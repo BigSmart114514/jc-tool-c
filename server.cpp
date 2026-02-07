@@ -1,39 +1,36 @@
 ﻿#define NOMINMAX
 #include <winsock2.h>
 #include <windows.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <iostream>
 #include <vector>
 #include <thread>
 #include <atomic>
-#include <algorithm>
-#include <chrono>
 #include <mutex>
-#include <string>
 #include <cstdio>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
-#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
+// ==================== 配置 ====================
 const int PORT = 12345;
-const int CRF = 23;
+const int CRF = 28;
 const int FPS = 30;
-const int KEYFRAME_INTERVAL = 60;
+const int KEYFRAME_INTERVAL = 120;
 std::atomic<bool> serverRunning(true);
 
 struct InputEvent {
-    int type;
-    int x;
-    int y;
-    int key;
-    int flags;
+    int type, x, y, key, flags;
 };
 
 #define MOUSE_MIDDLE_DOWN 5
@@ -46,262 +43,72 @@ enum PacketType : uint8_t {
     PACKET_DIMENSIONS = 2
 };
 
-// HEVC编码器封装类
-class HEVCEncoder {
-private:
-    const AVCodec* codec = nullptr;
-    AVCodecContext* ctx = nullptr;
-    AVFrame* frame = nullptr;
-    AVPacket* pkt = nullptr;
-    SwsContext* swsCtx = nullptr;
-    int width = 0;
-    int height = 0;
-    bool initialized = false;
-    std::mutex encodeMutex;
-
+// ==================== COM智能指针 ====================
+template<typename T>
+class ComPtr {
+    T* ptr = nullptr;
 public:
-    HEVCEncoder() = default;
-    
-    ~HEVCEncoder() {
-        Cleanup();
-    }
-    
-    void Cleanup() {
-        std::lock_guard<std::mutex> lock(encodeMutex);
-        if (swsCtx) {
-            sws_freeContext(swsCtx);
-            swsCtx = nullptr;
-        }
-        if (pkt) {
-            av_packet_free(&pkt);
-            pkt = nullptr;
-        }
-        if (frame) {
-            av_frame_free(&frame);
-            frame = nullptr;
-        }
-        if (ctx) {
-            avcodec_free_context(&ctx);
-            ctx = nullptr;
-        }
-        initialized = false;
-    }
-    
-    bool Init(int w, int h, int fps, int crf) {
-        std::lock_guard<std::mutex> lock(encodeMutex);
-        
-        width = w;
-        height = h;
-        
-        const char* encoderNames[] = {
-            "libx265",
-            "hevc_nvenc",
-            "hevc_qsv",
-            "hevc_amf",
-            nullptr
-        };
-        
-        for (int i = 0; encoderNames[i] != nullptr; i++) {
-            codec = avcodec_find_encoder_by_name(encoderNames[i]);
-            if (codec) {
-                std::cout << "尝试使用编码器: " << encoderNames[i] << "\n";
-                break;
-            }
-        }
-        
-        if (!codec) {
-            codec = avcodec_find_encoder(AV_CODEC_ID_HEVC);
-        }
-        
-        if (!codec) {
-            std::cerr << "错误: 未找到HEVC编码器\n";
-            return false;
-        }
-        
-        std::cout << "使用编码器: " << codec->name << "\n";
-        
-        ctx = avcodec_alloc_context3(codec);
-        if (!ctx) {
-            std::cerr << "错误: 无法分配编码器上下文\n";
-            return false;
-        }
-        
-        ctx->width = width;
-        ctx->height = height;
-        ctx->time_base = AVRational{1, fps};
-        ctx->framerate = AVRational{fps, 1};
-        ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-        ctx->gop_size = KEYFRAME_INTERVAL;
-        ctx->max_b_frames = 0;
-        ctx->thread_count = 4;
-        
-        char crfStr[16];
-        snprintf(crfStr, sizeof(crfStr), "%d", crf);
-        
-        if (strcmp(codec->name, "libx265") == 0) {
-            av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
-            av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
-            av_opt_set(ctx->priv_data, "crf", crfStr, 0);
-            av_opt_set(ctx->priv_data, "x265-params", 
-                "log-level=error:repeat-headers=1:aud=1", 0);
-        } else if (strstr(codec->name, "nvenc")) {
-            av_opt_set(ctx->priv_data, "preset", "p1", 0);
-            av_opt_set(ctx->priv_data, "tune", "ll", 0);
-            av_opt_set(ctx->priv_data, "rc", "constqp", 0);
-            ctx->global_quality = crf;
-        } else if (strstr(codec->name, "qsv")) {
-            av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
-            ctx->global_quality = crf;
-        } else if (strstr(codec->name, "amf")) {
-            av_opt_set(ctx->priv_data, "quality", "speed", 0);
-            ctx->global_quality = crf;
-        }
-        
-        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-        ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-        
-        int ret = avcodec_open2(ctx, codec, nullptr);
-        if (ret < 0) {
-            char errBuf[256];
-            av_strerror(ret, errBuf, sizeof(errBuf));
-            std::cerr << "错误: 无法打开编码器: " << errBuf << "\n";
-            avcodec_free_context(&ctx);
-            return false;
-        }
-        
-        frame = av_frame_alloc();
-        if (!frame) {
-            std::cerr << "错误: 无法分配帧\n";
-            return false;
-        }
-        
-        frame->format = ctx->pix_fmt;
-        frame->width = width;
-        frame->height = height;
-        
-        ret = av_frame_get_buffer(frame, 32);
-        if (ret < 0) {
-            std::cerr << "错误: 无法分配帧缓冲区\n";
-            return false;
-        }
-        
-        pkt = av_packet_alloc();
-        if (!pkt) {
-            std::cerr << "错误: 无法分配数据包\n";
-            return false;
-        }
-        
-        swsCtx = sws_getContext(
-            width, height, AV_PIX_FMT_BGRA,
-            width, height, AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR, nullptr, nullptr, nullptr
-        );
-        
-        if (!swsCtx) {
-            std::cerr << "错误: 无法创建颜色空间转换上下文\n";
-            return false;
-        }
-        
-        initialized = true;
-        std::cout << "HEVC编码器初始化成功: " << width << "x" << height 
-                  << " @ " << fps << "fps, CRF=" << crf << "\n";
-        return true;
-    }
-    
-    bool Encode(const uint8_t* bgraData, int64_t pts, std::vector<uint8_t>& output, bool forceKeyframe = false) {
-        std::lock_guard<std::mutex> lock(encodeMutex);
-        
-        if (!initialized) return false;
-        
-        output.clear();
-        
-        int ret = av_frame_make_writable(frame);
-        if (ret < 0) {
-            return false;
-        }
-        
-        const uint8_t* srcSlice[1] = {bgraData};
-        int srcStride[1] = {width * 4};
-        
-        sws_scale(swsCtx, srcSlice, srcStride, 0, height,
-                  frame->data, frame->linesize);
-        
-        frame->pts = pts;
-        
-        if (forceKeyframe) {
-            frame->pict_type = AV_PICTURE_TYPE_I;
-#if LIBAVUTIL_VERSION_MAJOR >= 58
-            frame->flags |= AV_FRAME_FLAG_KEY;
-#endif
-        } else {
-            frame->pict_type = AV_PICTURE_TYPE_NONE;
-#if LIBAVUTIL_VERSION_MAJOR >= 58
-            frame->flags &= ~AV_FRAME_FLAG_KEY;
-#endif
-        }
-        
-        ret = avcodec_send_frame(ctx, frame);
-        if (ret < 0) {
-            return false;
-        }
-        
-        while (ret >= 0) {
-            ret = avcodec_receive_packet(ctx, pkt);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break;
-            }
-            if (ret < 0) {
-                return false;
-            }
-            
-            size_t oldSize = output.size();
-            output.resize(oldSize + pkt->size);
-            memcpy(output.data() + oldSize, pkt->data, pkt->size);
-            
-            av_packet_unref(pkt);
-        }
-        
-        return !output.empty();
-    }
-    
-    int GetWidth() const { return width; }
-    int GetHeight() const { return height; }
-    bool IsInitialized() const { return initialized; }
+    ~ComPtr() { if (ptr) ptr->Release(); }
+    T** operator&() { return &ptr; }
+    T* operator->() { return ptr; }
+    T* get() { return ptr; }
+    void reset() { if (ptr) { ptr->Release(); ptr = nullptr; } }
+    explicit operator bool() const { return ptr != nullptr; }
 };
 
-// 屏幕捕获类
-class ScreenCapture {
+// ==================== 轻量级屏幕捕获 ====================
+class LiteScreenCapture {
 private:
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<IDXGIOutputDuplication> duplication;
+    ComPtr<ID3D11Texture2D> stagingTexture;
+    
+    // GDI回退
     HDC hdcScreen = nullptr;
     HDC hdcMem = nullptr;
     HBITMAP hBitmap = nullptr;
-    void* bits = nullptr;
+    void* gdiBits = nullptr;
+    
+    uint8_t* frameBuffer = nullptr;  // 单一缓冲区
     int width = 0;
     int height = 0;
+    bool useGDI = false;
     bool initialized = false;
+    bool frameAcquired = false;
 
 public:
-    ~ScreenCapture() {
-        Cleanup();
-    }
+    ~LiteScreenCapture() { Cleanup(); }
     
     void Cleanup() {
-        if (hBitmap) {
-            DeleteObject(hBitmap);
-            hBitmap = nullptr;
+        if (frameAcquired && duplication.get()) {
+            duplication->ReleaseFrame();
         }
-        if (hdcMem) {
-            DeleteDC(hdcMem);
-            hdcMem = nullptr;
+        stagingTexture.reset();
+        duplication.reset();
+        context.reset();
+        device.reset();
+        
+        if (hBitmap) DeleteObject(hBitmap);
+        if (hdcMem) DeleteDC(hdcMem);
+        if (hdcScreen) ReleaseDC(nullptr, hdcScreen);
+        
+        // 不要删除 gdiBits，它由CreateDIBSection管理
+        // 也不要删除 frameBuffer（DXGI模式下它指向映射内存）
+        if (useGDI) {
+            // GDI模式下 frameBuffer 就是 gdiBits
+        } else {
+            delete[] frameBuffer;
         }
-        if (hdcScreen) {
-            ReleaseDC(nullptr, hdcScreen);
-            hdcScreen = nullptr;
-        }
+        frameBuffer = nullptr;
+        
+        hBitmap = nullptr;
+        hdcMem = nullptr;
+        hdcScreen = nullptr;
         initialized = false;
     }
     
-    bool Init() {
+    bool InitGDI() {
         hdcScreen = GetDC(nullptr);
         if (!hdcScreen) return false;
         
@@ -319,225 +126,447 @@ public:
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
         
-        hBitmap = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        hBitmap = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &gdiBits, nullptr, 0);
         if (!hBitmap) return false;
         
         SelectObject(hdcMem, hBitmap);
-        initialized = true;
+        frameBuffer = static_cast<uint8_t*>(gdiBits);
         
+        useGDI = true;
+        initialized = true;
         return true;
     }
     
-    const uint8_t* Capture() {
+    bool Init() {
+        D3D_FEATURE_LEVEL featureLevel;
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION,
+            &device, &featureLevel, &context
+        );
+        
+        if (FAILED(hr)) return InitGDI();
+        
+        ComPtr<IDXGIDevice> dxgiDevice;
+        hr = device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
+        if (FAILED(hr)) return InitGDI();
+        
+        ComPtr<IDXGIAdapter> adapter;
+        hr = dxgiDevice->GetAdapter(&adapter);
+        if (FAILED(hr)) return InitGDI();
+        
+        ComPtr<IDXGIOutput> output;
+        hr = adapter->EnumOutputs(0, &output);
+        if (FAILED(hr)) return InitGDI();
+        
+        DXGI_OUTPUT_DESC outputDesc;
+        output->GetDesc(&outputDesc);
+        
+        ComPtr<IDXGIOutput1> output1;
+        hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+        if (FAILED(hr)) return InitGDI();
+        
+        hr = output1->DuplicateOutput(device.get(), &duplication);
+        if (FAILED(hr)) return InitGDI();
+        
+        width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+        height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+        
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width = width;
+        stagingDesc.Height = height;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        
+        hr = device->CreateTexture2D(&stagingDesc, nullptr, &stagingTexture);
+        if (FAILED(hr)) return InitGDI();
+        
+        // 只在DXGI模式下分配缓冲区
+        frameBuffer = new uint8_t[static_cast<size_t>(width) * height * 4];
+        
+        useGDI = false;
+        initialized = true;
+        return true;
+    }
+    
+    const uint8_t* Capture(bool& hasNewFrame) {
+        hasNewFrame = false;
         if (!initialized) return nullptr;
-        BitBlt(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
-        return static_cast<uint8_t*>(bits);
+        
+        if (useGDI) {
+            BitBlt(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
+            hasNewFrame = true;
+            return frameBuffer;
+        }
+        
+        if (frameAcquired) {
+            duplication->ReleaseFrame();
+            frameAcquired = false;
+        }
+        
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        ComPtr<IDXGIResource> resource;
+        
+        HRESULT hr = duplication->AcquireNextFrame(0, &frameInfo, &resource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            return frameBuffer;
+        }
+        if (FAILED(hr)) return frameBuffer;
+        
+        frameAcquired = true;
+        hasNewFrame = true;
+        
+        ComPtr<ID3D11Texture2D> texture;
+        hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture);
+        if (FAILED(hr)) return frameBuffer;
+        
+        context->CopyResource(stagingTexture.get(), texture.get());
+        
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = context->Map(stagingTexture.get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr)) {
+            const int rowBytes = width * 4;
+            if (mapped.RowPitch == static_cast<UINT>(rowBytes)) {
+                memcpy(frameBuffer, mapped.pData, static_cast<size_t>(rowBytes) * height);
+            } else {
+                for (int y = 0; y < height; y++) {
+                    memcpy(frameBuffer + y * rowBytes,
+                           static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch,
+                           rowBytes);
+                }
+            }
+            context->Unmap(stagingTexture.get(), 0);
+        }
+        
+        return frameBuffer;
     }
     
     int GetWidth() const { return width; }
     int GetHeight() const { return height; }
 };
 
-bool SendData(SOCKET clientSocket, const char* data, int size) {
-    int totalSent = 0;
-    while (totalSent < size) {
-        int sent = send(clientSocket, data + totalSent, size - totalSent, 0);
-        if (sent <= 0) return false;
-        totalSent += sent;
-    }
-    return true;
-}
+// ==================== 低内存HEVC编码器 ====================
+class LiteHEVCEncoder {
+private:
+    const AVCodec* codec = nullptr;
+    AVCodecContext* ctx = nullptr;
+    AVFrame* frame = nullptr;
+    AVPacket* pkt = nullptr;
+    SwsContext* swsCtx = nullptr;
+    int width = 0;
+    int height = 0;
+    bool initialized = false;
+    bool isHardware = false;
+    std::mutex mtx;
 
-bool ReceiveData(SOCKET socket, char* buffer, int size) {
-    int totalReceived = 0;
-    while (totalReceived < size) {
-        int received = recv(socket, buffer + totalReceived, size - totalReceived, 0);
-        if (received <= 0) return false;
-        totalReceived += received;
+public:
+    ~LiteHEVCEncoder() { Cleanup(); }
+    
+    void Cleanup() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (swsCtx) { sws_freeContext(swsCtx); swsCtx = nullptr; }
+        if (pkt) { av_packet_free(&pkt); pkt = nullptr; }
+        if (frame) { av_frame_free(&frame); frame = nullptr; }
+        if (ctx) { avcodec_free_context(&ctx); ctx = nullptr; }
+        initialized = false;
     }
-    return true;
-}
-
-void InputHandler(SOCKET clientSocket, std::atomic<bool>& running) {
-    while (running && serverRunning) {
-        InputEvent event;
-        if (ReceiveData(clientSocket, reinterpret_cast<char*>(&event), sizeof(InputEvent))) {
-            if (event.type == 0) {
-                SetCursorPos(event.x, event.y);
+    
+    bool Init(int w, int h, int fps, int crf) {
+        std::lock_guard<std::mutex> lock(mtx);
+        width = w;
+        height = h;
+        
+        // 优先硬件编码器（内存占用低）
+        const char* encoders[] = {"hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265", nullptr};
+        
+        for (int i = 0; encoders[i]; i++) {
+            codec = avcodec_find_encoder_by_name(encoders[i]);
+            if (!codec) continue;
+            
+            ctx = avcodec_alloc_context3(codec);
+            if (!ctx) continue;
+            
+            ctx->width = width;
+            ctx->height = height;
+            ctx->time_base = {1, fps};
+            ctx->framerate = {fps, 1};
+            ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+            ctx->gop_size = KEYFRAME_INTERVAL;
+            ctx->max_b_frames = 0;
+            ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+            
+            if (strcmp(encoders[i], "hevc_nvenc") == 0) {
+                av_opt_set(ctx->priv_data, "preset", "p1", 0);
+                av_opt_set(ctx->priv_data, "tune", "ll", 0);
+                av_opt_set(ctx->priv_data, "rc", "constqp", 0);
+                av_opt_set_int(ctx->priv_data, "qp", crf, 0);
+                isHardware = true;
+            }
+            else if (strcmp(encoders[i], "hevc_qsv") == 0) {
+                av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
+                ctx->global_quality = crf;
+                isHardware = true;
+            }
+            else if (strcmp(encoders[i], "hevc_amf") == 0) {
+                av_opt_set(ctx->priv_data, "quality", "speed", 0);
+                av_opt_set(ctx->priv_data, "rc", "cqp", 0);
+                av_opt_set_int(ctx->priv_data, "qp_i", crf, 0);
+                av_opt_set_int(ctx->priv_data, "qp_p", crf, 0);
+                isHardware = true;
+            }
+            else if (strcmp(encoders[i], "libx265") == 0) {
+                // ========== 关键：最小化内存配置 ==========
+                ctx->thread_count = 2;  // 减少线程
                 
-                switch (event.key) {
-                    case 1: mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0); break;
-                    case 2: mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0); break;
-                    case 3: mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0); break;
-                    case 4: mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0); break;
-                    case MOUSE_MIDDLE_DOWN: mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0); break;
-                    case MOUSE_MIDDLE_UP: mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0); break;
-                    case MOUSE_WHEEL: mouse_event(MOUSEEVENTF_WHEEL, 0, 0, event.flags, 0); break;
-                }
-            } else if (event.type == 1) {
-                INPUT input = {};
-                input.type = INPUT_KEYBOARD;
-                input.ki.wVk = static_cast<WORD>(event.key);
-                input.ki.dwFlags = event.flags ? KEYEVENTF_KEYUP : 0;
-                SendInput(1, &input, sizeof(INPUT));
+                char params[512];
+                snprintf(params, sizeof(params),
+                    "log-level=error:"
+                    "pools=1:"              // 单线程池
+                    "frame-threads=1:"      // 单帧线程
+                    "lookahead-slices=1:"   // 最小lookahead
+                    "rc-lookahead=0:"       // 禁用lookahead (大幅减少内存!)
+                    "bframes=0:"            // 无B帧
+                    "ref=1:"                // 单参考帧 (减少50%+内存!)
+                    "no-wpp=1:"             // 禁用WPP
+                    "no-pmode=1:"           // 禁用并行模式
+                    "no-pme=1:"             // 禁用并行运动估计
+                    "no-sao=1:"             // 禁用SAO
+                    "no-weightp=1:"         // 禁用加权预测
+                    "no-cutree=1:"          // 禁用cutree
+                    "aq-mode=0:"            // 禁用自适应量化
+                    "crf=%d",
+                    crf + 3
+                );
+                
+                av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
+                av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
+                av_opt_set(ctx->priv_data, "x265-params", params, 0);
+                isHardware = false;
+            }
+            
+            if (avcodec_open2(ctx, codec, nullptr) >= 0) {
+                std::cout << "编码器: " << encoders[i];
+                if (isHardware) std::cout << " [硬件]";
+                std::cout << "\n";
+                break;
+            }
+            
+            avcodec_free_context(&ctx);
+            ctx = nullptr;
+        }
+        
+        if (!ctx) {
+            std::cerr << "无可用编码器\n";
+            return false;
+        }
+        
+        frame = av_frame_alloc();
+        frame->format = ctx->pix_fmt;
+        frame->width = width;
+        frame->height = height;
+        if (av_frame_get_buffer(frame, 32) < 0) return false;
+        
+        pkt = av_packet_alloc();
+        
+        // 使用最快的缩放算法
+        swsCtx = sws_getContext(
+            width, height, AV_PIX_FMT_BGRA,
+            width, height, AV_PIX_FMT_YUV420P,
+            SWS_POINT, nullptr, nullptr, nullptr
+        );
+        
+        initialized = true;
+        return true;
+    }
+    
+    bool Encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>& out, bool keyframe = false) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!initialized) return false;
+        
+        out.clear();
+        
+        if (av_frame_make_writable(frame) < 0) return false;
+        
+        const uint8_t* src[1] = {bgra};
+        int srcStride[1] = {width * 4};
+        sws_scale(swsCtx, src, srcStride, 0, height, frame->data, frame->linesize);
+        
+        frame->pts = pts;
+        frame->pict_type = keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+        
+        if (avcodec_send_frame(ctx, frame) < 0) return false;
+        
+        int ret;
+        while ((ret = avcodec_receive_packet(ctx, pkt)) >= 0) {
+            out.insert(out.end(), pkt->data, pkt->data + pkt->size);
+            av_packet_unref(pkt);
+        }
+        
+        return !out.empty();
+    }
+    
+    bool IsHardware() const { return isHardware; }
+};
+
+// ==================== 网络函数 ====================
+inline bool SendAll(SOCKET s, const void* data, int len) {
+    const char* p = static_cast<const char*>(data);
+    while (len > 0) {
+        int sent = send(s, p, len, 0);
+        if (sent <= 0) return false;
+        p += sent;
+        len -= sent;
+    }
+    return true;
+}
+
+inline bool RecvAll(SOCKET s, void* buf, int len) {
+    char* p = static_cast<char*>(buf);
+    while (len > 0) {
+        int r = recv(s, p, len, 0);
+        if (r <= 0) return false;
+        p += r;
+        len -= r;
+    }
+    return true;
+}
+
+// ==================== 输入处理 ====================
+void InputHandler(SOCKET sock, std::atomic<bool>& running) {
+    INPUT input = {};
+    while (running && serverRunning) {
+        InputEvent ev;
+        if (!RecvAll(sock, &ev, sizeof(ev))) break;
+        
+        if (ev.type == 0) {
+            SetCursorPos(ev.x, ev.y);
+            switch (ev.key) {
+                case 1: mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0); break;
+                case 2: mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0); break;
+                case 3: mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0); break;
+                case 4: mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0); break;
+                case MOUSE_MIDDLE_DOWN: mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0); break;
+                case MOUSE_MIDDLE_UP: mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0); break;
+                case MOUSE_WHEEL: mouse_event(MOUSEEVENTF_WHEEL, 0, 0, ev.flags, 0); break;
             }
         } else {
-            break;
+            input.type = INPUT_KEYBOARD;
+            input.ki.wVk = static_cast<WORD>(ev.key);
+            input.ki.dwFlags = ev.flags ? KEYEVENTF_KEYUP : 0;
+            SendInput(1, &input, sizeof(INPUT));
         }
     }
 }
 
-void ClientHandler(SOCKET clientSocket) {
-    std::cout << "客户端已连接\n";
+// ==================== 客户端处理 ====================
+void ClientHandler(SOCKET sock) {
+    std::cout << "客户端连接\n";
+    std::atomic<bool> running(true);
     
-    std::atomic<bool> clientRunning(true);
-    
-    ScreenCapture capture;
+    LiteScreenCapture capture;
     if (!capture.Init()) {
-        std::cerr << "屏幕捕获初始化失败\n";
-        closesocket(clientSocket);
+        closesocket(sock);
         return;
     }
     
-    int screenWidth = capture.GetWidth();
-    int screenHeight = capture.GetHeight();
+    int w = capture.GetWidth(), h = capture.GetHeight();
+    std::cout << "分辨率: " << w << "x" << h << "\n";
     
-    std::cout << "屏幕尺寸: " << screenWidth << "x" << screenHeight << "\n";
-    
-    int dimensions[2] = {screenWidth, screenHeight};
-    if (!SendData(clientSocket, reinterpret_cast<char*>(dimensions), sizeof(dimensions))) {
-        closesocket(clientSocket);
+    int dims[2] = {w, h};
+    if (!SendAll(sock, dims, sizeof(dims))) {
+        closesocket(sock);
         return;
     }
     
-    HEVCEncoder encoder;
-    if (!encoder.Init(screenWidth, screenHeight, FPS, CRF)) {
-        std::cerr << "HEVC编码器初始化失败\n";
-        closesocket(clientSocket);
+    LiteHEVCEncoder encoder;
+    if (!encoder.Init(w, h, FPS, CRF)) {
+        closesocket(sock);
         return;
     }
     
-    std::thread inputThread(InputHandler, clientSocket, std::ref(clientRunning));
+    std::thread inputThread(InputHandler, sock, std::ref(running));
     
-    const DWORD frameTime = 1000 / FPS;
+    // 预分配，但使用较小容量
+    std::vector<uint8_t> encoded;
+    encoded.reserve(64 * 1024);  // 64KB初始
+    
+    const DWORD frameMs = 1000 / FPS;
     int64_t pts = 0;
-    std::vector<uint8_t> encodedData;
     
-    while (serverRunning && clientRunning) {
-        DWORD startTime = GetTickCount();
+    while (serverRunning && running) {
+        DWORD t0 = GetTickCount();
         
-        const uint8_t* screenData = capture.Capture();
-        if (!screenData) {
-            break;
-        }
+        bool hasNew = false;
+        const uint8_t* data = capture.Capture(hasNew);
+        if (!data) { Sleep(1); continue; }
         
-        bool forceKeyframe = (pts % KEYFRAME_INTERVAL == 0);
+        bool keyframe = (pts % KEYFRAME_INTERVAL == 0);
         
-        if (encoder.Encode(screenData, pts, encodedData, forceKeyframe)) {
-            uint8_t packetType = PACKET_VIDEO;
-            if (!SendData(clientSocket, reinterpret_cast<char*>(&packetType), 1)) {
-                break;
-            }
+        if (encoder.Encode(data, pts, encoded, keyframe)) {
+            uint8_t hdr[6];
+            hdr[0] = PACKET_VIDEO;
+            hdr[1] = keyframe ? 1 : 0;
+            *reinterpret_cast<int32_t*>(&hdr[2]) = static_cast<int32_t>(encoded.size());
             
-            uint8_t isKeyframe = forceKeyframe ? 1 : 0;
-            if (!SendData(clientSocket, reinterpret_cast<char*>(&isKeyframe), 1)) {
-                break;
-            }
-            
-            int32_t dataSize = static_cast<int32_t>(encodedData.size());
-            if (!SendData(clientSocket, reinterpret_cast<char*>(&dataSize), sizeof(dataSize))) {
-                break;
-            }
-            
-            if (!SendData(clientSocket, reinterpret_cast<char*>(encodedData.data()), dataSize)) {
+            if (!SendAll(sock, hdr, 6) || !SendAll(sock, encoded.data(), (int)encoded.size())) {
                 break;
             }
         }
         
         pts++;
         
-        DWORD elapsed = GetTickCount() - startTime;
-        if (elapsed < frameTime) {
-            Sleep(frameTime - elapsed);
-        }
+        DWORD elapsed = GetTickCount() - t0;
+        if (elapsed < frameMs) Sleep(frameMs - elapsed);
     }
     
-    clientRunning = false;
-    
-    if (inputThread.joinable()) {
-        inputThread.join();
-    }
-    
-    closesocket(clientSocket);
-    std::cout << "客户端断开连接\n";
+    running = false;
+    if (inputThread.joinable()) inputThread.join();
+    closesocket(sock);
+    std::cout << "客户端断开\n";
 }
 
+// ==================== 主函数 ====================
 int main() {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "WSAStartup失败\n";
-        return 1;
-    }
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket == INVALID_SOCKET) {
-        std::cerr << "创建socket失败\n";
-        WSACleanup();
-        return 1;
-    }
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
     
+    SOCKET srv = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     
-    sockaddr_in serverAddr = {};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(PORT);
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
     
-    if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        std::cerr << "绑定端口失败\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return 1;
-    }
+    bind(srv, (sockaddr*)&addr, sizeof(addr));
+    listen(srv, 5);
     
-    if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "监听失败\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return 1;
-    }
-    
-    std::cout << "========================================\n";
-    std::cout << "    HEVC (H.265) 远程桌面服务端\n";
-    std::cout << "========================================\n";
-    std::cout << "端口: " << PORT << "\n";
-    std::cout << "编码参数: CRF=" << CRF << ", FPS=" << FPS << "\n";
+    std::cout << "================================\n";
+    std::cout << "  HEVC远程桌面 (低内存版)\n";
+    std::cout << "================================\n";
+    std::cout << "端口: " << PORT << " CRF: " << CRF << " FPS: " << FPS << "\n";
     std::cout << "等待连接...\n";
     
     while (serverRunning) {
-        sockaddr_in clientAddr;
-        int clientSize = sizeof(clientAddr);
-        SOCKET clientSocket = accept(serverSocket, (sockaddr*)&clientAddr, &clientSize);
-        
-        if (clientSocket == INVALID_SOCKET) {
-            if (serverRunning) {
-                std::cerr << "接受连接失败\n";
-            }
-            break;
-        }
+        sockaddr_in caddr;
+        int clen = sizeof(caddr);
+        SOCKET client = accept(srv, (sockaddr*)&caddr, &clen);
+        if (client == INVALID_SOCKET) break;
         
         int flag = 1;
-        setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
         
-        int bufSize = 1024 * 1024;
-        setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF, (char*)&bufSize, sizeof(bufSize));
-        
-        std::thread(ClientHandler, clientSocket).detach();
+        std::thread(ClientHandler, client).detach();
     }
     
-    closesocket(serverSocket);
+    closesocket(srv);
     WSACleanup();
-    
     return 0;
 }
