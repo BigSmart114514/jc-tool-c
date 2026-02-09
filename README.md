@@ -9,6 +9,8 @@
 
 ## 功能：
 
+- 可搭配p2p网络远程控制（需要我另一个仓库的信令服务器）
+
 - 屏幕监控
 
 - 鼠标操作
@@ -25,6 +27,8 @@
 
 - 下载ffmpeg（https://github.com/BtbN/FFmpeg-Builds/releases）Windows版
 
+- 编译我的https://github.com/BigSmart114514/p2p 可以用github actions，反正我是这么编译的。
+
 - 自己改一下下面的build.bat
 
 - 使用MSVC编译器 （反正我用2022的）
@@ -34,66 +38,73 @@
 setlocal
 
 :: 设置FFmpeg路径 - 请根据实际安装位置修改
-set FFMPEG_DIR=C:\test...
+set FFMPEG_DIR=\path\to\ffmpeg
 
 :: 设置Visual Studio环境 - 根据你的VS版本调整路径
-call "C:\Visual Studio\Community\VC\Auxiliary\Build\vcvars64.bat"
+call "\path\to\vs\vcvars64.bat"
+
+:: 设置P2P库路径
+set P2P_DIR=\sb\114514
+
 
 echo ========================================
-echo    HEVC远程桌面编译脚本
+echo    P2P HEVC 远程桌面编译脚本
 echo ========================================
 echo.
 echo FFmpeg路径: %FFMPEG_DIR%
+echo P2P库路径: %P2P_DIR%
 echo.
 
-:: 检查FFmpeg目录是否存在
+:: 检查目录
 if not exist "%FFMPEG_DIR%\include" (
     echo 错误: 未找到FFmpeg include目录
-    echo 请确认 %FFMPEG_DIR%\include 存在
     exit /b 1
 )
 
-if not exist "%FFMPEG_DIR%\lib" (
-    echo 错误: 未找到FFmpeg lib目录
-    echo 请确认 %FFMPEG_DIR%\lib 存在
+if not exist "%P2P_DIR%\include" (
+    echo 错误: 未找到P2P库 include目录
     exit /b 1
 )
 
-:: 编译服务器
-echo 正在编译服务器...
-cl /nologo /EHsc /O2 /MD ^
+:: 编译服务端
+echo 正在编译P2P服务端...
+cl /nologo /EHsc /O2 /MD /std:c++17 /utf-8 ^
    /I"%FFMPEG_DIR%\include" ^
+   /I"%P2P_DIR%\include" ^
    /D_CRT_SECURE_NO_WARNINGS ^
+   /DP2P_CLIENT_STATIC ^
    /wd4819 ^
    server.cpp ^
-   /link /LIBPATH:"%FFMPEG_DIR%\lib" ^
+   /link /LIBPATH:"%FFMPEG_DIR%\lib" /LIBPATH:"%P2P_DIR%\lib" ^
    avcodec.lib avutil.lib swscale.lib ^
-   ws2_32.lib gdi32.lib user32.lib ^
+   p2p-client.lib datachannel.lib juice.lib libcrypto.lib libssl.lib usrsctp.lib ^
+   ws2_32.lib gdi32.lib user32.lib winmm.lib d3d11.lib dxgi.lib crypt32.lib ^
    /OUT:server.exe
 
 if %ERRORLEVEL% neq 0 (
-    echo.
-    echo 服务器编译失败!
+    echo 服务端编译失败!
     pause
     exit /b 1
 )
-echo 服务器编译成功!
+echo 服务端编译成功!
 echo.
 
 :: 编译客户端
-echo 正在编译客户端...
-cl /nologo /EHsc /O2 /MD ^
+echo 正在编译P2P客户端...
+cl /nologo /EHsc /O2 /MD /std:c++17 ^
    /I"%FFMPEG_DIR%\include" ^
+   /I"%P2P_DIR%\include" ^
    /D_CRT_SECURE_NO_WARNINGS ^
+   /DP2P_CLIENT_STATIC ^
    /wd4819 ^
    client.cpp ^
-   /link /LIBPATH:"%FFMPEG_DIR%\lib" ^
+   /link /LIBPATH:"%FFMPEG_DIR%\lib" /LIBPATH:"%P2P_DIR%\lib" ^
    avcodec.lib avutil.lib swscale.lib ^
-   ws2_32.lib gdi32.lib user32.lib dwmapi.lib ^
+   p2p-client.lib datachannel.lib juice.lib libcrypto.lib libssl.lib usrsctp.lib ^
+   ws2_32.lib gdi32.lib user32.lib dwmapi.lib crypt32.lib ^
    /OUT:client.exe
 
 if %ERRORLEVEL% neq 0 (
-    echo.
     echo 客户端编译失败!
     pause
     exit /b 1
@@ -108,27 +119,38 @@ if exist "%FFMPEG_DIR%\bin" (
     copy /Y "%FFMPEG_DIR%\bin\avutil*.dll" . >nul 2>&1
     copy /Y "%FFMPEG_DIR%\bin\swscale*.dll" . >nul 2>&1
     copy /Y "%FFMPEG_DIR%\bin\swresample*.dll" . >nul 2>&1
-    echo DLL文件已复制
-) else (
-    echo 警告: 未找到 %FFMPEG_DIR%\bin 目录
-    echo 请手动复制FFmpeg DLL文件到可执行文件目录
 )
 
+if exist "%P2P_DIR%\bin" (
+    copy /Y "%P2P_DIR%\bin\p2p-client.dll" . >nul 2>&1
+    copy /Y "%P2P_DIR%\bin\datachannel.dll" . >nul 2>&1
+    copy /Y "%P2P_DIR%\bin\juice.dll" . >nul 2>&1
+    copy /Y "%P2P_DIR%\bin\legacy.dll" . >nul 2>&1
+    copy /Y "%P2P_DIR%\bin\libcrypto-3-x64.dll" . >nul 2>&1
+    copy /Y "%P2P_DIR%\bin\libssl-3-x64.dll" . >nul 2>&1
+)
+
+echo DLL文件已复制
 echo.
+
+:: 清理
+del /Q *.obj >nul 2>&1
+
 echo ========================================
 echo    编译完成!
 echo ========================================
 echo.
-
-:: 清理临时文件
-del /Q *.obj >nul 2>&1
+echo 使用方法:
+echo   1. 启动信令服务器
+echo   2. 运行 p2p_server.exe (记下 Peer ID)
+echo   3. 运行 p2p_client.exe (输入服务端 Peer ID)
+echo.
 
 pause
 endlocal
 ```
-- 把编译好的server.exe和server.exe放进对方电脑里
+- 把编译好的server.exe放进对方电脑里
 
-- 自己改ip和端口号！
 
 ## 注意：
 
