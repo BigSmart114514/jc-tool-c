@@ -58,7 +58,7 @@ enum PacketType : uint8_t {
 };
 
 // ==================== 传输模式 ====================
-enum class TransportMode { None, TCP, P2P };
+enum class TransportMode { None, TCP, P2P, Relay };
 
 // ==================== 线程安全输入队列 ====================
 class InputQueue {
@@ -348,11 +348,12 @@ private:
     std::thread tcpInputThread_;
     std::atomic<bool> tcpClientActive_{false};
 
-    // P2P 状态
+    // P2P/Relay 状态
     std::unique_ptr<p2p::P2PClient> p2pClient_;
     std::string p2pPeerId_;
     std::atomic<bool> p2pClientReady_{false};
     std::atomic<bool> keyframeRequested_{false};
+    bool peerIsRelay_ = false;  // 当前连接是否为中继模式
 
     int screenW_ = 0, screenH_ = 0;
 
@@ -470,7 +471,7 @@ public:
         }
     }
 
-    // ========== P2P ==========
+    // ========== P2P + Relay ==========
     bool startP2P(const std::string& signalingUrl, const std::string& peerId = "") {
         p2p::ClientConfig config;
         config.signalingUrl = signalingUrl;
@@ -478,14 +479,20 @@ public:
 
         p2pClient_ = std::make_unique<p2p::P2PClient>(config);
 
+        // ========== 基础回调 ==========
         p2pClient_->setOnConnected([this]() {
-            std::cout << "P2P 已连接信令服务器, ID: " << p2pClient_->getLocalId() << std::endl;
+            std::cout << "已连接信令服务器, ID: " << p2pClient_->getLocalId() << std::endl;
         });
 
         p2pClient_->setOnDisconnected([](const p2p::Error& err) {
-            std::cerr << "P2P 信令断开: " << err.message << std::endl;
+            std::cerr << "信令断开: " << err.message << std::endl;
         });
 
+        p2pClient_->setOnError([](const p2p::Error& err) {
+            std::cerr << "P2P 错误: " << err.message << std::endl;
+        });
+
+        // ========== P2P 直连回调 ==========
         p2pClient_->setOnPeerConnected([this](const std::string& peerId) {
             std::lock_guard<std::mutex> lock(transportMtx_);
             if (activeMode_ != TransportMode::None) {
@@ -494,6 +501,7 @@ public:
                 return;
             }
             p2pPeerId_ = peerId;
+            peerIsRelay_ = false;
             std::cout << "P2P 客户端连接: " << peerId << std::endl;
 
             // 发送屏幕信息
@@ -510,17 +518,50 @@ public:
                 activeMode_ = TransportMode::None;
                 p2pClientReady_ = false;
                 p2pPeerId_.clear();
+                peerIsRelay_ = false;
                 inputQueue_.clear();
             }
         });
 
+        // ========== 中继模式回调 ==========
+        p2pClient_->setOnRelayConnected([this](const std::string& peerId) {
+            std::lock_guard<std::mutex> lock(transportMtx_);
+            if (activeMode_ != TransportMode::None) {
+                std::cout << "已有客户端连接，拒绝中继: " << peerId << std::endl;
+                p2pClient_->disconnectFromPeerViaRelay(peerId);
+                return;
+            }
+            p2pPeerId_ = peerId;
+            peerIsRelay_ = true;
+            std::cout << "中继客户端连接: " << peerId << std::endl;
+
+            // 发送屏幕信息（通过中继）
+            std::string json = "{\"type\":\"screen_info\",\"width\":" +
+                              std::to_string(screenW_) + ",\"height\":" +
+                              std::to_string(screenH_) + "}";
+            p2pClient_->sendTextViaRelay(peerId, json);
+        });
+
+        p2pClient_->setOnRelayDisconnected([this](const std::string& peerId) {
+            std::lock_guard<std::mutex> lock(transportMtx_);
+            if (peerId == p2pPeerId_ && activeMode_ == TransportMode::Relay) {
+                std::cout << "中继客户端断开: " << peerId << std::endl;
+                activeMode_ = TransportMode::None;
+                p2pClientReady_ = false;
+                p2pPeerId_.clear();
+                peerIsRelay_ = false;
+                inputQueue_.clear();
+            }
+        });
+
+        // ========== 消息回调 (P2P 和中继共用) ==========
         p2pClient_->setOnTextMessage([this](const std::string& from, const std::string& msg) {
             if (msg.find("\"type\":\"ready\"") != std::string::npos) {
                 std::lock_guard<std::mutex> lock(transportMtx_);
                 if (from == p2pPeerId_) {
-                    activeMode_ = TransportMode::P2P;
+                    activeMode_ = peerIsRelay_ ? TransportMode::Relay : TransportMode::P2P;
                     p2pClientReady_ = true;
-                    std::cout << "P2P 客户端准备就绪" << std::endl;
+                    std::cout << (peerIsRelay_ ? "中继" : "P2P") << " 客户端准备就绪" << std::endl;
                     clientCV_.notify_one();
                 }
             } else if (msg.find("\"type\":\"keyframe_request\"") != std::string::npos) {
@@ -537,12 +578,9 @@ public:
             }
         });
 
-        p2pClient_->setOnError([](const p2p::Error& err) {
-            std::cerr << "P2P 错误: " << err.message << std::endl;
-        });
-
+        // ========== 连接信令服务器 ==========
         if (!p2pClient_->connect()) {
-            std::cerr << "P2P 连接信令服务器失败" << std::endl;
+            std::cerr << "连接信令服务器失败" << std::endl;
             return false;
         }
 
@@ -566,14 +604,19 @@ public:
             }
             return true;
         }
-        else if (activeMode_ == TransportMode::P2P) {
+        else if (activeMode_ == TransportMode::P2P || activeMode_ == TransportMode::Relay) {
             p2p::BinaryData packet;
             packet.reserve(2 + encoded.size());
             packet.push_back(static_cast<uint8_t>(BinaryMsgType::VideoFrame));
             packet.push_back(isKeyframe ? 1 : 0);
             packet.insert(packet.end(), encoded.begin(), encoded.end());
 
-            return p2pClient_->sendBinary(p2pPeerId_, packet);
+            // 根据模式选择发送方法
+            if (activeMode_ == TransportMode::Relay) {
+                return p2pClient_->sendBinaryViaRelay(p2pPeerId_, packet);
+            } else {
+                return p2pClient_->sendBinary(p2pPeerId_, packet);
+            }
         }
 
         return false;
@@ -671,6 +714,10 @@ public:
 
         clientCV_.notify_all();
     }
+
+    std::string getLocalPeerId() const {
+        return p2pClient_ ? p2pClient_->getLocalId() : "";
+    }
 };
 
 // ==================== 主函数 ====================
@@ -680,8 +727,8 @@ int main() {
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
     std::cout << "========================================\n";
-    std::cout << "   双模式 HEVC 远程桌面服务端\n";
-    std::cout << "   (同时支持 TCP 直连 + P2P)\n";
+    std::cout << "   三模式 HEVC 远程桌面服务端\n";
+    std::cout << "   (TCP + P2P 直连 + 中继)\n";
     std::cout << "========================================\n\n";
 
     p2p::P2PClient::setLogLevel(2);
@@ -693,14 +740,12 @@ int main() {
         return 1;
     }
 
-
     WSADATA wsaData;
     int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (wsaResult != 0) {
         std::cerr << "WSAStartup 失败: " << wsaResult << std::endl;
         return 1;
     }
-    // -------------------------
 
     // 启动 TCP 监听
     std::cout << "\n[TCP 模式]\n";
@@ -713,7 +758,7 @@ int main() {
     bool tcpOk = server.startTCP(tcpPort);
 
     // 启动 P2P
-    std::cout << "\n[P2P 模式]\n";
+    std::cout << "\n[P2P + 中继模式]\n";
     std::string sigUrl = DEFAULT_SIGNALING_URL;
     std::cout << "信令服务器 URL (默认 " << sigUrl << ", 输入 skip 跳过): ";
     std::getline(std::cin, input);
@@ -732,12 +777,13 @@ int main() {
     if (!tcpOk && !p2pOk) {
         std::cerr << "\nTCP 和 P2P 均启动失败" << std::endl;
         timeEndPeriod(1);
+        WSACleanup();
         return 1;
     }
 
     std::cout << "\n========================================\n";
     if (tcpOk) std::cout << "  TCP 就绪: 端口 " << tcpPort << "\n";
-    if (p2pOk) std::cout << "  P2P 就绪: 等待 Peer 连接\n";
+    if (p2pOk) std::cout << "  P2P/中继 就绪: " << server.getLocalPeerId() << "\n";
     std::cout << "========================================\n";
     std::cout << "按 Ctrl+C 停止\n\n";
 
@@ -753,10 +799,7 @@ int main() {
     server.stop();
 
     timeEndPeriod(1);
-
-    // 清理 Winsock ---
     WSACleanup();
-    // -------------------------
     std::cout << "服务端已停止" << std::endl;
     return 0;
 }

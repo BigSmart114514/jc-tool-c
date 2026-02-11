@@ -9,7 +9,7 @@
 
 ## 功能：
 
-- 可搭配p2p网络远程控制（需要我另一个仓库的信令服务器）
+- 可搭配p2p网络远程控制（需要我另一个仓库的信令服务器）,也可以通过服务器中继
 
 - 屏幕监控
 
@@ -27,7 +27,7 @@
 
 - 下载ffmpeg（https://github.com/BtbN/FFmpeg-Builds/releases）Windows版
 
-- 编译我的https://github.com/BigSmart114514/p2p 可以用github actions，反正我是这么编译的。
+- 下载我的https://github.com/BigSmart114514/p2p 可以用github actions，反正我是这么编译的。
 
 - 自己改一下下面的build.bat
 

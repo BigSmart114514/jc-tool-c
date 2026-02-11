@@ -55,7 +55,8 @@ enum PacketType : uint8_t {
     PACKET_VIDEO = 0
 };
 
-enum class TransportMode { TCP, P2P };
+// 新增 Relay 模式
+enum class TransportMode { TCP, P2P, Relay };
 
 #define WM_UPDATE_DISPLAY   (WM_USER + 100)
 #define WM_CONNECTION_LOST  (WM_USER + 101)
@@ -400,47 +401,84 @@ private:
     }
 };
 
-// ==================== P2P 传输 ====================
+// ==================== P2P/Relay 传输 ====================
 class P2PTransport : public IClientTransport {
     std::unique_ptr<p2p::P2PClient> client_;
     std::string serverPeerId_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
+    bool useRelay_ = false;  // 是否使用中继模式
 
 public:
     ~P2PTransport() { disconnect(); }
 
-    bool connect(const std::string& signalingUrl, const std::string& serverPeerId) {
+    // 统一的连接方法，支持 P2P 直连和中继模式
+    bool connect(const std::string& signalingUrl, const std::string& serverPeerId,
+                 bool useRelay = false, const std::string& relayPassword = "") {
         serverPeerId_ = serverPeerId;
+        useRelay_ = useRelay;
 
         client_ = std::make_unique<p2p::P2PClient>(signalingUrl);
 
+        // ========== 基础回调 ==========
         client_->setOnConnected([this]() {
-            std::cout << "P2P 信令已连接, ID: " << client_->getLocalId() << std::endl;
+            std::cout << "信令已连接, 本地 ID: " << client_->getLocalId() << std::endl;
         });
 
         client_->setOnDisconnected([](const p2p::Error& err) {
-            std::cerr << "P2P 信令断开: " << err.message << std::endl;
+            std::cerr << "信令断开: " << err.message << std::endl;
         });
 
+        client_->setOnError([](const p2p::Error& err) {
+            std::cerr << "P2P 错误: " << err.message << std::endl;
+        });
+
+        // ========== P2P 直连回调 ==========
         client_->setOnPeerConnected([this](const std::string& peerId) {
-            if (peerId == serverPeerId_) {
-                std::cout << "P2P 已连接到服务端" << std::endl;
+            if (!useRelay_ && peerId == serverPeerId_) {
+                std::cout << "P2P 已连接到服务端: " << peerId << std::endl;
                 connected_ = true;
             }
         });
 
         client_->setOnPeerDisconnected([this](const std::string& peerId) {
-            if (peerId == serverPeerId_) {
-                std::cout << "P2P 服务端断开" << std::endl;
+            if (!useRelay_ && peerId == serverPeerId_) {
+                std::cout << "P2P 服务端断开: " << peerId << std::endl;
                 connected_ = false;
                 ready_ = false;
                 if (g_hwndMain) PostMessage(g_hwndMain, WM_CONNECTION_LOST, 0, 0);
             }
         });
 
+        // ========== 中继模式回调 ==========
+        client_->setOnRelayConnected([this](const std::string& peerId) {
+            if (useRelay_ && peerId == serverPeerId_) {
+                std::cout << "中继已连接到服务端: " << peerId << std::endl;
+                connected_ = true;
+            }
+        });
+
+        client_->setOnRelayDisconnected([this](const std::string& peerId) {
+            if (useRelay_ && peerId == serverPeerId_) {
+                std::cout << "中继服务端断开: " << peerId << std::endl;
+                connected_ = false;
+                ready_ = false;
+                if (g_hwndMain) PostMessage(g_hwndMain, WM_CONNECTION_LOST, 0, 0);
+            }
+        });
+
+        client_->setOnRelayAuthResult([](bool success, const std::string& message) {
+            if (success) {
+                std::cout << "中继认证成功: " << message << std::endl;
+            } else {
+                std::cerr << "中继认证失败: " << message << std::endl;
+            }
+        });
+
+        // ========== 消息回调 (P2P 和中继共用) ==========
         client_->setOnTextMessage([this](const std::string& from, const std::string& msg) {
             if (msg.find("\"type\":\"screen_info\"") != std::string::npos) {
+                // 解析屏幕信息 JSON
                 size_t wp = msg.find("\"width\":") + 8;
                 size_t hp = msg.find("\"height\":") + 9;
                 int w = std::atoi(msg.c_str() + wp);
@@ -451,7 +489,12 @@ public:
                 originalHeight = h;
 
                 if (g_decoder.Init(w, h)) {
-                    client_->sendText(from, "{\"type\":\"ready\"}");
+                    // 根据模式选择发送方式
+                    if (useRelay_) {
+                        client_->sendTextViaRelay(from, "{\"type\":\"ready\"}");
+                    } else {
+                        client_->sendText(from, "{\"type\":\"ready\"}");
+                    }
                     ready_ = true;
                 }
             }
@@ -465,27 +508,41 @@ public:
             }
         });
 
-        client_->setOnError([](const p2p::Error& err) {
-            std::cerr << "P2P 错误: " << err.message << std::endl;
-        });
-
-        std::cout << "连接信令服务器..." << std::endl;
+        // ========== 连接信令服务器 ==========
+        std::cout << "连接信令服务器: " << signalingUrl << std::endl;
         if (!client_->connect()) {
-            std::cerr << "P2P 连接信令服务器失败" << std::endl;
+            std::cerr << "连接信令服务器失败" << std::endl;
             return false;
         }
 
-        std::cout << "连接服务端 Peer: " << serverPeerId << std::endl;
-        client_->connectToPeer(serverPeerId);
+        // ========== 根据模式进行连接 ==========
+        if (useRelay_) {
+            // 中继模式：先认证，再连接
+            std::cout << "进行中继认证..." << std::endl;
+            if (!client_->authenticateRelay(relayPassword)) {
+                std::cerr << "中继认证失败" << std::endl;
+                return false;
+            }
 
-        // 等待 P2P 连接 + 屏幕信息
+            std::cout << "通过中继连接服务端: " << serverPeerId << std::endl;
+            if (!client_->connectToPeerViaRelay(serverPeerId)) {
+                std::cerr << "中继连接请求失败" << std::endl;
+                return false;
+            }
+        } else {
+            // P2P 模式：直接连接
+            std::cout << "P2P 连接服务端: " << serverPeerId << std::endl;
+            client_->connectToPeer(serverPeerId);
+        }
+
+        // ========== 等待连接完成和屏幕信息 ==========
         auto start = GetTickCount();
         while (!ready_ && (GetTickCount() - start) < 30000) {
             Sleep(100);
         }
 
         if (!ready_) {
-            std::cerr << "P2P 连接超时" << std::endl;
+            std::cerr << (useRelay_ ? "中继" : "P2P") << " 连接超时" << std::endl;
             return false;
         }
 
@@ -495,13 +552,19 @@ public:
     bool sendInput(const InputEvent& ev) override {
         if (!connected_ || !ready_ || !client_) return false;
 
+        // 构建输入事件数据包
         p2p::BinaryData packet;
         packet.reserve(1 + sizeof(InputEvent));
         packet.push_back(static_cast<uint8_t>(BinaryMsgType::InputEvent));
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&ev);
         packet.insert(packet.end(), ptr, ptr + sizeof(InputEvent));
 
-        return client_->sendBinary(serverPeerId_, packet);
+        // 根据模式选择发送方式
+        if (useRelay_) {
+            return client_->sendBinaryViaRelay(serverPeerId_, packet);
+        } else {
+            return client_->sendBinary(serverPeerId_, packet);
+        }
     }
 
     bool isConnected() const override { return connected_ && ready_; }
@@ -510,10 +573,17 @@ public:
         connected_ = false;
         ready_ = false;
         if (client_) {
+            if (useRelay_) {
+                client_->disconnectFromPeerViaRelay(serverPeerId_);
+            } else {
+                client_->disconnectFromPeer(serverPeerId_);
+            }
             client_->disconnect();
             client_.reset();
         }
     }
+
+    bool isRelayMode() const { return useRelay_; }
 };
 
 // ==================== 发送输入 ====================
@@ -700,12 +770,13 @@ int main() {
     WSAStartup(MAKEWORD(2,2), &wsa);
 
     std::cout << "========================================\n";
-    std::cout << "   双模式 HEVC 远程桌面客户端\n";
+    std::cout << "   三模式 HEVC 远程桌面客户端\n";
     std::cout << "========================================\n\n";
     std::cout << "选择连接方式:\n";
     std::cout << "  1. TCP 直连 (IP:端口)\n";
     std::cout << "  2. P2P 穿透 (信令服务器 + Peer ID)\n";
-    std::cout << "请选择 (1/2): ";
+    std::cout << "  3. 中继模式 (信令服务器 + Peer ID + 密码)\n";
+    std::cout << "请选择 (1/2/3): ";
 
     std::string choice;
     std::getline(std::cin, choice);
@@ -713,7 +784,48 @@ int main() {
     TransportMode mode;
     std::string connectInfo;
 
-    if (choice == "2") {
+    if (choice == "3") {
+        // ===== 中继模式 =====
+        mode = TransportMode::Relay;
+        p2p::P2PClient::setLogLevel(2);
+
+        std::string sigUrl = "ws://localhost:8080";
+        std::cout << "信令服务器 URL (默认 " << sigUrl << "): ";
+        std::string input; std::getline(std::cin, input);
+        if (!input.empty()) sigUrl = input;
+
+        std::string peerId;
+        std::cout << "服务端 Peer ID: ";
+        std::getline(std::cin, peerId);
+        if (peerId.empty()) {
+            std::cerr << "必须输入服务端 Peer ID" << std::endl;
+            return 1;
+        }
+
+        std::string password;
+        std::cout << "中继密码: ";
+        std::getline(std::cin, password);
+        if (password.empty()) {
+            std::cerr << "必须输入中继密码" << std::endl;
+            return 1;
+        }
+
+        auto* transport = new P2PTransport();
+        g_transport = transport;
+
+        std::cout << "\n正在通过中继连接..." << std::endl;
+        if (!transport->connect(sigUrl, peerId, true, password)) {
+            delete transport;
+            g_transport = nullptr;
+            WSACleanup();
+            std::cout << "按回车键退出..." << std::endl;
+            std::cin.get();
+            return 1;
+        }
+
+        connectInfo = "Relay: " + peerId;
+
+    } else if (choice == "2") {
         // ===== P2P 模式 =====
         mode = TransportMode::P2P;
         p2p::P2PClient::setLogLevel(2);
@@ -731,13 +843,16 @@ int main() {
             return 1;
         }
 
-        auto* p2p = new P2PTransport();
-        g_transport = p2p;
+        auto* transport = new P2PTransport();
+        g_transport = transport;
 
-        if (!p2p->connect(sigUrl, peerId)) {
-            delete p2p;
+        std::cout << "\n正在 P2P 连接..." << std::endl;
+        if (!transport->connect(sigUrl, peerId, false, "")) {
+            delete transport;
             g_transport = nullptr;
             WSACleanup();
+            std::cout << "按回车键退出..." << std::endl;
+            std::cin.get();
             return 1;
         }
 
@@ -764,6 +879,8 @@ int main() {
             delete tcp;
             g_transport = nullptr;
             WSACleanup();
+            std::cout << "按回车键退出..." << std::endl;
+            std::cin.get();
             return 1;
         }
 
@@ -776,7 +893,7 @@ int main() {
     WNDCLASSA wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(0);
-    wc.lpszClassName = "DualModeRemoteDesktop";
+    wc.lpszClassName = "TriModeRemoteDesktop";
     wc.hCursor = LoadCursor(0, IDC_ARROW);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     RegisterClassA(&wc);
@@ -789,10 +906,14 @@ int main() {
     int ww = GetSystemMetrics(SM_CXSCREEN) * 3 / 4;
     int wh = GetSystemMetrics(SM_CYSCREEN) * 3 / 4;
 
-    const char* title = (mode == TransportMode::TCP) ?
-        "远程桌面 [TCP]" : "远程桌面 [P2P]";
+    const char* title = nullptr;
+    switch (mode) {
+        case TransportMode::TCP:   title = "远程桌面 [TCP]";   break;
+        case TransportMode::P2P:   title = "远程桌面 [P2P]";   break;
+        case TransportMode::Relay: title = "远程桌面 [Relay]"; break;
+    }
 
-    HWND hwnd = CreateWindowExA(WS_EX_COMPOSITED, "DualModeRemoteDesktop", title,
+    HWND hwnd = CreateWindowExA(WS_EX_COMPOSITED, "TriModeRemoteDesktop", title,
         WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, ww, wh,
         nullptr, nullptr, GetModuleHandle(0), &wd);
