@@ -21,6 +21,7 @@ public:
     bool isConnected() const override;
     void disconnect() override;
     void setCallbacks(const TransportCallbacks& callbacks) override;
+    bool reconnect() override;
 
 private:
     std::unique_ptr<p2p::P2PClient> client_;
@@ -30,6 +31,13 @@ private:
     std::atomic<bool> ready_{false};
     bool useRelay_ = false;
     TransportCallbacks callbacks_;
+    
+    // 保存连接参数用于重连
+    std::string savedSignalingUrl_;
+    std::string savedPeerId_;
+    ServiceType savedService_ = ServiceType::Desktop;
+    bool savedUseRelay_ = false;
+    std::string savedRelayPassword_;
 };
 
 // ==================== P2P服务端传输 ====================
@@ -38,17 +46,14 @@ public:
     P2PServerTransport(ServiceType service);
     ~P2PServerTransport();
 
-    // 带参数的启动
     bool start(const std::string& signalingUrl, const std::string& peerId = "");
     
-    // IServerTransport 接口
-    bool start() override;  // 使用预设参数
+    bool start() override;
     void stop() override;
     bool send(const BinaryData& data) override;
     bool hasClient() const override;
     void setCallbacks(const TransportCallbacks& callbacks) override;
     
-    // 预设参数
     void setConfig(const std::string& signalingUrl, const std::string& peerId = "") {
         signalingUrl_ = signalingUrl;
         peerId_ = peerId;

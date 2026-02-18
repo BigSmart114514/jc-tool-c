@@ -1,4 +1,3 @@
-
 #ifndef TRANSPORT_H
 #define TRANSPORT_H
 
@@ -23,6 +22,9 @@ public:
     virtual bool isConnected() const = 0;
     virtual void disconnect() = 0;
     virtual void setCallbacks(const TransportCallbacks& callbacks) = 0;
+    
+    // 使用之前保存的参数重新连接
+    virtual bool reconnect() = 0;
 };
 
 // ==================== 服务端传输接口 ====================

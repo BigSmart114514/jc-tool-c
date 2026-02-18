@@ -47,6 +47,10 @@ private:
     void onDisconnect();
     void onDesktopWindowClosed();
     void onFileWindowClosed();
+    
+    // 检查连接状态，必要时尝试重连
+    bool ensureDesktopConnected();
+    bool ensureFileConnected();
 
     HWND hwnd_ = nullptr;
     HWND hBtnDesktop_ = nullptr;
@@ -56,7 +60,6 @@ private:
 
     ControlPanelConfig config_;
 
-    // 窗口指针 + 保护锁
     DesktopWindow* desktopWindow_ = nullptr;
     FileWindow* fileWindow_ = nullptr;
     std::mutex windowMtx_;

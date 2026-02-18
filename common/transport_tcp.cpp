@@ -9,6 +9,10 @@ TCPClientTransport::~TCPClientTransport() {
 }
 
 bool TCPClientTransport::connect(const std::string& ip, int port) {
+    // 保存连接参数用于重连
+    savedIp_ = ip;
+    savedPort_ = port;
+
     socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_ == INVALID_SOCKET) {
         std::cerr << "[TCP Client] socket() failed: " << WSAGetLastError() << std::endl;
@@ -57,6 +61,21 @@ bool TCPClientTransport::connect(const std::string& ip, int port) {
 
     if (callbacks_.onConnected) callbacks_.onConnected();
     return true;
+}
+
+bool TCPClientTransport::reconnect() {
+    if (savedIp_.empty() || savedPort_ == 0) {
+        std::cerr << "[TCP Client] No saved connection parameters for reconnect" << std::endl;
+        return false;
+    }
+    
+    std::cout << "[TCP Client] Attempting reconnect to " << savedIp_ << ":" << savedPort_ << std::endl;
+    
+    // 先断开旧连接
+    disconnect();
+    
+    // 使用保存的参数重连
+    return connect(savedIp_, savedPort_);
 }
 
 void TCPClientTransport::recvLoop() {

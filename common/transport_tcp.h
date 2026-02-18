@@ -1,4 +1,3 @@
-
 #ifndef TRANSPORT_TCP_H
 #define TRANSPORT_TCP_H
 
@@ -18,6 +17,7 @@ public:
     bool isConnected() const override;
     void disconnect() override;
     void setCallbacks(const TransportCallbacks& callbacks) override;
+    bool reconnect() override;
 
 private:
     void recvLoop();
@@ -27,6 +27,10 @@ private:
     std::thread recvThread_;
     TransportCallbacks callbacks_;
     std::mutex sendMtx_;
+    
+    // 保存连接参数用于重连
+    std::string savedIp_;
+    int savedPort_ = 0;
 };
 
 // ==================== TCP服务端传输 ====================

@@ -23,7 +23,6 @@ void ControlPanel::setConfig(const ControlPanelConfig& config) {
 }
 
 void ControlPanel::setupTransportCallbacks() {
-    // 桌面传输回调 —— 转发给 DesktopWindow（如果存在）
     if (config_.desktopTransport) {
         TransportCallbacks cb;
         cb.onConnected = []() {
@@ -41,7 +40,6 @@ void ControlPanel::setupTransportCallbacks() {
         config_.desktopTransport->setCallbacks(cb);
     }
 
-    // 文件传输回调 —— 转发给 FileWindow（如果存在）
     if (config_.fileTransport) {
         TransportCallbacks cb;
         cb.onConnected = []() {
@@ -58,6 +56,72 @@ void ControlPanel::setupTransportCallbacks() {
         };
         config_.fileTransport->setCallbacks(cb);
     }
+}
+
+bool ControlPanel::ensureDesktopConnected() {
+    if (!config_.desktopTransport) {
+        MessageBoxW(hwnd_, L"Desktop transport not configured", L"Error", MB_ICONERROR);
+        return false;
+    }
+    
+    if (config_.desktopTransport->isConnected()) {
+        return true;
+    }
+    
+    // 尝试重连
+    updateStatus(L"Reconnecting desktop...");
+    
+    // 禁用按钮防止重复点击
+    EnableWindow(hBtnDesktop_, FALSE);
+    
+    bool result = config_.desktopTransport->reconnect();
+    
+    EnableWindow(hBtnDesktop_, TRUE);
+    
+    if (!result) {
+        MessageBoxW(hwnd_, 
+            L"Failed to reconnect to remote desktop.\n"
+            L"Please check your network connection and try again.", 
+            L"Connection Error", MB_ICONERROR);
+        updateStatus(L"Desktop connection failed");
+        return false;
+    }
+    
+    updateStatus(L"Desktop reconnected");
+    return true;
+}
+
+bool ControlPanel::ensureFileConnected() {
+    if (!config_.fileTransport) {
+        MessageBoxW(hwnd_, L"File transport not configured", L"Error", MB_ICONERROR);
+        return false;
+    }
+    
+    if (config_.fileTransport->isConnected()) {
+        return true;
+    }
+    
+    // 尝试重连
+    updateStatus(L"Reconnecting file transport...");
+    
+    // 禁用按钮防止重复点击
+    EnableWindow(hBtnFileManager_, FALSE);
+    
+    bool result = config_.fileTransport->reconnect();
+    
+    EnableWindow(hBtnFileManager_, TRUE);
+    
+    if (!result) {
+        MessageBoxW(hwnd_, 
+            L"Failed to reconnect to file service.\n"
+            L"Please check your network connection and try again.", 
+            L"Connection Error", MB_ICONERROR);
+        updateStatus(L"File connection failed");
+        return false;
+    }
+    
+    updateStatus(L"File transport reconnected");
+    return true;
 }
 
 bool ControlPanel::create(HINSTANCE hInstance) {
@@ -85,8 +149,6 @@ bool ControlPanel::create(HINSTANCE hInstance) {
                               DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
 
     createControls();
-    
-    // 设置传输回调（只做一次，永不更换）
     setupTransportCallbacks();
 
     ShowWindow(hwnd_, SW_SHOW);
@@ -195,7 +257,6 @@ void ControlPanel::updateStatus(const wchar_t* text) {
 
 void ControlPanel::toggleDesktop() {
     if (desktopOpen_) {
-        // 关闭桌面 —— 先从锁里移除指针
         DesktopWindow* toDelete = nullptr;
         {
             std::lock_guard<std::mutex> lock(windowMtx_);
@@ -210,18 +271,21 @@ void ControlPanel::toggleDesktop() {
         SetWindowTextW(hBtnDesktop_, L"Open Desktop");
         updateStatus(L"Desktop closed");
     } else {
-        // 打开桌面
+        // ====== 检查连接状态，必要时重连 ======
+        if (!ensureDesktopConnected()) {
+            return;
+        }
+        // =====================================
+
         auto* dw = new DesktopWindow();
         dw->init(config_.desktopTransport);
         dw->setInputToggles(&enableMouseMove_, &enableMouseClick_, &enableKeyboard_);
 
         dw->setOnClosed([this]() {
-            // 从桌面窗口的 X 按钮关闭 → 通知控制面板
             PostMessage(hwnd_, WM_DESKTOP_CLOSED, 0, 0);
         });
 
         dw->setOnOpenFileManager([this]() {
-            // F12
             if (!fileManagerOpen_) {
                 PostMessage(hwnd_, WM_COMMAND, MAKEWPARAM(IDC_BTN_FILEMANAGER, 0), 0);
             }
@@ -243,7 +307,6 @@ void ControlPanel::toggleDesktop() {
         SetWindowTextW(hBtnDesktop_, L"Close Desktop");
         updateStatus(L"Desktop opened");
 
-        // 请求服务端推流
         dw->requestStream();
     }
 }
@@ -264,6 +327,12 @@ void ControlPanel::toggleFileManager() {
         SetWindowTextW(hBtnFileManager_, L"Open File Manager");
         updateStatus(L"File Manager closed");
     } else {
+        // ====== 检查连接状态，必要时重连 ======
+        if (!ensureFileConnected()) {
+            return;
+        }
+        // =====================================
+
         auto* fw = new FileWindow();
         fw->init(config_.fileTransport);
 
@@ -324,7 +393,6 @@ void ControlPanel::onFileWindowClosed() {
 }
 
 void ControlPanel::onDisconnect() {
-    // 关闭所有窗口
     {
         std::lock_guard<std::mutex> lock(windowMtx_);
         if (desktopWindow_) {

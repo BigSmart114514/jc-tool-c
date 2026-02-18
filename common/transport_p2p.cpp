@@ -13,6 +13,13 @@ bool P2PClientTransport::connect(const std::string& signalingUrl,
                                   ServiceType service,
                                   bool useRelay,
                                   const std::string& relayPassword) {
+    // 保存连接参数用于重连
+    savedSignalingUrl_ = signalingUrl;
+    savedPeerId_ = peerId;
+    savedService_ = service;
+    savedUseRelay_ = useRelay;
+    savedRelayPassword_ = relayPassword;
+
     peerId_ = peerId;
     service_ = service;
     useRelay_ = useRelay;
@@ -93,6 +100,21 @@ bool P2PClientTransport::connect(const std::string& signalingUrl,
     }
 
     return connected_;
+}
+
+bool P2PClientTransport::reconnect() {
+    if (savedSignalingUrl_.empty() || savedPeerId_.empty()) {
+        std::cerr << "[P2P Client] No saved connection parameters for reconnect" << std::endl;
+        return false;
+    }
+    
+    std::cout << "[P2P Client] Attempting reconnect to " << savedPeerId_ << std::endl;
+    
+    // 先断开旧连接
+    disconnect();
+    
+    // 使用保存的参数重连
+    return connect(savedSignalingUrl_, savedPeerId_, savedService_, savedUseRelay_, savedRelayPassword_);
 }
 
 bool P2PClientTransport::send(const BinaryData& data) {
