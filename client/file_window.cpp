@@ -139,10 +139,16 @@ void FileWindow::handleMessage(const BinaryData& data) {
             if (!downloading_) break;
 
             if (header->chunkSize > 0 && downloadFile_ != INVALID_HANDLE_VALUE) {
-                const uint8_t* chunkData = data.data() + 1 + sizeof(FileManager::TransferHeader);
-                DWORD written;
-                WriteFile(downloadFile_, chunkData, header->chunkSize, &written, nullptr);
-                downloadReceived_ += written;
+                // 增加越界校验：确保 data 的实际大小包含完整的 chunkData
+                size_t requiredSize = 1 + sizeof(FileManager::TransferHeader) + header->chunkSize;
+                if (data.size() >= requiredSize) {
+                    const uint8_t* chunkData = data.data() + 1 + sizeof(FileManager::TransferHeader);
+                    DWORD written;
+                    WriteFile(downloadFile_, chunkData, header->chunkSize, &written, nullptr);
+                    downloadReceived_ += written;
+                } else {
+                    std::cerr << "[File Window] Received fragmented or invalid chunk" << std::endl;
+                }
             }
 
             if (header->totalSize > 0) {
@@ -384,7 +390,8 @@ void FileWindow::onDownloadProgress(int percent) {
 void FileWindow::onDownloadComplete(bool success) {
     if (progressDialog_) {
         progressDialog_->close();
-        delete progressDialog_;
+        // 修复：使用 deleteLater 安全释放内存，避免事件循环中野指针访问
+        progressDialog_->deleteLater(); 
         progressDialog_ = nullptr;
     }
     
