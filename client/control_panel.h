@@ -1,22 +1,21 @@
 #ifndef CONTROL_PANEL_H
 #define CONTROL_PANEL_H
 
+#include <QMainWindow>
+#include <QLabel>
+#include <QPushButton>
+#include <QCheckBox>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGroupBox>
+#include <QStatusBar>
+#include <QMessageBox>
+#include <atomic>
+#include <mutex>
 #include "../common/protocol.h"
 #include "../common/transport.h"
 #include "desktop_window.h"
 #include "file_window.h"
-#include <atomic>
-#include <mutex>
-#include <string>
-
-#define IDC_STATIC_MODE         4001
-#define IDC_STATIC_STATUS       4002
-#define IDC_BTN_DESKTOP         4010
-#define IDC_BTN_FILEMANAGER     4011
-#define IDC_BTN_DISCONNECT      4012
-#define IDC_CHECK_MOUSE_MOVE    4020
-#define IDC_CHECK_MOUSE_CLICK   4021
-#define IDC_CHECK_KEYBOARD      4022
 
 struct ControlPanelConfig {
     ITransport* desktopTransport = nullptr;
@@ -25,41 +24,45 @@ struct ControlPanelConfig {
     std::string connectInfo;
 };
 
-class ControlPanel {
+class ControlPanel : public QMainWindow {
+    Q_OBJECT
+
 public:
-    ControlPanel();
+    explicit ControlPanel(QWidget* parent = nullptr);
     ~ControlPanel();
 
     void setConfig(const ControlPanelConfig& config);
-    bool create(HINSTANCE hInstance);
-    void destroy();
-
-    HWND getHwnd() const { return hwnd_; }
-
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-
-private:
-    void createControls();
     void setupTransportCallbacks();
-    void updateStatus(const wchar_t* text);
+
+private slots:
     void toggleDesktop();
     void toggleFileManager();
     void onDisconnect();
     void onDesktopWindowClosed();
     void onFileWindowClosed();
-    
-    // 检查连接状态，必要时尝试重连
+    void onMouseMoveToggled(bool checked);
+    void onMouseClickToggled(bool checked);
+    void onKeyboardToggled(bool checked);
+
+private:
+    void createUI();
+    void updateStatus(const QString& text);
     bool ensureDesktopConnected();
     bool ensureFileConnected();
 
-    HWND hwnd_ = nullptr;
-    HWND hBtnDesktop_ = nullptr;
-    HWND hBtnFileManager_ = nullptr;
-    HWND hBtnDisconnect_ = nullptr;
-    HWND hStaticStatus_ = nullptr;
+    // UI组件
+    QLabel* lblMode_;
+    QLabel* lblInfo_;
+    QStatusBar* statusBar_;
+    QPushButton* btnDesktop_;
+    QPushButton* btnFileManager_;
+    QPushButton* btnDisconnect_;
+    QCheckBox* chkMouseMove_;
+    QCheckBox* chkMouseClick_;
+    QCheckBox* chkKeyboard_;
 
+    // 配置和状态
     ControlPanelConfig config_;
-
     DesktopWindow* desktopWindow_ = nullptr;
     FileWindow* fileWindow_ = nullptr;
     std::mutex windowMtx_;
@@ -70,10 +73,6 @@ private:
     std::atomic<bool> enableMouseMove_{true};
     std::atomic<bool> enableMouseClick_{true};
     std::atomic<bool> enableKeyboard_{true};
-
-    HINSTANCE hInstance_ = nullptr;
-    HFONT hFont_ = nullptr;
-    HFONT hFontBold_ = nullptr;
 };
 
-#endif
+#endif // CONTROL_PANEL_H

@@ -1,67 +1,76 @@
 #ifndef DESKTOP_WINDOW_H
 #define DESKTOP_WINDOW_H
 
+#include <QWidget>
+#include <QLabel>
+#include <QPixmap>
+#include <QImage>
+#include <QMouseEvent>
+#include <QKeyEvent>
+#include <QTimer>
+#include <atomic>
 #include "../common/protocol.h"
 #include "../common/transport.h"
 #include "hevc_decoder.h"
-#include "display_buffer.h"
-#include <atomic>
-#include <functional>
 
-class DesktopWindow {
+class DesktopWindow : public QWidget {
+    Q_OBJECT
+
 public:
-    DesktopWindow();
+    explicit DesktopWindow(QWidget* parent = nullptr);
     ~DesktopWindow();
 
-    // 只存储传输指针（用于发送），不设置回调
     void init(ITransport* transport);
-    
-    bool create(HINSTANCE hInstance, const char* title);
-    void destroy();
-
-    // 由 ControlPanel 从传输回调中调用
     void handleMessage(const BinaryData& data);
-
-    HWND getHwnd() const { return hwnd_; }
+    void requestStream();
 
     void setInputToggles(std::atomic<bool>* mouseMove,
-                         std::atomic<bool>* mouseClick,
-                         std::atomic<bool>* keyboard) {
+                        std::atomic<bool>* mouseClick,
+                        std::atomic<bool>* keyboard) {
         pEnableMouseMove_ = mouseMove;
         pEnableMouseClick_ = mouseClick;
         pEnableKeyboard_ = keyboard;
     }
 
-    void setOnClosed(std::function<void()> callback) { onClosed_ = callback; }
-    void setOnOpenFileManager(std::function<void()> callback) { onOpenFileManager_ = callback; }
+signals:
+    void closed();
+    void openFileManager();
+    void frameReady();
 
-    // 请求服务端开始推流
-    void requestStream();
+protected:
+    void closeEvent(QCloseEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+private slots:
+    void updateDisplay();
 
 private:
     void handleVideoFrame(const uint8_t* data, size_t size, bool isKeyframe);
     void handleScreenInfo(const BinaryData& data);
     void sendInput(const Desktop::InputEvent& ev);
-    bool convertToImageCoords(int cx, int cy, int& ix, int& iy);
+    bool convertToImageCoords(int wx, int wy, int& ix, int& iy);
 
-    HWND hwnd_ = nullptr;
+    QLabel* displayLabel_;
+    QPixmap currentFrame_;
+    
     ITransport* transport_ = nullptr;
     HEVCDecoder decoder_;
-    DisplayBuffer display_;
 
     std::atomic<int> screenWidth_{0};
     std::atomic<int> screenHeight_{0};
-    DWORD lastFrameTime_ = 0;
     bool decoderReady_ = false;
 
     std::atomic<bool>* pEnableMouseMove_ = nullptr;
     std::atomic<bool>* pEnableMouseClick_ = nullptr;
     std::atomic<bool>* pEnableKeyboard_ = nullptr;
 
-    std::function<void()> onClosed_;
-    std::function<void()> onOpenFileManager_;
+    QTimer* updateTimer_;
 };
 
-#endif
+#endif // DESKTOP_WINDOW_H

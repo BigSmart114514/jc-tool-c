@@ -1,66 +1,91 @@
-#define UNICODE
-#define _UNICODE
-
 #include "file_window.h"
-#include <shlwapi.h>
-#include <shellapi.h>
-#include <commdlg.h>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QFileDialog>
+#include <QMessageBox>
+#include <QCloseEvent>
+#include <QDateTime>
 #include <iostream>
 
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "comdlg32.lib")
-
-#pragma comment(linker,"\"/manifestdependency:type='win32' \
-    name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
-    processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
-
-#define WM_FILE_LIST_READY   (WM_USER + 200)
-#define WM_DOWNLOAD_PROGRESS (WM_USER + 201)
-#define WM_DOWNLOAD_COMPLETE (WM_USER + 202)
-
-#define IDC_LISTVIEW    2001
-#define IDC_STATUSBAR   2002
-#define IDC_ADDRESSBAR  2003
-#define IDC_GO_BUTTON   2004
-#define IDC_UP_BUTTON   2005
-#define IDC_REFRESH_BTN 2006
-
-#define IDM_DOWNLOAD   3001
-#define IDM_REFRESH    3002
-#define IDM_OPEN       3003
-#define IDM_PROPERTIES 3004
-
-// Unicode 版本的 ListView 辅助函数
-static inline int LV_InsertItemW(HWND hwnd, const LVITEMW* item) {
-    return (int)SendMessageW(hwnd, LVM_INSERTITEMW, 0, (LPARAM)item);
-}
-
-static inline void LV_SetItemTextW(HWND hwnd, int iItem, int iSubItem, LPWSTR pszText) {
-    LVITEMW lvi = {};
-    lvi.iSubItem = iSubItem;
-    lvi.pszText = pszText;
-    SendMessageW(hwnd, LVM_SETITEMTEXTW, (WPARAM)iItem, (LPARAM)&lvi);
-}
-
-static inline int LV_InsertColumnW(HWND hwnd, int iCol, const LVCOLUMNW* col) {
-    return (int)SendMessageW(hwnd, LVM_INSERTCOLUMNW, (WPARAM)iCol, (LPARAM)col);
-}
-
-static FileWindow* g_fileWindow = nullptr;
-
-FileWindow::FileWindow() {
-    g_fileWindow = this;
+FileWindow::FileWindow(QWidget* parent)
+    : QMainWindow(parent) {
+    
+    setWindowTitle("Remote File Manager");
+    resize(800, 600);
+    
+    createUI();
+    
+    connect(this, &FileWindow::fileListReady, this, &FileWindow::onFileListReady);
+    connect(this, &FileWindow::downloadProgress, this, &FileWindow::onDownloadProgress);
+    connect(this, &FileWindow::downloadComplete, this, &FileWindow::onDownloadComplete);
 }
 
 FileWindow::~FileWindow() {
-    destroy();
-    g_fileWindow = nullptr;
+    if (downloadFile_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(downloadFile_);
+    }
+}
+
+void FileWindow::createUI() {
+    QWidget* central = new QWidget(this);
+    setCentralWidget(central);
+
+    QVBoxLayout* mainLayout = new QVBoxLayout(central);
+    mainLayout->setContentsMargins(5, 5, 5, 5);
+
+    // 工具栏
+    QHBoxLayout* toolbarLayout = new QHBoxLayout();
+    
+    btnUp_ = new QPushButton("Up", this);
+    btnUp_->setFixedWidth(50);
+    connect(btnUp_, &QPushButton::clicked, this, &FileWindow::onUpClicked);
+    toolbarLayout->addWidget(btnUp_);
+    
+    addressBar_ = new QLineEdit(this);
+    toolbarLayout->addWidget(addressBar_);
+    
+    btnGo_ = new QPushButton("Go", this);
+    btnGo_->setFixedWidth(50);
+    connect(btnGo_, &QPushButton::clicked, this, &FileWindow::onGoClicked);
+    toolbarLayout->addWidget(btnGo_);
+    
+    btnRefresh_ = new QPushButton("Refresh", this);
+    btnRefresh_->setFixedWidth(70);
+    connect(btnRefresh_, &QPushButton::clicked, this, &FileWindow::onRefreshClicked);
+    toolbarLayout->addWidget(btnRefresh_);
+    
+    mainLayout->addLayout(toolbarLayout);
+
+    // 文件列表
+    treeWidget_ = new QTreeWidget(this);
+    treeWidget_->setColumnCount(4);
+    treeWidget_->setHeaderLabels({"Name", "Size", "Type", "Modified"});
+    treeWidget_->setRootIsDecorated(false);
+    treeWidget_->setAlternatingRowColors(true);
+    treeWidget_->setSelectionMode(QAbstractItemView::SingleSelection);
+    treeWidget_->setContextMenuPolicy(Qt::CustomContextMenu);
+    
+    treeWidget_->header()->resizeSection(0, 300);
+    treeWidget_->header()->resizeSection(1, 120);
+    treeWidget_->header()->resizeSection(2, 100);
+    treeWidget_->header()->resizeSection(3, 180);
+    
+    connect(treeWidget_, &QTreeWidget::itemDoubleClicked, 
+            this, &FileWindow::onItemDoubleClicked);
+    connect(treeWidget_, &QTreeWidget::customContextMenuRequested,
+            this, &FileWindow::onItemRightClicked);
+    
+    mainLayout->addWidget(treeWidget_);
+
+    // 状态栏
+    statusBar_ = new QStatusBar(this);
+    setStatusBar(statusBar_);
+    statusBar_->showMessage("Ready");
 }
 
 void FileWindow::init(ITransport* transport) {
     transport_ = transport;
-    // 不设置传输层回调！回调由 ControlPanel 管理
 }
 
 void FileWindow::handleMessage(const BinaryData& data) {
@@ -81,7 +106,8 @@ void FileWindow::handleMessage(const BinaryData& data) {
                 auto* entries = reinterpret_cast<const FileManager::FileEntry*>(
                     data.data() + 1 + sizeof(FileManager::ListHeader));
 
-                size_t expectedSize = 1 + sizeof(FileManager::ListHeader) + header->count * sizeof(FileManager::FileEntry);
+                size_t expectedSize = 1 + sizeof(FileManager::ListHeader) + 
+                                     header->count * sizeof(FileManager::FileEntry);
                 if (data.size() >= expectedSize) {
                     for (uint32_t i = 0; i < header->count; i++) {
                         files_.push_back(entries[i]);
@@ -89,7 +115,7 @@ void FileWindow::handleMessage(const BinaryData& data) {
                 }
             }
 
-            if (hwnd_) PostMessageW(hwnd_, WM_FILE_LIST_READY, 0, 0);
+            emit fileListReady();
             break;
         }
 
@@ -103,10 +129,10 @@ void FileWindow::handleMessage(const BinaryData& data) {
                 if (downloadFile_ != INVALID_HANDLE_VALUE) {
                     CloseHandle(downloadFile_);
                     downloadFile_ = INVALID_HANDLE_VALUE;
-                    DeleteFileW(downloadPath_.c_str());
+                    QFile::remove(downloadPath_);
                 }
                 downloading_ = false;
-                if (hwnd_) PostMessageW(hwnd_, WM_DOWNLOAD_COMPLETE, 0, 1);
+                emit downloadComplete(false);
                 break;
             }
 
@@ -119,9 +145,9 @@ void FileWindow::handleMessage(const BinaryData& data) {
                 downloadReceived_ += written;
             }
 
-            if (hwnd_ && header->totalSize > 0) {
+            if (header->totalSize > 0) {
                 int progress = static_cast<int>((downloadReceived_ * 100) / header->totalSize);
-                PostMessageW(hwnd_, WM_DOWNLOAD_PROGRESS, progress, 0);
+                emit downloadProgress(progress);
             }
 
             if (header->status == static_cast<uint8_t>(FileManager::Status::Complete)) {
@@ -130,7 +156,7 @@ void FileWindow::handleMessage(const BinaryData& data) {
                     downloadFile_ = INVALID_HANDLE_VALUE;
                 }
                 downloading_ = false;
-                if (hwnd_) PostMessageW(hwnd_, WM_DOWNLOAD_COMPLETE, 0, 0);
+                emit downloadComplete(true);
             }
             break;
         }
@@ -140,79 +166,76 @@ void FileWindow::handleMessage(const BinaryData& data) {
     }
 }
 
-void FileWindow::navigateTo(const std::wstring& path) {
+void FileWindow::navigateTo(const QString& path) {
     if (!transport_ || !transport_->isConnected()) return;
     
     currentPath_ = path;
-    SetWindowTextW(hAddressBar_, path.c_str());
-    SendMessageW(hStatusBar_, SB_SETTEXTW, 0, (LPARAM)L"Loading...");
+    addressBar_->setText(path);
+    statusBar_->showMessage("Loading...");
     
-    auto request = MessageBuilder::FileListRequest(path);
+    auto request = MessageBuilder::FileListRequest(path.toStdWString());
     transport_->send(request);
 }
 
-void FileWindow::goUp() {
-    if (currentPath_.empty()) return;
+void FileWindow::onGoClicked() {
+    navigateTo(addressBar_->text());
+}
+
+void FileWindow::onUpClicked() {
+    if (currentPath_.isEmpty()) return;
     
-    size_t pos = currentPath_.rfind(L'\\');
-    if (pos == std::wstring::npos) {
-        navigateTo(L"");
+    int pos = currentPath_.lastIndexOf('\\');
+    if (pos == -1) {
+        navigateTo("");
     } else if (pos == 2 && currentPath_.length() == 3) {
-        navigateTo(L"");
+        navigateTo("");
     } else {
-        navigateTo(currentPath_.substr(0, pos));
+        navigateTo(currentPath_.left(pos));
     }
 }
 
-void FileWindow::refresh() {
+void FileWindow::onRefreshClicked() {
     navigateTo(currentPath_);
 }
 
-void FileWindow::populateListView() {
-    SendMessageW(hListView_, LVM_DELETEALLITEMS, 0, 0);
+void FileWindow::onFileListReady() {
+    populateFileList();
+}
+
+void FileWindow::populateFileList() {
+    treeWidget_->clear();
     
     std::lock_guard<std::mutex> lock(filesMtx_);
     
-    for (size_t i = 0; i < files_.size(); i++) {
-        const auto& entry = files_[i];
+    for (const auto& entry : files_) {
+        QTreeWidgetItem* item = new QTreeWidgetItem(treeWidget_);
         
-        LVITEMW item = {};
-        item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
-        item.iItem = static_cast<int>(i);
-        item.pszText = const_cast<LPWSTR>(entry.name);
-        item.lParam = static_cast<LPARAM>(i);
-        
-        switch (static_cast<FileManager::FileType>(entry.type)) {
-            case FileManager::FileType::Drive:     item.iImage = 2; break;
-            case FileManager::FileType::Directory: item.iImage = 0; break;
-            default:                               item.iImage = 1; break;
-        }
-        
-        int idx = LV_InsertItemW(hListView_, &item);
+        // 名称
+        item->setText(0, QString::fromWCharArray(entry.name));
         
         // 大小
         if (static_cast<FileManager::FileType>(entry.type) == FileManager::FileType::File) {
-            wchar_t sizeStr[64];
+            QString sizeStr;
             if (entry.size < 1024) {
-                swprintf(sizeStr, 64, L"%llu B", entry.size);
+                sizeStr = QString::number(entry.size) + " B";
             } else if (entry.size < 1024 * 1024) {
-                swprintf(sizeStr, 64, L"%.2f KB", entry.size / 1024.0);
+                sizeStr = QString::number(entry.size / 1024.0, 'f', 2) + " KB";
             } else if (entry.size < 1024ULL * 1024 * 1024) {
-                swprintf(sizeStr, 64, L"%.2f MB", entry.size / (1024.0 * 1024.0));
+                sizeStr = QString::number(entry.size / (1024.0 * 1024.0), 'f', 2) + " MB";
             } else {
-                swprintf(sizeStr, 64, L"%.2f GB", entry.size / (1024.0 * 1024.0 * 1024.0));
+                sizeStr = QString::number(entry.size / (1024.0 * 1024.0 * 1024.0), 'f', 2) + " GB";
             }
-            LV_SetItemTextW(hListView_, idx, 1, sizeStr);
+            item->setText(1, sizeStr);
         }
         
         // 类型
-        wchar_t typeStr[32] = L"";
+        QString typeStr;
         switch (static_cast<FileManager::FileType>(entry.type)) {
-            case FileManager::FileType::Drive:     wcscpy(typeStr, L"Drive"); break;
-            case FileManager::FileType::Directory: wcscpy(typeStr, L"Folder"); break;
-            default:                               wcscpy(typeStr, L"File"); break;
+            case FileManager::FileType::Drive:     typeStr = "Drive"; break;
+            case FileManager::FileType::Directory: typeStr = "Folder"; break;
+            default:                               typeStr = "File"; break;
         }
-        LV_SetItemTextW(hListView_, idx, 2, typeStr);
+        item->setText(2, typeStr);
         
         // 时间
         if (entry.modifyTime != 0) {
@@ -224,108 +247,82 @@ void FileWindow::populateListView() {
             FileTimeToLocalFileTime(&ft, &ft);
             FileTimeToSystemTime(&ft, &st);
             
-            wchar_t timeStr[64];
-            swprintf(timeStr, 64, L"%04d-%02d-%02d %02d:%02d",
-                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
-            LV_SetItemTextW(hListView_, idx, 3, timeStr);
+            QDateTime dt(QDate(st.wYear, st.wMonth, st.wDay),
+                        QTime(st.wHour, st.wMinute, st.wSecond));
+            item->setText(3, dt.toString("yyyy-MM-dd HH:mm:ss"));
         }
+        
+        // 存储索引
+        item->setData(0, Qt::UserRole, static_cast<int>(&entry - &files_[0]));
     }
     
-    wchar_t status[256];
-    swprintf(status, 256, L"%zu items", files_.size());
-    SendMessageW(hStatusBar_, SB_SETTEXTW, 0, (LPARAM)status);
+    statusBar_->showMessage(QString("%1 items").arg(files_.size()));
 }
 
-void FileWindow::onListViewDblClick() {
-    int sel = ListView_GetNextItem(hListView_, -1, LVNI_SELECTED);
-    if (sel < 0) return;
+void FileWindow::onItemDoubleClicked(QTreeWidgetItem* item, int column) {
+    if (!item) return;
     
+    int index = item->data(0, Qt::UserRole).toInt();
     FileManager::FileEntry entry;
+    
     {
         std::lock_guard<std::mutex> lock(filesMtx_);
-        if (sel >= static_cast<int>(files_.size())) return;
-        entry = files_[sel];
+        if (index < 0 || index >= static_cast<int>(files_.size())) return;
+        entry = files_[index];
     }
     
     auto type = static_cast<FileManager::FileType>(entry.type);
+    QString name = QString::fromWCharArray(entry.name);
     
     if (type == FileManager::FileType::Drive) {
-        std::wstring newPath = entry.name;
-        newPath += L"\\";
-        navigateTo(newPath);
+        navigateTo(name + "\\");
     } else if (type == FileManager::FileType::Directory) {
-        if (wcscmp(entry.name, L"..") == 0) {
-            goUp();
+        if (name == "..") {
+            onUpClicked();
         } else {
-            std::wstring newPath = currentPath_;
-            if (!newPath.empty() && newPath.back() != L'\\') {
-                newPath += L"\\";
+            QString newPath = currentPath_;
+            if (!newPath.isEmpty() && !newPath.endsWith('\\')) {
+                newPath += "\\";
             }
-            newPath += entry.name;
+            newPath += name;
             navigateTo(newPath);
         }
     }
 }
 
-void FileWindow::onListViewRightClick() {
-    POINT pt;
-    GetCursorPos(&pt);
+void FileWindow::onItemRightClicked(const QPoint& pos) {
+    QTreeWidgetItem* item = treeWidget_->itemAt(pos);
+    if (!item) return;
     
-    int sel = ListView_GetNextItem(hListView_, -1, LVNI_SELECTED);
-    if (sel < 0) return;
-    
+    int index = item->data(0, Qt::UserRole).toInt();
     FileManager::FileEntry entry;
+    
     {
         std::lock_guard<std::mutex> lock(filesMtx_);
-        if (sel >= static_cast<int>(files_.size())) return;
-        entry = files_[sel];
+        if (index < 0 || index >= static_cast<int>(files_.size())) return;
+        entry = files_[index];
     }
     
-    HMENU hMenu = CreatePopupMenu();
+    QMenu menu(this);
     auto type = static_cast<FileManager::FileType>(entry.type);
     
     if (type == FileManager::FileType::File) {
-        AppendMenuW(hMenu, MF_STRING, IDM_DOWNLOAD, L"Download");
-        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        QAction* downloadAction = menu.addAction("Download");
+        connect(downloadAction, &QAction::triggered, [this, index]() {
+            downloadFile(index);
+        });
+        menu.addSeparator();
     } else {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN, L"Open");
-        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        QAction* openAction = menu.addAction("Open");
+        connect(openAction, &QAction::triggered, [this, item]() {
+            onItemDoubleClicked(item, 0);
+        });
+        menu.addSeparator();
     }
     
-    AppendMenuW(hMenu, MF_STRING, IDM_REFRESH, L"Refresh");
-    AppendMenuW(hMenu, MF_STRING, IDM_PROPERTIES, L"Properties");
+    menu.addAction("Refresh", this, &FileWindow::onRefreshClicked);
     
-    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
-    DestroyMenu(hMenu);
-    
-    switch (cmd) {
-        case IDM_DOWNLOAD:
-            downloadFile(sel);
-            break;
-        case IDM_OPEN:
-            onListViewDblClick();
-            break;
-        case IDM_REFRESH:
-            refresh();
-            break;
-        case IDM_PROPERTIES: {
-            std::wstring info = L"Name: ";
-            info += entry.name;
-            info += L"\nType: ";
-            switch (type) {
-                case FileManager::FileType::File: info += L"File"; break;
-                case FileManager::FileType::Directory: info += L"Folder"; break;
-                case FileManager::FileType::Drive: info += L"Drive"; break;
-            }
-            if (type == FileManager::FileType::File) {
-                wchar_t sizeStr[64];
-                swprintf(sizeStr, 64, L"\nSize: %llu bytes", entry.size);
-                info += sizeStr;
-            }
-            MessageBoxW(hwnd_, info.c_str(), L"Properties", MB_OK | MB_ICONINFORMATION);
-            break;
-        }
-    }
+    menu.exec(treeWidget_->viewport()->mapToGlobal(pos));
 }
 
 void FileWindow::downloadFile(int index) {
@@ -338,27 +335,19 @@ void FileWindow::downloadFile(int index) {
     
     if (static_cast<FileManager::FileType>(entry.type) != FileManager::FileType::File) return;
     if (downloading_) {
-        MessageBoxW(hwnd_, L"Download in progress", L"Info", MB_OK);
+        QMessageBox::information(this, "Info", "Download in progress");
         return;
     }
     
-    wchar_t savePath[MAX_PATH] = {};
-    wcscpy(savePath, entry.name);
+    QString fileName = QString::fromWCharArray(entry.name);
+    QString savePath = QFileDialog::getSaveFileName(this, "Save File", fileName);
+    if (savePath.isEmpty()) return;
     
-    OPENFILENAMEW ofn = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd_;
-    ofn.lpstrFile = savePath;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrTitle = L"Save File";
-    ofn.Flags = OFN_OVERWRITEPROMPT;
-    
-    if (!GetSaveFileNameW(&ofn)) return;
-    
-    downloadFile_ = CreateFileW(savePath, GENERIC_WRITE, 0, nullptr,
+    downloadFile_ = CreateFileW(savePath.toStdWString().c_str(),
+                                GENERIC_WRITE, 0, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (downloadFile_ == INVALID_HANDLE_VALUE) {
-        MessageBoxW(hwnd_, L"Cannot create file", L"Error", MB_OK | MB_ICONERROR);
+        QMessageBox::critical(this, "Error", "Cannot create file");
         return;
     }
     
@@ -367,245 +356,49 @@ void FileWindow::downloadFile(int index) {
     downloadReceived_ = 0;
     downloading_ = true;
     
-    SendMessageW(hStatusBar_, SB_SETTEXTW, 0, (LPARAM)L"Downloading...");
+    // 显示进度对话框
+    progressDialog_ = new QProgressDialog("Downloading...", "Cancel", 0, 100, this);
+    progressDialog_->setWindowModality(Qt::WindowModal);
+    progressDialog_->setMinimumDuration(0);
+    progressDialog_->setValue(0);
     
-    std::wstring remotePath = currentPath_;
-    if (!remotePath.empty() && remotePath.back() != L'\\') {
-        remotePath += L"\\";
+    statusBar_->showMessage("Downloading...");
+    
+    QString remotePath = currentPath_;
+    if (!remotePath.isEmpty() && !remotePath.endsWith('\\')) {
+        remotePath += "\\";
     }
-    remotePath += entry.name;
+    remotePath += fileName;
     
-    auto request = MessageBuilder::DownloadRequest(remotePath);
+    auto request = MessageBuilder::DownloadRequest(remotePath.toStdWString());
     transport_->send(request);
 }
 
-void FileWindow::createControls() {
-    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd_, GWLP_HINSTANCE);
-    
-    INITCOMMONCONTROLSEX icex;
-    icex.dwSize = sizeof(icex);
-    icex.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
-    InitCommonControlsEx(&icex);
-    
-    int y = 5;
-    
-    CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  5, y, 40, 24, hwnd_, (HMENU)IDC_UP_BUTTON, hInst, nullptr);
-    
-    hAddressBar_ = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                                  50, y, 500, 24, hwnd_, (HMENU)IDC_ADDRESSBAR, hInst, nullptr);
-    
-    CreateWindowW(L"BUTTON", L"Go", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  555, y, 45, 24, hwnd_, (HMENU)IDC_GO_BUTTON, hInst, nullptr);
-    
-    CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  605, y, 60, 24, hwnd_, (HMENU)IDC_REFRESH_BTN, hInst, nullptr);
-    
-    y += 32;
-    
-    // 图标
-    hImageList_ = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 3, 0);
-    
-    SHFILEINFOW sfi = {};
-    SHGetFileInfoW(L"folder", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
-                   SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
-    if (sfi.hIcon) {
-        ImageList_AddIcon(hImageList_, sfi.hIcon);
-        DestroyIcon(sfi.hIcon);
+void FileWindow::onDownloadProgress(int percent) {
+    if (progressDialog_) {
+        progressDialog_->setValue(percent);
     }
-    
-    memset(&sfi, 0, sizeof(sfi));
-    SHGetFileInfoW(L"file.txt", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
-                   SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
-    if (sfi.hIcon) {
-        ImageList_AddIcon(hImageList_, sfi.hIcon);
-        DestroyIcon(sfi.hIcon);
-    }
-    
-    memset(&sfi, 0, sizeof(sfi));
-    SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON);
-    if (sfi.hIcon) {
-        ImageList_AddIcon(hImageList_, sfi.hIcon);
-        DestroyIcon(sfi.hIcon);
-    }
-    
-    // ListView
-    hListView_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
-                                  WS_CHILD | WS_VISIBLE | WS_BORDER |
-                                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                                  5, y, 660, 350, hwnd_, (HMENU)IDC_LISTVIEW, hInst, nullptr);
-    
-    ListView_SetExtendedListViewStyle(hListView_,
-                                       LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-    ListView_SetImageList(hListView_, hImageList_, LVSIL_SMALL);
-    
-    // 添加列
-    LVCOLUMNW col = {};
-    col.mask = LVCF_TEXT | LVCF_WIDTH;
-    
-    wchar_t colName[] = L"Name";
-    col.pszText = colName;
-    col.cx = 280;
-    LV_InsertColumnW(hListView_, 0, &col);
-    
-    wchar_t colSize[] = L"Size";
-    col.pszText = colSize;
-    col.cx = 100;
-    LV_InsertColumnW(hListView_, 1, &col);
-    
-    wchar_t colType[] = L"Type";
-    col.pszText = colType;
-    col.cx = 80;
-    LV_InsertColumnW(hListView_, 2, &col);
-    
-    wchar_t colModified[] = L"Modified";
-    col.pszText = colModified;
-    col.cx = 130;
-    LV_InsertColumnW(hListView_, 3, &col);
-    
-    // 状态栏
-    hStatusBar_ = CreateWindowExW(0, STATUSCLASSNAMEW, L"",
-                                   WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
-                                   0, 0, 0, 0, hwnd_, (HMENU)IDC_STATUSBAR, hInst, nullptr);
-    SendMessageW(hStatusBar_, SB_SETTEXTW, 0, (LPARAM)L"Ready");
+    statusBar_->showMessage(QString("Downloading... %1%").arg(percent));
 }
 
-bool FileWindow::create(HINSTANCE hInstance) {
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"RemoteFileManager";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    RegisterClassW(&wc);
+void FileWindow::onDownloadComplete(bool success) {
+    if (progressDialog_) {
+        progressDialog_->close();
+        delete progressDialog_;
+        progressDialog_ = nullptr;
+    }
     
-    hwnd_ = CreateWindowExW(0, L"RemoteFileManager", L"Remote File Manager",
-                            WS_OVERLAPPEDWINDOW,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 700, 500,
-                            nullptr, nullptr, hInstance, nullptr);
-    
-    if (!hwnd_) return false;
-    
-    createControls();
-    return true;
-}
-
-void FileWindow::show() {
-    if (hwnd_) {
-        ShowWindow(hwnd_, SW_SHOW);
-        SetForegroundWindow(hwnd_);
-        
-        if (transport_ && transport_->isConnected()) {
-            navigateTo(currentPath_);
-        }
+    if (success) {
+        statusBar_->showMessage("Download complete");
+        QMessageBox::information(this, "Success", "Download complete!");
+    } else {
+        statusBar_->showMessage("Download failed");
+        QMessageBox::critical(this, "Error", "Download failed!");
     }
 }
 
-void FileWindow::destroy() {
-    if (downloadFile_ != INVALID_HANDLE_VALUE) {
-        CloseHandle(downloadFile_);
-        downloadFile_ = INVALID_HANDLE_VALUE;
-    }
-    downloading_ = false;
-    onClosed_ = nullptr;
-
-    if (hwnd_) {
-        if (g_fileWindow == this) g_fileWindow = nullptr;
-        DestroyWindow(hwnd_);
-        hwnd_ = nullptr;
-    }
-    if (hImageList_) {
-        ImageList_Destroy(hImageList_);
-        hImageList_ = nullptr;
-    }
-    if (g_fileWindow == this) g_fileWindow = nullptr;
-}
-
-LRESULT CALLBACK FileWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (!g_fileWindow) return DefWindowProcW(hwnd, msg, wParam, lParam);
-    
-    auto* self = g_fileWindow;
-    
-    switch (msg) {
-        case WM_SIZE: {
-            int width = LOWORD(lParam);
-            int height = HIWORD(lParam);
-            
-            MoveWindow(self->hAddressBar_, 50, 5, width - 175, 24, TRUE);
-            MoveWindow(GetDlgItem(hwnd, IDC_GO_BUTTON), width - 120, 5, 45, 24, TRUE);
-            MoveWindow(GetDlgItem(hwnd, IDC_REFRESH_BTN), width - 70, 5, 60, 24, TRUE);
-            
-            RECT rcStatus;
-            GetWindowRect(self->hStatusBar_, &rcStatus);
-            int statusHeight = rcStatus.bottom - rcStatus.top;
-            MoveWindow(self->hListView_, 5, 37, width - 15, height - 45 - statusHeight, TRUE);
-            
-            SendMessageW(self->hStatusBar_, WM_SIZE, 0, 0);
-            break;
-        }
-        
-        case WM_COMMAND: {
-            int id = LOWORD(wParam);
-            switch (id) {
-                case IDC_UP_BUTTON:
-                    self->goUp();
-                    break;
-                case IDC_GO_BUTTON: {
-                    wchar_t path[MAX_PATH];
-                    GetDlgItemTextW(hwnd, IDC_ADDRESSBAR, path, MAX_PATH);
-                    self->navigateTo(path);
-                    break;
-                }
-                case IDC_REFRESH_BTN:
-                    self->refresh();
-                    break;
-            }
-            break;
-        }
-        
-        case WM_NOTIFY: {
-            auto* pnmh = (LPNMHDR)lParam;
-            if (pnmh->hwndFrom == self->hListView_) {
-                switch (pnmh->code) {
-                    case NM_DBLCLK:
-                        self->onListViewDblClick();
-                        break;
-                    case NM_RCLICK:
-                        self->onListViewRightClick();
-                        break;
-                }
-            }
-            break;
-        }
-        
-        case WM_FILE_LIST_READY:
-            self->populateListView();
-            break;
-            
-        case WM_DOWNLOAD_PROGRESS: {
-            wchar_t status[128];
-            swprintf(status, 128, L"Downloading... %d%%", static_cast<int>(wParam));
-            SendMessageW(self->hStatusBar_, SB_SETTEXTW, 0, (LPARAM)status);
-            break;
-        }
-        
-        case WM_DOWNLOAD_COMPLETE:
-            if (lParam == 0) {
-                SendMessageW(self->hStatusBar_, SB_SETTEXTW, 0, (LPARAM)L"Download complete");
-                MessageBoxW(hwnd, L"Download complete!", L"Success", MB_OK | MB_ICONINFORMATION);
-            } else {
-                SendMessageW(self->hStatusBar_, SB_SETTEXTW, 0, (LPARAM)L"Download failed");
-                MessageBoxW(hwnd, L"Download failed!", L"Error", MB_OK | MB_ICONERROR);
-            }
-            break;
-        
-        case WM_CLOSE:
-            ShowWindow(hwnd, SW_HIDE);
-            if (self->onClosed_) {
-                self->onClosed_();
-            }
-            return 0;
-    }
-    
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+void FileWindow::closeEvent(QCloseEvent* event) {
+    hide();
+    emit closed();
+    event->ignore(); // 不真正关闭，只隐藏
 }

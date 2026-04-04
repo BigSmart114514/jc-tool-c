@@ -1,80 +1,81 @@
+#include <QApplication>
+#include <QMessageBox>
+#include <QInputDialog>
+#include <iostream>
 #include "../common/protocol.h"
 #include "../common/transport_tcp.h"
 #include "../common/transport_p2p.h"
 #include "control_panel.h"
-#include <iostream>
 
-int main() {
-    SetConsoleOutputCP(65001);
-
+int main(int argc, char* argv[]) {
+    QApplication app(argc, argv);
+    
     std::cout << "========================================\n";
-    std::cout << "  Remote Control Client\n";
+    std::cout << "  Remote Control Client (Qt6)\n";
     std::cout << "========================================\n\n";
 
     if (!NetUtil::InitWinsock()) {
-        std::cerr << "WSAStartup failed!" << std::endl;
+        QMessageBox::critical(nullptr, "Error", "WSAStartup failed!");
         return 1;
     }
 
     p2p::P2PClient::setLogLevel(2);
 
-    std::cout << "Transport mode:\n";
-    std::cout << "  1. TCP\n";
-    std::cout << "  2. P2P\n";
-    std::cout << "  3. Relay\n";
-    std::cout << "Select (1/2/3): ";
-
-    std::string choice;
-    std::getline(std::cin, choice);
+    // 选择传输模式
+    QStringList modes = {"TCP", "P2P", "Relay"};
+    bool ok;
+    QString mode = QInputDialog::getItem(nullptr, "Transport Mode",
+                                        "Select transport mode:",
+                                        modes, 0, false, &ok);
+    if (!ok) return 0;
 
     std::string modeText, connectInfo;
     std::string ip, sigUrl, desktopPeerId, filePeerId, relayPassword;
     int desktopPort = 0, filePort = 0;
     bool useRelay = false;
-    TransportMode mode;
+    TransportMode transportMode;
 
-    if (choice == "3" || choice == "2") {
-        useRelay = (choice == "3");
-        mode = useRelay ? TransportMode::Relay : TransportMode::P2P;
-        modeText = useRelay ? "Relay" : "P2P";
+    if (mode == "Relay" || mode == "P2P") {
+        useRelay = (mode == "Relay");
+        transportMode = useRelay ? TransportMode::Relay : TransportMode::P2P;
+        modeText = mode.toStdString();
 
         sigUrl = "ws://localhost:8080";
-        std::string input;
-        std::cout << "Signaling URL (default " << sigUrl << "): ";
-        std::getline(std::cin, input);
-        if (!input.empty()) sigUrl = input;
+        sigUrl = QInputDialog::getText(nullptr, "Signaling Server",
+                                      "Signaling URL:",
+                                      QLineEdit::Normal, QString::fromStdString(sigUrl)).toStdString();
 
-        std::cout << "Desktop Peer ID: ";
-        std::getline(std::cin, desktopPeerId);
-        std::cout << "File Peer ID: ";
-        std::getline(std::cin, filePeerId);
+        desktopPeerId = QInputDialog::getText(nullptr, "Desktop Peer",
+                                             "Desktop Peer ID:").toStdString();
+        filePeerId = QInputDialog::getText(nullptr, "File Peer",
+                                          "File Peer ID:").toStdString();
+
         if (desktopPeerId.empty() || filePeerId.empty()) {
-            std::cerr << "Peer IDs required" << std::endl;
+            QMessageBox::critical(nullptr, "Error", "Peer IDs required");
             return 1;
         }
+
         if (useRelay) {
-            std::cout << "Relay Password: ";
-            std::getline(std::cin, relayPassword);
+            relayPassword = QInputDialog::getText(nullptr, "Relay Password",
+                                                 "Password:", QLineEdit::Password).toStdString();
         }
+
         connectInfo = desktopPeerId + " / " + filePeerId;
     } else {
-        mode = TransportMode::TCP;
+        transportMode = TransportMode::TCP;
         modeText = "TCP";
 
         ip = "127.0.0.1";
-        std::string input;
-        std::cout << "Server IP (default " << ip << "): ";
-        std::getline(std::cin, input);
-        if (!input.empty()) ip = input;
+        ip = QInputDialog::getText(nullptr, "Server IP",
+                                  "Server IP:",
+                                  QLineEdit::Normal, QString::fromStdString(ip)).toStdString();
 
-        desktopPort = Config::DEFAULT_DESKTOP_PORT;
-        filePort = Config::DEFAULT_FILE_PORT;
-        std::cout << "Desktop port (default " << desktopPort << "): ";
-        std::getline(std::cin, input);
-        if (!input.empty()) desktopPort = std::atoi(input.c_str());
-        std::cout << "File port (default " << filePort << "): ";
-        std::getline(std::cin, input);
-        if (!input.empty()) filePort = std::atoi(input.c_str());
+        desktopPort = QInputDialog::getInt(nullptr, "Desktop Port",
+                                          "Desktop port:",
+                                          Config::DEFAULT_DESKTOP_PORT);
+        filePort = QInputDialog::getInt(nullptr, "File Port",
+                                       "File port:",
+                                       Config::DEFAULT_FILE_PORT);
 
         connectInfo = ip + ":" + std::to_string(desktopPort) + "/" + std::to_string(filePort);
     }
@@ -85,30 +86,28 @@ int main() {
 
     std::cout << "\nConnecting..." << std::endl;
 
-    if (mode == TransportMode::TCP) {
+    if (transportMode == TransportMode::TCP) {
         auto* dt = new TCPClientTransport();
         auto* ft = new TCPClientTransport();
 
         if (!dt->connect(ip, desktopPort)) {
-            std::cerr << "\nDesktop connection failed!" << std::endl;
-            std::cerr << "Make sure the server is running and port " << desktopPort << " is correct.\n";
+            QMessageBox::critical(nullptr, "Connection Failed",
+                QString("Desktop connection failed!\nMake sure the server is running and port %1 is correct.")
+                .arg(desktopPort));
             delete dt;
             delete ft;
             WSACleanup();
-            std::cout << "Press Enter to exit...";
-            std::cin.get();
             return 1;
         }
 
         if (!ft->connect(ip, filePort)) {
-            std::cerr << "\nFile connection failed!" << std::endl;
-            std::cerr << "Make sure port " << filePort << " is correct.\n";
+            QMessageBox::critical(nullptr, "Connection Failed",
+                QString("File connection failed!\nMake sure port %1 is correct.")
+                .arg(filePort));
             dt->disconnect();
             delete dt;
             delete ft;
             WSACleanup();
-            std::cout << "Press Enter to exit...";
-            std::cin.get();
             return 1;
         }
 
@@ -119,23 +118,19 @@ int main() {
         auto* ft = new P2PClientTransport();
 
         if (!dt->connect(sigUrl, desktopPeerId, ServiceType::Desktop, useRelay, relayPassword)) {
-            std::cerr << "Desktop P2P connection failed" << std::endl;
+            QMessageBox::critical(nullptr, "Connection Failed", "Desktop P2P connection failed");
             delete dt;
             delete ft;
             WSACleanup();
-            std::cout << "Press Enter to exit...";
-            std::cin.get();
             return 1;
         }
 
         if (!ft->connect(sigUrl, filePeerId, ServiceType::FileManager, useRelay, relayPassword)) {
-            std::cerr << "File P2P connection failed" << std::endl;
+            QMessageBox::critical(nullptr, "Connection Failed", "File P2P connection failed");
             dt->disconnect();
             delete dt;
             delete ft;
             WSACleanup();
-            std::cout << "Press Enter to exit...";
-            std::cin.get();
             return 1;
         }
 
@@ -146,8 +141,6 @@ int main() {
     std::cout << "Connected successfully!" << std::endl;
 
     // 创建控制面板
-    HINSTANCE hInstance = GetModuleHandle(nullptr);
-
     ControlPanelConfig panelConfig;
     panelConfig.desktopTransport = desktopTransport;
     panelConfig.fileTransport = fileTransport;
@@ -156,24 +149,11 @@ int main() {
 
     ControlPanel controlPanel;
     controlPanel.setConfig(panelConfig);
+    controlPanel.setupTransportCallbacks();
+    controlPanel.show();
 
-    if (!controlPanel.create(hInstance)) {
-        std::cerr << "Failed to create control panel" << std::endl;
-        desktopTransport->disconnect();
-        fileTransport->disconnect();
-        delete desktopTransport;
-        delete fileTransport;
-        WSACleanup();
-        return 1;
-    }
+    int result = app.exec();
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    controlPanel.destroy();
     desktopTransport->disconnect();
     fileTransport->disconnect();
     delete desktopTransport;
@@ -181,5 +161,5 @@ int main() {
     WSACleanup();
 
     std::cout << "Client stopped" << std::endl;
-    return 0;
+    return result;
 }

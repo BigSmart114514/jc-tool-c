@@ -1,65 +1,75 @@
 #ifndef FILE_WINDOW_H
 #define FILE_WINDOW_H
 
-#include "../common/protocol.h"
-#include "../common/transport.h"
-#include <commctrl.h>
+#include <QMainWindow>
+#include <QTreeWidget>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QStatusBar>
+#include <QMenu>
+#include <QProgressDialog>
 #include <vector>
 #include <mutex>
-#include <functional>
+#include "../common/protocol.h"
+#include "../common/transport.h"
 
-#pragma comment(lib, "comctl32.lib")
+class FileWindow : public QMainWindow {
+    Q_OBJECT
 
-class FileWindow {
 public:
-    FileWindow();
+    explicit FileWindow(QWidget* parent = nullptr);
     ~FileWindow();
 
-    // 只存储传输指针，不设置回调
     void init(ITransport* transport);
-    
-    bool create(HINSTANCE hInstance);
-    void destroy();
-    void show();
-
-    // 由 ControlPanel 从传输回调中调用
     void handleMessage(const BinaryData& data);
+    void navigateTo(const QString& path);
 
-    HWND getHwnd() const { return hwnd_; }
-    void setOnClosed(std::function<void()> callback) { onClosed_ = callback; }
+signals:
+    void closed();
+    void fileListReady();
+    void downloadProgress(int percent);
+    void downloadComplete(bool success);
 
-    void navigateTo(const std::wstring& path);
+protected:
+    void closeEvent(QCloseEvent* event) override;
 
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+private slots:
+    void onGoClicked();
+    void onUpClicked();
+    void onRefreshClicked();
+    void onItemDoubleClicked(QTreeWidgetItem* item, int column);
+    void onItemRightClicked(const QPoint& pos);
+    void onFileListReady();
+    void onDownloadProgress(int percent);
+    void onDownloadComplete(bool success);
 
 private:
-    void createControls();
-    void goUp();
-    void refresh();
-    void populateListView();
-    void onListViewDblClick();
-    void onListViewRightClick();
+    void createUI();
+    void populateFileList();
     void downloadFile(int index);
+    void showContextMenu(const QPoint& pos);
 
-    HWND hwnd_ = nullptr;
-    HWND hListView_ = nullptr;
-    HWND hStatusBar_ = nullptr;
-    HWND hAddressBar_ = nullptr;
-    HIMAGELIST hImageList_ = nullptr;
+    // UI组件
+    QLineEdit* addressBar_;
+    QPushButton* btnUp_;
+    QPushButton* btnGo_;
+    QPushButton* btnRefresh_;
+    QTreeWidget* treeWidget_;
+    QStatusBar* statusBar_;
+    QProgressDialog* progressDialog_ = nullptr;
 
+    // 数据
     ITransport* transport_ = nullptr;
-
-    std::wstring currentPath_;
+    QString currentPath_;
     std::vector<FileManager::FileEntry> files_;
     std::mutex filesMtx_;
 
-    std::wstring downloadPath_;
+    // 下载状态
+    QString downloadPath_;
     HANDLE downloadFile_ = INVALID_HANDLE_VALUE;
     uint64_t downloadTotal_ = 0;
     uint64_t downloadReceived_ = 0;
     bool downloading_ = false;
-
-    std::function<void()> onClosed_;
 };
 
-#endif
+#endif // FILE_WINDOW_H

@@ -1,25 +1,115 @@
-#define UNICODE
-#define _UNICODE
-
 #include "control_panel.h"
+#include <QGroupBox>
+#include <QFrame>
 #include <iostream>
 
-#define WM_DESKTOP_CLOSED  (WM_USER + 300)
-#define WM_FILE_CLOSED     (WM_USER + 301)
-
-static ControlPanel* g_controlPanel = nullptr;
-
-ControlPanel::ControlPanel() {
-    g_controlPanel = this;
+ControlPanel::ControlPanel(QWidget* parent)
+    : QMainWindow(parent) {
+    setWindowTitle("Remote Control");
+    setFixedSize(350, 450);
+    createUI();
 }
 
 ControlPanel::~ControlPanel() {
-    destroy();
-    g_controlPanel = nullptr;
+    std::lock_guard<std::mutex> lock(windowMtx_);
+    if (desktopWindow_) {
+        desktopWindow_->close();
+        delete desktopWindow_;
+    }
+    if (fileWindow_) {
+        fileWindow_->close();
+        delete fileWindow_;
+    }
+}
+
+void ControlPanel::createUI() {
+    QWidget* central = new QWidget(this);
+    setCentralWidget(central);
+
+    QVBoxLayout* mainLayout = new QVBoxLayout(central);
+    mainLayout->setContentsMargins(15, 10, 15, 10);
+    mainLayout->setSpacing(10);
+
+    // 连接信息组
+    QGroupBox* connectionGroup = new QGroupBox("Connection", this);
+    QVBoxLayout* connLayout = new QVBoxLayout(connectionGroup);
+    
+    lblMode_ = new QLabel("Mode: ", this);
+    connLayout->addWidget(lblMode_);
+    
+    lblInfo_ = new QLabel("", this);
+    lblInfo_->setWordWrap(true);
+    connLayout->addWidget(lblInfo_);
+    
+    mainLayout->addWidget(connectionGroup);
+
+    // 分隔线
+    QFrame* line1 = new QFrame(this);
+    line1->setFrameShape(QFrame::HLine);
+    line1->setFrameShadow(QFrame::Sunken);
+    mainLayout->addWidget(line1);
+
+    // 窗口控制组
+    QGroupBox* windowGroup = new QGroupBox("Windows", this);
+    QVBoxLayout* windowLayout = new QVBoxLayout(windowGroup);
+    
+    btnDesktop_ = new QPushButton("Open Desktop", this);
+    btnDesktop_->setMinimumHeight(32);
+    connect(btnDesktop_, &QPushButton::clicked, this, &ControlPanel::toggleDesktop);
+    windowLayout->addWidget(btnDesktop_);
+    
+    btnFileManager_ = new QPushButton("Open File Manager", this);
+    btnFileManager_->setMinimumHeight(32);
+    connect(btnFileManager_, &QPushButton::clicked, this, &ControlPanel::toggleFileManager);
+    windowLayout->addWidget(btnFileManager_);
+    
+    mainLayout->addWidget(windowGroup);
+
+    // 分隔线
+    QFrame* line2 = new QFrame(this);
+    line2->setFrameShape(QFrame::HLine);
+    line2->setFrameShadow(QFrame::Sunken);
+    mainLayout->addWidget(line2);
+
+    // 输入控制组
+    QGroupBox* inputGroup = new QGroupBox("Input Control", this);
+    QVBoxLayout* inputLayout = new QVBoxLayout(inputGroup);
+    
+    chkMouseMove_ = new QCheckBox("Mouse Move", this);
+    chkMouseMove_->setChecked(true);
+    connect(chkMouseMove_, &QCheckBox::toggled, this, &ControlPanel::onMouseMoveToggled);
+    inputLayout->addWidget(chkMouseMove_);
+    
+    chkMouseClick_ = new QCheckBox("Mouse Click", this);
+    chkMouseClick_->setChecked(true);
+    connect(chkMouseClick_, &QCheckBox::toggled, this, &ControlPanel::onMouseClickToggled);
+    inputLayout->addWidget(chkMouseClick_);
+    
+    chkKeyboard_ = new QCheckBox("Keyboard", this);
+    chkKeyboard_->setChecked(true);
+    connect(chkKeyboard_, &QCheckBox::toggled, this, &ControlPanel::onKeyboardToggled);
+    inputLayout->addWidget(chkKeyboard_);
+    
+    mainLayout->addWidget(inputGroup);
+
+    mainLayout->addStretch();
+
+    // 断开连接按钮
+    btnDisconnect_ = new QPushButton("Disconnect && Exit", this);
+    btnDisconnect_->setMinimumHeight(32);
+    connect(btnDisconnect_, &QPushButton::clicked, this, &ControlPanel::onDisconnect);
+    mainLayout->addWidget(btnDisconnect_);
+
+    // 状态栏
+    statusBar_ = new QStatusBar(this);
+    setStatusBar(statusBar_);
+    updateStatus("Ready");
 }
 
 void ControlPanel::setConfig(const ControlPanelConfig& config) {
     config_ = config;
+    lblMode_->setText(QString("Mode: %1").arg(QString::fromStdString(config.modeText)));
+    lblInfo_->setText(QString::fromStdString(config.connectInfo));
 }
 
 void ControlPanel::setupTransportCallbacks() {
@@ -58,9 +148,13 @@ void ControlPanel::setupTransportCallbacks() {
     }
 }
 
+void ControlPanel::updateStatus(const QString& text) {
+    statusBar_->showMessage("Status: " + text);
+}
+
 bool ControlPanel::ensureDesktopConnected() {
     if (!config_.desktopTransport) {
-        MessageBoxW(hwnd_, L"Desktop transport not configured", L"Error", MB_ICONERROR);
+        QMessageBox::critical(this, "Error", "Desktop transport not configured");
         return false;
     }
     
@@ -68,32 +162,28 @@ bool ControlPanel::ensureDesktopConnected() {
         return true;
     }
     
-    // 尝试重连
-    updateStatus(L"Reconnecting desktop...");
-    
-    // 禁用按钮防止重复点击
-    EnableWindow(hBtnDesktop_, FALSE);
+    updateStatus("Reconnecting desktop...");
+    btnDesktop_->setEnabled(false);
     
     bool result = config_.desktopTransport->reconnect();
     
-    EnableWindow(hBtnDesktop_, TRUE);
+    btnDesktop_->setEnabled(true);
     
     if (!result) {
-        MessageBoxW(hwnd_, 
-            L"Failed to reconnect to remote desktop.\n"
-            L"Please check your network connection and try again.", 
-            L"Connection Error", MB_ICONERROR);
-        updateStatus(L"Desktop connection failed");
+        QMessageBox::critical(this, "Connection Error",
+            "Failed to reconnect to remote desktop.\n"
+            "Please check your network connection and try again.");
+        updateStatus("Desktop connection failed");
         return false;
     }
     
-    updateStatus(L"Desktop reconnected");
+    updateStatus("Desktop reconnected");
     return true;
 }
 
 bool ControlPanel::ensureFileConnected() {
     if (!config_.fileTransport) {
-        MessageBoxW(hwnd_, L"File transport not configured", L"Error", MB_ICONERROR);
+        QMessageBox::critical(this, "Error", "File transport not configured");
         return false;
     }
     
@@ -101,158 +191,23 @@ bool ControlPanel::ensureFileConnected() {
         return true;
     }
     
-    // 尝试重连
-    updateStatus(L"Reconnecting file transport...");
-    
-    // 禁用按钮防止重复点击
-    EnableWindow(hBtnFileManager_, FALSE);
+    updateStatus("Reconnecting file transport...");
+    btnFileManager_->setEnabled(false);
     
     bool result = config_.fileTransport->reconnect();
     
-    EnableWindow(hBtnFileManager_, TRUE);
+    btnFileManager_->setEnabled(true);
     
     if (!result) {
-        MessageBoxW(hwnd_, 
-            L"Failed to reconnect to file service.\n"
-            L"Please check your network connection and try again.", 
-            L"Connection Error", MB_ICONERROR);
-        updateStatus(L"File connection failed");
+        QMessageBox::critical(this, "Connection Error",
+            "Failed to reconnect to file service.\n"
+            "Please check your network connection and try again.");
+        updateStatus("File connection failed");
         return false;
     }
     
-    updateStatus(L"File transport reconnected");
+    updateStatus("File transport reconnected");
     return true;
-}
-
-bool ControlPanel::create(HINSTANCE hInstance) {
-    hInstance_ = hInstance;
-
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"RemoteControlPanel";
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    RegisterClassW(&wc);
-
-    hwnd_ = CreateWindowExW(0, L"RemoteControlPanel", L"Remote Control",
-                            WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 320, 420,
-                            nullptr, nullptr, hInstance, nullptr);
-
-    if (!hwnd_) return false;
-
-    hFont_ = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                          DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    hFontBold_ = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-
-    createControls();
-    setupTransportCallbacks();
-
-    ShowWindow(hwnd_, SW_SHOW);
-    UpdateWindow(hwnd_);
-
-    return true;
-}
-
-void ControlPanel::createControls() {
-    int x = 15, y = 10, w = 270, h = 22;
-    int btnH = 32;
-
-    auto hLabel = CreateWindowW(L"STATIC", L"Connection",
-                                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                 x, y, w, h, hwnd_, nullptr, hInstance_, nullptr);
-    SendMessage(hLabel, WM_SETFONT, (WPARAM)hFontBold_, TRUE);
-    y += 24;
-
-    std::wstring modeW(config_.modeText.begin(), config_.modeText.end());
-    std::wstring modeLabel = L"Mode: " + modeW;
-    auto hMode = CreateWindowW(L"STATIC", modeLabel.c_str(),
-                                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                x, y, w, h, hwnd_, (HMENU)IDC_STATIC_MODE, hInstance_, nullptr);
-    SendMessage(hMode, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    y += 20;
-
-    std::wstring infoW(config_.connectInfo.begin(), config_.connectInfo.end());
-    auto hInfo = CreateWindowW(L"STATIC", infoW.c_str(),
-                                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                x, y, w, h * 2, hwnd_, nullptr, hInstance_, nullptr);
-    SendMessage(hInfo, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    y += 40;
-
-    hStaticStatus_ = CreateWindowW(L"STATIC", L"Status: Ready",
-                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                    x, y, w, h, hwnd_, (HMENU)IDC_STATIC_STATUS, hInstance_, nullptr);
-    SendMessage(hStaticStatus_, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    y += 30;
-
-    CreateWindowW(L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                  x, y, w, 2, hwnd_, nullptr, hInstance_, nullptr);
-    y += 10;
-
-    hLabel = CreateWindowW(L"STATIC", L"Windows",
-                            WS_CHILD | WS_VISIBLE | SS_LEFT,
-                            x, y, w, h, hwnd_, nullptr, hInstance_, nullptr);
-    SendMessage(hLabel, WM_SETFONT, (WPARAM)hFontBold_, TRUE);
-    y += 26;
-
-    hBtnDesktop_ = CreateWindowW(L"BUTTON", L"Open Desktop",
-                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  x, y, w, btnH, hwnd_, (HMENU)IDC_BTN_DESKTOP, hInstance_, nullptr);
-    SendMessage(hBtnDesktop_, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    y += btnH + 6;
-
-    hBtnFileManager_ = CreateWindowW(L"BUTTON", L"Open File Manager",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                      x, y, w, btnH, hwnd_, (HMENU)IDC_BTN_FILEMANAGER, hInstance_, nullptr);
-    SendMessage(hBtnFileManager_, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    y += btnH + 14;
-
-    CreateWindowW(L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-                  x, y, w, 2, hwnd_, nullptr, hInstance_, nullptr);
-    y += 10;
-
-    hLabel = CreateWindowW(L"STATIC", L"Input Control",
-                            WS_CHILD | WS_VISIBLE | SS_LEFT,
-                            x, y, w, h, hwnd_, nullptr, hInstance_, nullptr);
-    SendMessage(hLabel, WM_SETFONT, (WPARAM)hFontBold_, TRUE);
-    y += 26;
-
-    auto hChk = CreateWindowW(L"BUTTON", L"Mouse Move",
-                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                               x, y, w, h, hwnd_, (HMENU)IDC_CHECK_MOUSE_MOVE, hInstance_, nullptr);
-    SendMessage(hChk, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    CheckDlgButton(hwnd_, IDC_CHECK_MOUSE_MOVE, BST_CHECKED);
-    y += 24;
-
-    hChk = CreateWindowW(L"BUTTON", L"Mouse Click",
-                          WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                          x, y, w, h, hwnd_, (HMENU)IDC_CHECK_MOUSE_CLICK, hInstance_, nullptr);
-    SendMessage(hChk, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    CheckDlgButton(hwnd_, IDC_CHECK_MOUSE_CLICK, BST_CHECKED);
-    y += 24;
-
-    hChk = CreateWindowW(L"BUTTON", L"Keyboard",
-                          WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                          x, y, w, h, hwnd_, (HMENU)IDC_CHECK_KEYBOARD, hInstance_, nullptr);
-    SendMessage(hChk, WM_SETFONT, (WPARAM)hFont_, TRUE);
-    CheckDlgButton(hwnd_, IDC_CHECK_KEYBOARD, BST_CHECKED);
-    y += 30;
-
-    hBtnDisconnect_ = CreateWindowW(L"BUTTON", L"Disconnect && Exit",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     x, y, w, btnH, hwnd_, (HMENU)IDC_BTN_DISCONNECT, hInstance_, nullptr);
-    SendMessage(hBtnDisconnect_, WM_SETFONT, (WPARAM)hFont_, TRUE);
-}
-
-void ControlPanel::updateStatus(const wchar_t* text) {
-    if (hStaticStatus_) {
-        std::wstring s = L"Status: ";
-        s += text;
-        SetWindowTextW(hStaticStatus_, s.c_str());
-    }
 }
 
 void ControlPanel::toggleDesktop() {
@@ -264,39 +219,29 @@ void ControlPanel::toggleDesktop() {
             desktopWindow_ = nullptr;
         }
         if (toDelete) {
-            toDelete->destroy();
+            toDelete->close();
             delete toDelete;
         }
         desktopOpen_ = false;
-        SetWindowTextW(hBtnDesktop_, L"Open Desktop");
-        updateStatus(L"Desktop closed");
+        btnDesktop_->setText("Open Desktop");
+        updateStatus("Desktop closed");
     } else {
-        // ====== 检查连接状态，必要时重连 ======
-        if (!ensureDesktopConnected()) {
-            return;
-        }
-        // =====================================
+        if (!ensureDesktopConnected()) return;
 
         auto* dw = new DesktopWindow();
         dw->init(config_.desktopTransport);
         dw->setInputToggles(&enableMouseMove_, &enableMouseClick_, &enableKeyboard_);
 
-        dw->setOnClosed([this]() {
-            PostMessage(hwnd_, WM_DESKTOP_CLOSED, 0, 0);
-        });
-
-        dw->setOnOpenFileManager([this]() {
+        connect(dw, &DesktopWindow::closed, this, &ControlPanel::onDesktopWindowClosed);
+        connect(dw, &DesktopWindow::openFileManager, this, [this]() {
             if (!fileManagerOpen_) {
-                PostMessage(hwnd_, WM_COMMAND, MAKEWPARAM(IDC_BTN_FILEMANAGER, 0), 0);
+                toggleFileManager();
             }
         });
 
         std::string title = "Remote Desktop [" + config_.modeText + "]";
-        if (!dw->create(hInstance_, title.c_str())) {
-            delete dw;
-            MessageBoxW(hwnd_, L"Failed to create desktop window", L"Error", MB_ICONERROR);
-            return;
-        }
+        dw->setWindowTitle(QString::fromStdString(title));
+        dw->show();
 
         {
             std::lock_guard<std::mutex> lock(windowMtx_);
@@ -304,8 +249,8 @@ void ControlPanel::toggleDesktop() {
         }
 
         desktopOpen_ = true;
-        SetWindowTextW(hBtnDesktop_, L"Close Desktop");
-        updateStatus(L"Desktop opened");
+        btnDesktop_->setText("Close Desktop");
+        updateStatus("Desktop opened");
 
         dw->requestStream();
     }
@@ -320,43 +265,31 @@ void ControlPanel::toggleFileManager() {
             fileWindow_ = nullptr;
         }
         if (toDelete) {
-            toDelete->destroy();
+            toDelete->close();
             delete toDelete;
         }
         fileManagerOpen_ = false;
-        SetWindowTextW(hBtnFileManager_, L"Open File Manager");
-        updateStatus(L"File Manager closed");
+        btnFileManager_->setText("Open File Manager");
+        updateStatus("File Manager closed");
     } else {
-        // ====== 检查连接状态，必要时重连 ======
-        if (!ensureFileConnected()) {
-            return;
-        }
-        // =====================================
+        if (!ensureFileConnected()) return;
 
         auto* fw = new FileWindow();
         fw->init(config_.fileTransport);
 
-        fw->setOnClosed([this]() {
-            PostMessage(hwnd_, WM_FILE_CLOSED, 0, 0);
-        });
+        connect(fw, &FileWindow::closed, this, &ControlPanel::onFileWindowClosed);
 
-        if (!fw->create(hInstance_)) {
-            delete fw;
-            MessageBoxW(hwnd_, L"Failed to create file manager", L"Error", MB_ICONERROR);
-            return;
-        }
+        fw->show();
+        fw->navigateTo("");
 
         {
             std::lock_guard<std::mutex> lock(windowMtx_);
             fileWindow_ = fw;
         }
 
-        fw->show();
-        fw->navigateTo(L"");
-
         fileManagerOpen_ = true;
-        SetWindowTextW(hBtnFileManager_, L"Close File Manager");
-        updateStatus(L"File Manager opened");
+        btnFileManager_->setText("Close File Manager");
+        updateStatus("File Manager opened");
     }
 }
 
@@ -368,12 +301,11 @@ void ControlPanel::onDesktopWindowClosed() {
         desktopWindow_ = nullptr;
     }
     if (toDelete) {
-        toDelete->destroy();
-        delete toDelete;
+        toDelete->deleteLater();
     }
     desktopOpen_ = false;
-    SetWindowTextW(hBtnDesktop_, L"Open Desktop");
-    updateStatus(L"Desktop closed");
+    btnDesktop_->setText("Open Desktop");
+    updateStatus("Desktop closed");
 }
 
 void ControlPanel::onFileWindowClosed() {
@@ -384,101 +316,49 @@ void ControlPanel::onFileWindowClosed() {
         fileWindow_ = nullptr;
     }
     if (toDelete) {
-        toDelete->destroy();
-        delete toDelete;
+        toDelete->deleteLater();
     }
     fileManagerOpen_ = false;
-    SetWindowTextW(hBtnFileManager_, L"Open File Manager");
-    updateStatus(L"File Manager closed");
+    btnFileManager_->setText("Open File Manager");
+    updateStatus("File Manager closed");
 }
 
 void ControlPanel::onDisconnect() {
-    {
-        std::lock_guard<std::mutex> lock(windowMtx_);
-        if (desktopWindow_) {
-            desktopWindow_->destroy();
-            delete desktopWindow_;
-            desktopWindow_ = nullptr;
+    auto reply = QMessageBox::question(this, "Confirm",
+        "Disconnect and exit?",
+        QMessageBox::Yes | QMessageBox::No);
+    
+    if (reply == QMessageBox::Yes) {
+        {
+            std::lock_guard<std::mutex> lock(windowMtx_);
+            if (desktopWindow_) {
+                desktopWindow_->close();
+                delete desktopWindow_;
+                desktopWindow_ = nullptr;
+            }
+            if (fileWindow_) {
+                fileWindow_->close();
+                delete fileWindow_;
+                fileWindow_ = nullptr;
+            }
         }
-        if (fileWindow_) {
-            fileWindow_->destroy();
-            delete fileWindow_;
-            fileWindow_ = nullptr;
-        }
+
+        if (config_.desktopTransport) config_.desktopTransport->disconnect();
+        if (config_.fileTransport) config_.fileTransport->disconnect();
+
+        close();
+        qApp->quit();
     }
-
-    if (config_.desktopTransport) config_.desktopTransport->disconnect();
-    if (config_.fileTransport) config_.fileTransport->disconnect();
-
-    DestroyWindow(hwnd_);
 }
 
-void ControlPanel::destroy() {
-    {
-        std::lock_guard<std::mutex> lock(windowMtx_);
-        if (desktopWindow_) {
-            desktopWindow_->destroy();
-            delete desktopWindow_;
-            desktopWindow_ = nullptr;
-        }
-        if (fileWindow_) {
-            fileWindow_->destroy();
-            delete fileWindow_;
-            fileWindow_ = nullptr;
-        }
-    }
-    if (hFont_) { DeleteObject(hFont_); hFont_ = nullptr; }
-    if (hFontBold_) { DeleteObject(hFontBold_); hFontBold_ = nullptr; }
-    if (hwnd_) { DestroyWindow(hwnd_); hwnd_ = nullptr; }
+void ControlPanel::onMouseMoveToggled(bool checked) {
+    enableMouseMove_ = checked;
 }
 
-LRESULT CALLBACK ControlPanel::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (!g_controlPanel) return DefWindowProcW(hwnd, msg, wParam, lParam);
-    auto* self = g_controlPanel;
+void ControlPanel::onMouseClickToggled(bool checked) {
+    enableMouseClick_ = checked;
+}
 
-    switch (msg) {
-        case WM_COMMAND: {
-            int id = LOWORD(wParam);
-            int code = HIWORD(wParam);
-            switch (id) {
-                case IDC_BTN_DESKTOP:     self->toggleDesktop(); break;
-                case IDC_BTN_FILEMANAGER: self->toggleFileManager(); break;
-                case IDC_BTN_DISCONNECT:  self->onDisconnect(); break;
-                case IDC_CHECK_MOUSE_MOVE:
-                    if (code == BN_CLICKED)
-                        self->enableMouseMove_ = (IsDlgButtonChecked(hwnd, IDC_CHECK_MOUSE_MOVE) == BST_CHECKED);
-                    break;
-                case IDC_CHECK_MOUSE_CLICK:
-                    if (code == BN_CLICKED)
-                        self->enableMouseClick_ = (IsDlgButtonChecked(hwnd, IDC_CHECK_MOUSE_CLICK) == BST_CHECKED);
-                    break;
-                case IDC_CHECK_KEYBOARD:
-                    if (code == BN_CLICKED)
-                        self->enableKeyboard_ = (IsDlgButtonChecked(hwnd, IDC_CHECK_KEYBOARD) == BST_CHECKED);
-                    break;
-            }
-            break;
-        }
-
-        case WM_DESKTOP_CLOSED:
-            self->onDesktopWindowClosed();
-            break;
-
-        case WM_FILE_CLOSED:
-            self->onFileWindowClosed();
-            break;
-
-        case WM_CLOSE:
-            if (MessageBoxW(hwnd, L"Disconnect and exit?", L"Confirm",
-                            MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                self->onDisconnect();
-            }
-            return 0;
-
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
-    }
-
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+void ControlPanel::onKeyboardToggled(bool checked) {
+    enableKeyboard_ = checked;
 }
