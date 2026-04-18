@@ -8,7 +8,7 @@ echo ========================================
 echo.
 
 :: 设置 Qt 路径
-set QT_DIR=E:\test\Qt_software\6.11.0\msvc2022_64
+set QT_DIR=%QT6_DIR%
 if not exist "%QT_DIR%" (
     echo Error: Qt not found at %QT_DIR%
     pause
@@ -53,7 +53,7 @@ cd build
 
 :: 配置项目
 echo [1/2] Configuring...
-cmake -G "Visual Studio 17 2022" -A x64 ..
+cmake -G "Visual Studio 18 2026" -A x64 ..
 if errorlevel 1 (
     echo.
     echo ========================================
@@ -91,12 +91,12 @@ echo ========================================
 echo   Build Complete!
 echo ========================================
 echo.
-echo Output files are in: build\Release\
-echo   - client.exe
-echo   - server.exe
-echo.
-echo Run client: cd build\Release ^&^& client.exe
-echo Run server: cd build\Release ^&^& server.exe
+echo Output file is in: build\Release\
+@REM echo   - client.exe
+@REM echo   - server.exe
+@REM echo.
+@REM echo Run client: cd build\Release ^&^& client.exe
+@REM echo Run server: cd build\Release ^&^& server.exe
 echo.
 
 pause

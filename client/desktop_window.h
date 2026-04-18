@@ -3,14 +3,15 @@
 
 #include <QWidget>
 #include <QLabel>
-#include <QPixmap>
 #include <QImage>
-#include <QMouseEvent>
-#include <QKeyEvent>
-#include <QTimer>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
 #include <atomic>
-#include "../common/protocol.h"
+
 #include "../common/transport.h"
+#include "../common/protocol.h"
 #include "hevc_decoder.h"
 
 class DesktopWindow : public QWidget {
@@ -21,21 +22,60 @@ public:
     ~DesktopWindow();
 
     void init(ITransport* transport);
-    void handleMessage(const BinaryData& data);
     void requestStream();
+    void handleMessage(const BinaryData& data);
 
-    void setInputToggles(std::atomic<bool>* mouseMove,
-                        std::atomic<bool>* mouseClick,
-                        std::atomic<bool>* keyboard) {
-        pEnableMouseMove_ = mouseMove;
-        pEnableMouseClick_ = mouseClick;
-        pEnableKeyboard_ = keyboard;
+    // 解决 control_panel.cpp 报错：增加这个成员函数
+    void setInputToggles(std::atomic<bool>* mm, std::atomic<bool>* mc, std::atomic<bool>* kb) {
+        pEnableMouseMove_ = mm;
+        pEnableMouseClick_ = mc;
+        pEnableKeyboard_ = kb;
     }
 
+    std::atomic<bool>* pEnableMouseMove_ = nullptr;
+    std::atomic<bool>* pEnableMouseClick_ = nullptr;
+    std::atomic<bool>* pEnableKeyboard_ = nullptr;
+
 signals:
+    void frameReady();
     void closed();
     void openFileManager();
-    void frameReady();
+
+private slots:
+    void updateDisplay();
+
+private:
+    std::thread decodeThread_;
+    std::atomic<bool> decoding_{false};
+    std::mutex queueMtx_;
+    std::condition_variable queueCV_;
+    std::queue<BinaryData> videoQueue_;
+
+    // --- 关键修正：类名必须匹配 hevc_decoder.h 中的 HEVCDecoder ---
+    HEVCDecoder decoder_; 
+    // -------------------------------------------------------
+    
+    bool decoderReady_ = false;
+    QImage latestFrame_;
+    std::mutex frameMutex_;
+    bool hasNewFrame_ = false;
+
+    int screenWidth_ = 0;
+    int screenHeight_ = 0;
+    ITransport* transport_ = nullptr;
+    QLabel* displayLabel_ = nullptr;
+
+    // --- 统计相关 ---
+    uint64_t totalFramesReceived_ = 0; // 总接收帧数
+    uint64_t droppedFrames_ = 0;       // 丢弃帧数（由于队列积压）
+    uint64_t decodedFrames_ = 0;       // 成功解码帧数
+    int64_t lastLogTime_ = 0;          // 上次打印时间
+
+    void logStatistics();               // 打印函数
+    void decodeLoop();
+    void handleScreenInfo(const BinaryData& data);
+    void sendInput(const Desktop::InputEvent& ev);
+    bool convertToImageCoords(int wx, int wy, int& ix, int& iy);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -46,31 +86,6 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
-
-private slots:
-    void updateDisplay();
-
-private:
-    void handleVideoFrame(const uint8_t* data, size_t size, bool isKeyframe);
-    void handleScreenInfo(const BinaryData& data);
-    void sendInput(const Desktop::InputEvent& ev);
-    bool convertToImageCoords(int wx, int wy, int& ix, int& iy);
-
-    QLabel* displayLabel_;
-    QPixmap currentFrame_;
-    
-    ITransport* transport_ = nullptr;
-    HEVCDecoder decoder_;
-
-    std::atomic<int> screenWidth_{0};
-    std::atomic<int> screenHeight_{0};
-    bool decoderReady_ = false;
-
-    std::atomic<bool>* pEnableMouseMove_ = nullptr;
-    std::atomic<bool>* pEnableMouseClick_ = nullptr;
-    std::atomic<bool>* pEnableKeyboard_ = nullptr;
-
-    QTimer* updateTimer_;
 };
 
-#endif // DESKTOP_WINDOW_H
+#endif

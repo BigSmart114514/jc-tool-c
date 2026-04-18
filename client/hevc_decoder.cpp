@@ -14,6 +14,7 @@ HEVCDecoder::~HEVCDecoder() {
 }
 
 bool HEVCDecoder::init(int width, int height) {
+    av_log_set_level(AV_LOG_FATAL); // 只显示致命错误
     std::lock_guard<std::mutex> lock(mtx_);
     
     width_ = width;

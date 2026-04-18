@@ -2,6 +2,8 @@
 #include <QGroupBox>
 #include <QFrame>
 #include <iostream>
+#include <QApplication>
+//#include <QScreen>
 
 ControlPanel::ControlPanel(QWidget* parent)
     : QMainWindow(parent) {
