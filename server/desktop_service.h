@@ -46,6 +46,12 @@ private:
     std::atomic<bool> keyframeRequested_{false};
     std::condition_variable clientCV_;
     std::mutex clientMtx_;
+    // --- 新增：动态流控配置目标值 ---
+    int targetWidth_ = 0;
+    int targetHeight_ = 0;
+    int targetFps_ = 0;
+    int targetKfIntervalSec_ = 0;
+    std::atomic<bool> configChanged_{false}; // 标记是否需要重新初始化编码器
 };
 
 #endif // DESKTOP_SERVICE_H

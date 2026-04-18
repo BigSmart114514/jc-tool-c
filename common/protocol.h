@@ -41,7 +41,8 @@ namespace Desktop {
         InputEvent      = 0x02,
         ScreenInfo      = 0x03,
         ClientReady     = 0x04,
-        KeyframeRequest = 0x05
+        KeyframeRequest = 0x05,
+        StreamConfig    = 0x06  // 新增：流配置
     };
 
     #pragma pack(push, 1)
@@ -56,6 +57,12 @@ namespace Desktop {
     struct ScreenInfo {
         int32_t width;
         int32_t height;
+    };
+    // --- 新增流配置结构体 ---
+    struct StreamConfig {
+        int32_t width;               // 指定的长（宽）
+        int32_t fps;                 // 指定的FPS
+        int32_t keyframeIntervalSec; // 指定的关键帧间隔（秒）
     };
     #pragma pack(pop)
 }
@@ -150,6 +157,20 @@ namespace NetUtil {
 // ==================== 消息构建器 ====================
 namespace MessageBuilder {
     // 远程桌面
+    inline BinaryData KeyframeRequest() {
+        return { static_cast<uint8_t>(Desktop::MsgType::KeyframeRequest) };
+    }
+
+    inline BinaryData StreamConfigMsg(int w, int fps, int kfIntervalSec) {
+        BinaryData msg(1 + sizeof(Desktop::StreamConfig));
+        msg[0] = static_cast<uint8_t>(Desktop::MsgType::StreamConfig);
+        auto* cfg = reinterpret_cast<Desktop::StreamConfig*>(msg.data() + 1);
+        cfg->width = w;
+        cfg->fps = fps;
+        cfg->keyframeIntervalSec = kfIntervalSec;
+        return msg;
+    }
+    
     inline BinaryData VideoFrame(const uint8_t* data, size_t size, bool isKeyframe) {
         BinaryData msg;
         msg.reserve(2 + size);

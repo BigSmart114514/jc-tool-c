@@ -100,6 +100,7 @@ bool HEVCDecoder::decode(const uint8_t* data, int size, std::vector<uint8_t>& ou
                     rgbFrame_->format = AV_PIX_FMT_BGRA;
                     rgbFrame_->width = width_;
                     rgbFrame_->height = height_;
+                    rgbFrame_->linesize[0];
                     av_frame_get_buffer(rgbFrame_, 32);
                 }
 

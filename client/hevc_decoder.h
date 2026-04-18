@@ -25,6 +25,7 @@ public:
     
     int getWidth() const { return width_; }
     int getHeight() const { return height_; }
+    int getStride() const { return stride_; }
 
 private:
     const AVCodec* codec_ = nullptr;
@@ -37,6 +38,7 @@ private:
     
     int width_ = 0;
     int height_ = 0;
+    int stride_ = 0;
     bool initialized_ = false;
     std::mutex mtx_;
 };

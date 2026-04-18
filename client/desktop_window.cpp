@@ -9,33 +9,37 @@
 DesktopWindow::DesktopWindow(QWidget* parent)
     : QWidget(parent) {
     
-    // 窗口基础设置
+    // --- 【保留】窗口基础设置 ---
     setAttribute(Qt::WA_DeleteOnClose, false);
     setWindowFlags(Qt::Window);
+    setMouseTracking(true); // 必须保留，用于捕获鼠标移动发送给远端
     
+    // --- 【保留】初始大小设置 ---
     QScreen* screen = QApplication::primaryScreen();
     QRect screenGeometry = screen->geometry();
     resize(screenGeometry.width() * 3 / 4, screenGeometry.height() * 3 / 4);
 
-    // 创建显示容器
-    displayLabel_ = new QLabel(this);
-    displayLabel_->setAlignment(Qt::AlignCenter);
-    displayLabel_->setScaledContents(false);
-    displayLabel_->setStyleSheet("QLabel { background-color: black; }");
+    // --- 【核心修改】彻底删掉 displayLabel_ 和 Layout ---
+    /* 不要创建 displayLabel_
+       不要创建 QVBoxLayout
+       因为我们要直接在 DesktopWindow 窗口本身上画图（通过 paintEvent）
+    */
 
-    QVBoxLayout* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(displayLabel_);
-
-    // 绑定渲染信号
+    // --- 【修改】绑定渲染信号 ---
+    // 依然监听信号，但 updateDisplay 内部只需调用 update()
     connect(this, &DesktopWindow::frameReady, this, &DesktopWindow::updateDisplay);
-    
-    setMouseTracking(true);
-    displayLabel_->setMouseTracking(true);
 
-    // 启动独立解码线程
+    // --- 【保留】流控与解码初始化 ---
     decoding_ = true;
     decodeThread_ = std::thread(&DesktopWindow::decodeLoop, this);
+
+    // 初始化缩放定时器
+    resizeTimer_.setSingleShot(true);
+    connect(&resizeTimer_, &QTimer::timeout, this, &DesktopWindow::onResizeCooldown);
+
+    // 初始化统计时间
+    lastStatsTime_ = std::chrono::steady_clock::now();
+    lastFpsChangeTime_ = std::chrono::steady_clock::now();
 }
 
 DesktopWindow::~DesktopWindow() {
@@ -78,20 +82,28 @@ void DesktopWindow::handleMessage(const BinaryData& data) {
                 std::lock_guard<std::mutex> lock(queueMtx_);
                 totalFramesReceived_++;
 
-                // 如果积压超过 3 帧，认为处理速度跟不上，执行丢弃
                 if (videoQueue_.size() > 3) {
-                    droppedFrames_ += videoQueue_.size(); // 统计丢弃掉的帧数
+                    int dropCount = videoQueue_.size();
+                    droppedFrames_ += dropCount;
+                    intervalFramesDropped_ += dropCount; // 记录区间内丢帧
+
                     std::queue<BinaryData> empty;
                     std::swap(videoQueue_, empty);
+
+                    // --- 新增：发生严重丢帧，立刻要求服务端发送关键帧 ---
+                    if (transport_ && transport_->isConnected()) {
+                        auto msg = MessageBuilder::KeyframeRequest();
+                        transport_->send(msg);
+                    }
                 }
                 
                 videoQueue_.push(data);
                 queueCV_.notify_one();
 
                 // 每隔 5 秒（或 150 帧）自动打印一次统计
-                if (totalFramesReceived_ % 150 == 0) {
-                    logStatistics();
-                }
+                // if (totalFramesReceived_ % 150 == 0) {
+                //     logStatistics();
+                // }
             }
             break;
         default:
@@ -126,56 +138,83 @@ void DesktopWindow::decodeLoop() {
     while (decoding_) {
         BinaryData data;
         {
+            // 1. 等待队列数据或退出信号
             std::unique_lock<std::mutex> lock(queueMtx_);
             queueCV_.wait(lock, [this] { return !videoQueue_.empty() || !decoding_; });
             if (!decoding_) break;
+            
             data = std::move(videoQueue_.front());
             videoQueue_.pop();
         }
 
         if (!decoderReady_) continue;
 
-        // 跳过 MsgType(1B) 和 isKeyframe(1B)
+        // 2. 准备解码数据（跳过 MsgType 1B 和 isKeyframe 1B）
         const uint8_t* rawH265 = data.data() + 2;
         size_t rawSize = data.size() - 2;
 
-        if (decoder_.decode(rawH265, static_cast<int>(rawSize), rgbData)) {
+        // 3. 记录解码开始时间
+        auto decodeStart = std::chrono::steady_clock::now();
+
+        // 4. 执行解码
+        bool success = decoder_.decode(rawH265, static_cast<int>(rawSize), rgbData);
+
+        // 5. 记录解码结束时间并计算耗时
+        auto decodeEnd = std::chrono::steady_clock::now();
+        
+        if (success) {
+            // 累加本次解码耗时（毫秒）和成功解码帧数
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(decodeEnd - decodeStart).count();
+            intervalDecodeTimeMs_ += static_cast<uint64_t>(duration);
+            intervalFramesDecoded_++;
+
+            // 6. 核心逻辑：尝试根据当前区间表现调整流控参数（内部会判断是否到达5秒间隔）
+            checkAndAdjustStreamQuality();
+
+            // 7. 准备 UI 渲染数据
             int w = decoder_.getWidth();
             int h = decoder_.getHeight();
 
-            // 构造线程安全的 QImage
-            // Format_RGB32 匹配 BGRA 排列
-            QImage img(rgbData.data(), w, h, w * 4, QImage::Format_RGB32);
+            // 【关键修改】必须从解码器获取真实的行字节数（Stride）
+            // 如果你底层封装的是 FFmpeg 的 sws_scale，这对应 dst_linesize[0]
+            int stride = decoder_.getStride(); // <--- 你需要在 decoder_ 类中暴露出这个值
             
+            // 如果 decoder 实在无法提供 stride，且你确定底层就是 FFmpeg，通常可以尝试对齐到 32 字节计算，但最保险的还是获取真实值
+            // 构造 QImage 时，传入真实的 stride，而不是 w * 4
+            QImage img(rgbData.data(), w, h, stride, QImage::Format_RGB32);
             {
                 std::lock_guard<std::mutex> lock(frameMutex_);
-                decodedFrames_++; // 记录解码成功
-                latestFrame_ = img.copy(); // 深拷贝，解耦内存
+                decodedFrames_++;           // 总计数（用于日志）
+                latestFrame_ = img.copy();   // 深拷贝，防止渲染时内存被下一帧修改
                 hasNewFrame_ = true;
                 screenWidth_ = w;
                 screenHeight_ = h;
             }
-            emit frameReady(); // 触发 UI 渲染
+
+            // 8. 通知 UI 线程更新显示
+            emit frameReady(); 
+        } else {
+            // 如果解码失败，通常意味着需要关键帧来修复参考链
+            if (transport_ && transport_->isConnected()) {
+                auto msg = MessageBuilder::KeyframeRequest();
+                transport_->send(msg);
+            }
         }
     }
 }
 
 // UI 渲染线程
 void DesktopWindow::updateDisplay() {
-    QImage imageToDraw;
+    // 仅仅检查是否有新帧，然后触发重绘
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
-        if (!hasNewFrame_) return; // 如果信号积压，直接跳过旧帧
-        imageToDraw = latestFrame_;
-        hasNewFrame_ = false;
+        if (!hasNewFrame_) return; 
+        // 我们不需要在这里 copy，paintEvent 会处理最新的 latestFrame_
     }
-
-    if (!imageToDraw.isNull()) {
-        QSize labelSize = displayLabel_->size();
-        // 使用 FastTransformation 降低 CPU 缩放开销，彻底解决延迟
-        QPixmap pix = QPixmap::fromImage(imageToDraw);
-        displayLabel_->setPixmap(pix.scaled(labelSize, Qt::KeepAspectRatio, Qt::FastTransformation));
-    }
+    
+    // 触发系统的 paintEvent。这是 Qt 最标准的做法。
+    // 它会将多次 update() 调用合并为一次重绘，极大地节省 CPU。
+    update(); 
 }
 
 void DesktopWindow::sendInput(const Desktop::InputEvent& ev) {
@@ -186,39 +225,27 @@ void DesktopWindow::sendInput(const Desktop::InputEvent& ev) {
 }
 
 bool DesktopWindow::convertToImageCoords(int wx, int wy, int& ix, int& iy) {
-    int ow, oh;
-    QSize imageSize;
+    std::lock_guard<std::mutex> lock(frameMutex_);
+    if (latestFrame_.isNull()) return false;
 
-    {
-        std::lock_guard<std::mutex> lock(frameMutex_);
-        if (latestFrame_.isNull()) return false;
-        ow = screenWidth_;
-        oh = screenHeight_;
-        imageSize = latestFrame_.size();
-    }
+    // 计算 paintEvent 中实际绘制的画面区域
+    QSize scaledSize = latestFrame_.size().scaled(this->size(), Qt::KeepAspectRatio);
+    int offsetX = (width() - scaledSize.width()) / 2;
+    int offsetY = (height() - scaledSize.height()) / 2;
 
-    if (ow == 0 || oh == 0) return false;
-
-    QSize labelSize = displayLabel_->size();
-    QSize scaledSize = imageSize.scaled(labelSize, Qt::KeepAspectRatio);
-    
-    int offsetX = (labelSize.width() - scaledSize.width()) / 2;
-    int offsetY = (labelSize.height() - scaledSize.height()) / 2;
-
-    QPoint labelPos = displayLabel_->mapFromParent(QPoint(wx, wy));
-    int lx = labelPos.x();
-    int ly = labelPos.y();
-
-    if (lx < offsetX || lx >= offsetX + scaledSize.width() ||
-        ly < offsetY || ly >= offsetY + scaledSize.height()) {
+    // 检查鼠标是否在画面区域内
+    if (wx < offsetX || wx > offsetX + scaledSize.width() ||
+        wy < offsetY || wy > offsetY + scaledSize.height()) {
         return false;
     }
 
-    float sx = (float)ow / scaledSize.width();
-    float sy = (float)oh / scaledSize.height();
-    ix = std::clamp((int)((lx - offsetX) * sx), 0, ow - 1);
-    iy = std::clamp((int)((ly - offsetY) * sy), 0, oh - 1);
-    
+    // 将窗口坐标转换为视频原始坐标
+    double ratioX = (double)latestFrame_.width() / scaledSize.width();
+    double ratioY = (double)latestFrame_.height() / scaledSize.height();
+
+    ix = static_cast<int>((wx - offsetX) * ratioX);
+    iy = static_cast<int>((wy - offsetY) * ratioY);
+
     return true;
 }
 
@@ -289,8 +316,15 @@ void DesktopWindow::wheelEvent(QWheelEvent* event) {
 void DesktopWindow::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
     updateDisplay();
-}
 
+    // 根据 displayLabel 的当前大小计算目标分辨率的长（宽）
+    if (displayLabel_) {
+        pendingResizeWidth_ = displayLabel_->width();
+        // 重新启动冷却时间（防抖），每次重新缩放都会重新计时
+        resizeTimer_.start(RESIZE_COOLDOWN_MS);
+    }
+}
+/*
 void DesktopWindow::logStatistics() {
     double dropRate = 0.0;
     if (totalFramesReceived_ > 0) {
@@ -304,4 +338,99 @@ void DesktopWindow::logStatistics() {
     std::cout << "  Successfully Decoded: " << decodedFrames_ << std::endl;
     std::cout << "  Queue Current Size: " << videoQueue_.size() << std::endl;
     std::cout << "------------------------------------------" << std::endl;
+}
+*/
+
+// --- 新增：处理流控统计的函数 ---
+void DesktopWindow::checkAndAdjustStreamQuality() {
+    auto now = std::chrono::steady_clock::now();
+    auto actualIntervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatsTime_).count();
+
+    if (actualIntervalMs >= STATS_INTERVAL_MS) {
+        auto sinceLastChangeMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFpsChangeTime_).count();
+        bool needUpdate = false;
+
+        if (sinceLastChangeMs > BLIND_PERIOD_MS) {
+            // 修正 1：降帧逻辑
+            if (intervalFramesDropped_ > 0) {
+                // 不要用“区间实际帧数”去算，而是基于“当前设定值”打折
+                // 否则一次抖动就会让 FPS 归零
+                int newFps = static_cast<int>(currentFps_ * FPS_DOWN_RATIO);
+                
+                // 修正 2：保底帧率建议设为 5，设为 1 画面就彻底卡死了
+                newFps = std::max(5, newFps); 
+                
+                if (newFps < currentFps_) {
+                    currentFps_ = newFps;
+                    needUpdate = true;
+                    std::cout << "[Quality] Dropped frames detected. Downgrading FPS to " << currentFps_ << std::endl;
+                }
+            } 
+            // 修正 3：升帧逻辑
+            else if (intervalDecodeTimeMs_ < actualIntervalMs / 2) {
+                // 在乘率基础上 + 2，确保从 1fps 或低 fps 能跳出来
+                int newFps = std::min(MAX_FPS, static_cast<int>(currentFps_ * FPS_UP_RATIO + 2));
+                
+                if (newFps > currentFps_) {
+                    currentFps_ = newFps;
+                    needUpdate = true;
+                    std::cout << "[Quality] Decoding is fast. Upgrading FPS to " << currentFps_ << std::endl;
+                }
+            }
+        }
+
+        if (needUpdate && transport_ && transport_->isConnected()) {
+            int targetWidth = (pendingResizeWidth_ > 0) ? pendingResizeWidth_ : screenWidth_;
+            // 确保你的协议函数名匹配（StreamConfigMsg 或 StreamConfig）
+            auto msg = MessageBuilder::StreamConfigMsg(targetWidth, currentFps_, currentKfIntervalSec_);
+            transport_->send(msg);
+            lastFpsChangeTime_ = now;
+        }
+
+        // 重置区间统计（保持不变）
+        intervalFramesDecoded_ = 0;
+        intervalFramesDropped_ = 0;
+        intervalDecodeTimeMs_ = 0;
+        lastStatsTime_ = now;
+    }
+}
+
+// --- 新增：冷却完成时发送配置 ---
+void DesktopWindow::onResizeCooldown() {
+    if (transport_ && transport_->isConnected() && pendingResizeWidth_ > 0) {
+        std::cout << "[Desktop] Window resized, updating target width to: " << pendingResizeWidth_ << std::endl;
+        auto msg = MessageBuilder::StreamConfigMsg(pendingResizeWidth_, currentFps_, currentKfIntervalSec_);
+        transport_->send(msg);
+    }
+}
+
+void DesktopWindow::paintEvent(QPaintEvent* event) {
+    Q_UNUSED(event);
+
+    QImage imageToDraw;
+    {
+        std::lock_guard<std::mutex> lock(frameMutex_);
+        if (latestFrame_.isNull()) return;
+        imageToDraw = latestFrame_; // 这里获取最新的帧
+        hasNewFrame_ = false;
+    }
+
+    QPainter painter(this);
+    
+    // 1. 背景涂黑（处理比例不一致时的黑边）
+    painter.fillRect(rect(), Qt::black);
+
+    // 2. 核心：让图片自适应“当前窗口”的大小
+    // 注意：这里使用的是 this->size() 而不是固定的大小
+    // Qt::FastTransformation 保证了低延迟
+    QImage scaledImg = imageToDraw.scaled(this->size(), 
+                                          Qt::KeepAspectRatio, 
+                                          Qt::FastTransformation);
+
+    // 3. 计算居中位置
+    int x = (width() - scaledImg.width()) / 2;
+    int y = (height() - scaledImg.height()) / 2;
+
+    // 4. 绘制到屏幕
+    painter.drawImage(x, y, scaledImg);
 }

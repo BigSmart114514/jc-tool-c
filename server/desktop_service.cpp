@@ -4,12 +4,17 @@
 DesktopService::DesktopService() {}
 DesktopService::~DesktopService() { stop(); }
 
+// 在 init 中赋予初始服务端默认设置：
 bool DesktopService::init() {
-    if (!capture_.init()) {
-        std::cerr << "[Desktop] Capture init failed" << std::endl;
-        return false;
-    }
-    if (!encoder_.init(capture_.getWidth(), capture_.getHeight(), Config::FPS, Config::CRF)) {
+    if (!capture_.init()) { return false; }
+    
+    // 初始使用服务端配置
+    targetWidth_ = capture_.getWidth();
+    targetHeight_ = capture_.getHeight();
+    targetFps_ = Config::FPS;
+    targetKfIntervalSec_ = 5; // 默认5秒
+
+    if (!encoder_.init(targetWidth_, targetHeight_, targetFps_, Config::CRF)) {
         std::cerr << "[Desktop] Encoder init failed" << std::endl;
         return false;
     }
@@ -72,6 +77,36 @@ void DesktopService::onMessage(const BinaryData& data) {
         case Desktop::MsgType::KeyframeRequest:
             keyframeRequested_ = true;
             break;
+        
+        case Desktop::MsgType::StreamConfig: {
+            if (data.size() >= 1 + sizeof(Desktop::StreamConfig)) {
+                Desktop::StreamConfig cfg;
+                memcpy(&cfg, data.data() + 1, sizeof(cfg));
+
+                int origW = capture_.getWidth();
+                int origH = capture_.getHeight();
+
+                // 约束计算：服务端原始长宽比缩放
+                int newH = (origW > 0) ? (origH * cfg.width / origW) : origH;
+                
+                // 【核心细节】：由于大部分HEVC编码器(YUV420)对分辨率要求必须为偶数，做对齐处理
+                cfg.width = (cfg.width >> 1) << 1;
+                newH = (newH >> 1) << 1;
+
+                targetWidth_ = cfg.width;
+                targetHeight_ = newH;
+                targetFps_ = cfg.fps > 0 ? cfg.fps : 1;
+                targetKfIntervalSec_ = cfg.keyframeIntervalSec > 0 ? cfg.keyframeIntervalSec : 5;
+                
+                // 标记配置有更改，在发送下个关键帧时应用
+                configChanged_ = true;
+                
+                std::cout << "[Desktop] Client specified Stream Config: " 
+                          << targetWidth_ << "x" << targetHeight_ 
+                          << " @ " << targetFps_ << "fps. Will apply on next keyframe." << std::endl;
+            }
+            break;
+        }
 
         default:
             break;
@@ -109,6 +144,8 @@ void DesktopService::captureLoop() {
         }
 
         DWORD t0 = GetTickCount();
+        // 【动态修改1】实时帧率导致的单帧延迟时间
+        DWORD frameMs = 1000 / targetFps_;
 
         processInput();
 
@@ -116,11 +153,29 @@ void DesktopService::captureLoop() {
         const uint8_t* frame = capture_.capture(hasNew);
         if (!frame) { Sleep(10); continue; }
 
-        bool keyframe = (pts % Config::KEYFRAME_INTERVAL == 0) || keyframeRequested_.exchange(false);
+        // 【动态修改2】判断本次是否应该发送关键帧
+        bool kfRequested = keyframeRequested_.exchange(false);
+        // 根据客户端指定的帧率和秒数计算关键帧间隔
+        bool isTimeForKeyframe = (pts % (targetFps_ * targetKfIntervalSec_) == 0) || kfRequested;
 
-        if (encoder_.encode(frame, pts, encoded, keyframe)) {
+        // 【动态修改3】如果有新的配置请求，并且当下马上要发关键帧，此时再重置编码器！
+        if (configChanged_ && isTimeForKeyframe) {
+            std::cout << "[Desktop] Applying new config and forcing keyframe..." << std::endl;
+            encoder_.cleanup();
+            encoder_.init(targetWidth_, targetHeight_, targetFps_, Config::CRF);
+            configChanged_ = false;
+
+            // 极为关键的一步：告诉客户端分辨率变了，让它的解码器也立即重新初始化！
+            if (transport_ && transport_->hasClient()) {
+                auto msg = MessageBuilder::ScreenInfo(targetWidth_, targetHeight_);
+                transport_->send(msg);
+            }
+            pts = 0; // 重置时间戳
+        }
+
+        if (encoder_.encode(frame, pts, encoded, isTimeForKeyframe)) {
             if (!encoded.empty() && transport_ && transport_->hasClient()) {
-                auto msg = MessageBuilder::VideoFrame(encoded.data(), encoded.size(), keyframe);
+                auto msg = MessageBuilder::VideoFrame(encoded.data(), encoded.size(), isTimeForKeyframe);
                 if (!transport_->send(msg)) {
                     clientReady_ = false;
                 }
