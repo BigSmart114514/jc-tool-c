@@ -20,14 +20,18 @@ echo Qt Path: %QT_DIR%
 echo.
 
 :: 检查 FFmpeg
-set FFMPEG_DIR=%~dp0..\ffmpeg
+if not defined FFMPEG_DIR (
+    set FFMPEG_DIR=%~dp0..\ffmpeg
+)
 if not exist "%FFMPEG_DIR%" (
     echo Warning: FFmpeg not found at %FFMPEG_DIR%
     echo Please ensure FFmpeg is installed correctly
 )
 
 :: 检查 P2P
-set P2P_DIR=%~dp0..\p2p-client-windows
+if not defined P2P_DIR (
+    set P2P_DIR=%~dp0..\p2p-client-windows
+)
 if not exist "%P2P_DIR%" (
     echo Warning: P2P library not found at %P2P_DIR%
     echo Please ensure P2P library is installed correctly
