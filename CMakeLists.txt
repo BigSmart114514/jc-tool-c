@@ -86,22 +86,30 @@ set_target_properties(RemoteControl PROPERTIES
 
 # 复制 DLL
 if(WIN32)
+    # 可靠地获取 Qt bin 目录
+    find_program(QT_QMAKE_EXECUTABLE qmake HINTS ${Qt6_DIR} ENV Qt6_DIR REQUIRED)
+    get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)
+    message(STATUS "Qt bin directory: ${QT_BIN_DIR}")
+
     file(GLOB FFMPEG_DLLS "${FFMPEG_DIR}/bin/*.dll")
     file(GLOB P2P_DLLS "${P2P_DIR}/bin/*.dll")
-    
-    # Qt DLLs
-    get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
-    get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)
-    
+
+    # Qt 核心 DLL（根据实际需要添加，可用 windeployqt --dry-run 查看）
     set(QT_DLLS
-        "${QT_BIN_DIR}/Qt6Core.dll" "${QT_BIN_DIR}/Qt6Gui.dll"
-        "${QT_BIN_DIR}/Qt6Widgets.dll" "${QT_BIN_DIR}/Qt6Network.dll"
+        "${QT_BIN_DIR}/Qt6Core.dll"
+        "${QT_BIN_DIR}/Qt6Gui.dll"
+        "${QT_BIN_DIR}/Qt6Widgets.dll"
+        "${QT_BIN_DIR}/Qt6Network.dll"
     )
-    
+
+    # 如果使用其他模块，请补充对应的 DLL
+
     add_custom_command(TARGET RemoteControl POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${P2P_DLLS} ${QT_DLLS} $<TARGET_FILE_DIR:RemoteControl>
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:RemoteControl>/platforms
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${P2P_DLLS} ${QT_DLLS} $<TARGET_FILE_DIR:RemoteControl>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qwindows.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
-        COMMENT "Copying Runtime DLLs..."
+        # 根据需要添加其他平台插件
+        # COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qdirect2d.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
+        COMMENT "Copying runtime DLLs and Qt platform plugin..."
     )
 endif()
