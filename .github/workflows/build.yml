@@ -21,7 +21,6 @@ on:
 
 env:
   BUILD_TYPE: Release
-  FFMPEG_VERSION: '7.1'  # 可根据需要调整
 
 jobs:
   build-windows:
@@ -33,7 +32,7 @@ jobs:
       - name: Checkout current repository
         uses: actions/checkout@v4
 
-      # 2. 安装 Qt6
+      # 2. 安装 Qt6 (MSVC 2022 版本)
       - name: Install Qt6
         uses: jurplel/install-qt-action@v4
         with:
@@ -41,7 +40,13 @@ jobs:
           arch: 'win64_msvc2022_64'
           modules: 'qt5compat'
 
-      # 3. 下载并解压 FFmpeg
+      # 3. 设置 MSVC 编译器环境
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # 4. 下载并部署 FFmpeg 到 ../ffmpeg
       - name: Download FFmpeg
         shell: pwsh
         run: |
@@ -49,16 +54,22 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
           Expand-Archive -Path ffmpeg.zip -DestinationPath .
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
-          echo "FFMPEG_DIR=${{ github.workspace }}\$ffmpegDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # 4. 下载 P2P 预编译库（来自 BigSmart114514/p2p 的 Release）
+          # 项目期望 FFmpeg 位于 ../ffmpeg
+          $targetDir = "${{ github.workspace }}/../ffmpeg"
+          New-Item -ItemType Directory -Force -Path $targetDir
+          Copy-Item -Path "$($ffmpegDir.FullName)\*" -Destination $targetDir -Recurse -Force
+
+          # 设置环境变量（可选，某些 CMake 脚本可能使用）
+          echo "FFMPEG_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # 5. 下载并部署 P2P 库到 ../p2p-client-windows
       - name: Download P2P library
         shell: pwsh
         run: |
           $repo = "BigSmart114514/p2p"
           $tag = "${{ github.event.inputs.p2p_version }}"
           if ([string]::IsNullOrEmpty($tag)) {
-            # 获取最新 release
             $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
           } else {
             $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag"
@@ -69,41 +80,47 @@ jobs:
             exit 1
           }
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile p2p-client-library-windows.zip
-          
-          # 解压第一层（得到内层 zip）
+
+          # 解压两层嵌套 zip
           Expand-Archive -Path p2p-client-library-windows.zip -DestinationPath p2p-extract
-          # 找到内层 zip 并解压到最终目录
           $innerZip = Get-ChildItem -Path p2p-extract -Filter "*.zip" | Select-Object -First 1
           if (-not $innerZip) {
             Write-Error "Inner zip not found in p2p-client-library-windows.zip"
             exit 1
           }
           Expand-Archive -Path $innerZip.FullName -DestinationPath p2p-lib
-          echo "P2P_DIR=${{ github.workspace }}\p2p-lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # 5. 配置并构建当前项目
+          # 项目期望 P2P 位于 ../p2p-client-windows
+          $targetDir = "${{ github.workspace }}/../p2p-client-windows"
+          New-Item -ItemType Directory -Force -Path $targetDir
+          Copy-Item -Path "p2p-lib\*" -Destination $targetDir -Recurse -Force
+
+          # 设置环境变量
+          echo "P2P_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # 6. 配置 CMake（使用 Visual Studio 2022 生成器）
       - name: Configure CMake
         shell: pwsh
         run: |
-          cmake -B build -G "Ninja" `
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
             -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" `
             -DFFMPEG_DIR="$env:FFMPEG_DIR" `
             -DP2P_DIR="$env:P2P_DIR"
 
+      # 7. 构建
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      # 6. 收集产物并打包
+      # 8. 收集产物并打包
       - name: Collect artifacts
         shell: pwsh
         run: |
           $staging = "${{ github.workspace }}\release"
           New-Item -ItemType Directory -Force -Path $staging
 
-          # 复制生成的可执行文件（根据实际项目调整）
-          Copy-Item "build\*.exe" $staging\ -ErrorAction SilentlyContinue
-          Copy-Item "build\bin\*.exe" $staging\ -ErrorAction SilentlyContinue
+          # 复制生成的可执行文件（根据实际项目调整名称）
+          Copy-Item "build\bin\${{ env.BUILD_TYPE }}\*.exe" $staging\ -ErrorAction SilentlyContinue
           Copy-Item "build\${{ env.BUILD_TYPE }}\*.exe" $staging\ -ErrorAction SilentlyContinue
 
           # 复制 Qt 运行时 DLL
@@ -116,13 +133,10 @@ jobs:
           # 复制 P2P 及其依赖 DLL
           Copy-Item "$env:P2P_DIR\bin\*.dll" $staging\
 
-          # 可选：配置文件等
-          # Copy-Item "config.json" $staging\
-
           # 打包
           Compress-Archive -Path "$staging\*" -DestinationPath "${{ github.workspace }}\remote-control-windows.zip"
 
-      # 7. 上传 Artifact（公开）
+      # 9. 上传 Artifact（公开）
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -130,7 +144,7 @@ jobs:
           path: ${{ github.workspace }}\remote-control-windows.zip
           retention-days: 30
 
-      # 8. 可选：创建 GitHub Release
+      # 10. 可选：创建 GitHub Release
       - name: Create Release
         if: ${{ github.event.inputs.create_release == 'true' && github.event.inputs.release_tag != '' }}
         uses: softprops/action-gh-release@v2
