@@ -7,7 +7,6 @@ on:
         description: 'P2P release version tag (leave empty for latest)'
         type: string
         default: ''
-        required: false
       create_release:
         description: 'Create a GitHub Release'
         type: boolean
@@ -41,7 +40,7 @@ jobs:
         with:
           arch: x64
 
-      # ---------- FFmpeg (部署到 ../ffmpeg) ----------
+      # ---------- FFmpeg ----------
       - name: Download and deploy FFmpeg
         shell: pwsh
         run: |
@@ -53,7 +52,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $targetDir
           Copy-Item -Path "$($ffmpegDir.FullName)\*" -Destination $targetDir -Recurse -Force
 
-      # ---------- P2P (部署到 ../p2p-client-windows) ----------
+      # ---------- P2P ----------
       - name: Download and deploy P2P library
         shell: pwsh
         run: |
@@ -77,7 +76,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $targetDir
           Copy-Item -Path "p2p-lib\*" -Destination $targetDir -Recurse -Force
 
-      # ---------- CMake 配置 (与 build.bat 完全一致) ----------
+      # ---------- CMake 配置 ----------
       - name: Configure CMake
         shell: pwsh
         run: |
@@ -87,20 +86,20 @@ jobs:
             -DFFMPEG_DIR="${{ github.workspace }}/../ffmpeg" `
             -DP2P_DIR="${{ github.workspace }}/../p2p-client-windows"
 
-      # ---------- 编译 (与 build.bat 完全一致) ----------
+      # ---------- 编译 ----------
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 8
 
-      # ---------- 收集产物：仅 exe，不包含任何 DLL ----------
+      # ---------- 收集产物（纯 cmd 语法）----------
       - name: Collect raw executable
-        run: |
-          mkdir artifacts
-          copy build\${{ env.BUILD_TYPE }}\*.exe artifacts\
-          # 如果可执行文件在 build\bin\Release 下，取消下一行注释
-          # copy build\bin\${{ env.BUILD_TYPE }}\*.exe artifacts\
         shell: cmd
+        run: |
+          if not exist artifacts mkdir artifacts
+          copy build\%BUILD_TYPE%\*.exe artifacts\
+          REM 如果 exe 位于 build\bin\Release，请取消下一行的 REM
+          REM copy build\bin\%BUILD_TYPE%\*.exe artifacts\
 
-      # ---------- 上传原始 exe ----------
+      # ---------- 上传 artifact ----------
       - name: Upload artifact (raw exe)
         uses: actions/upload-artifact@v4
         with:
@@ -108,27 +107,7 @@ jobs:
           path: artifacts\*.exe
           retention-days: 30
 
-      # ---------- (可选) 如果你需要完全自包含的包，请取消注释以下步骤 ----------
-      # - name: Create portable package with windeployqt
-      #   shell: pwsh
-      #   run: |
-      #     $staging = "${{ github.workspace }}\portable"
-      #     New-Item -ItemType Directory -Force -Path $staging
-      #     Copy-Item "build\${{ env.BUILD_TYPE }}\*.exe" $staging\
-      #     & windeployqt --release --no-translations "$staging\*.exe"
-      #     # 复制 FFmpeg 和 P2P 运行时 DLL (因为 windeployqt 不会处理它们)
-      #     Copy-Item "${{ github.workspace }}/../ffmpeg/bin/*.dll" $staging\
-      #     Copy-Item "${{ github.workspace }}/../p2p-client-windows/bin/*.dll" $staging\
-      #     Compress-Archive -Path "$staging\*" -DestinationPath "${{ github.workspace }}\remote-control-portable.zip"
-      #
-      # - name: Upload portable package
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: remote-control-portable
-      #     path: remote-control-portable.zip
-      #     retention-days: 30
-
-      # ---------- 创建 Release (可选) ----------
+      # ---------- 可选：创建 Release ----------
       - name: Create Release
         if: ${{ github.event.inputs.create_release == 'true' && github.event.inputs.release_tag != '' }}
         uses: softprops/action-gh-release@v2
