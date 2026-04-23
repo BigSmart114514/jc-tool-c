@@ -90,21 +90,26 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 8
 
-      # ---------- 收集产物（纯 cmd 语法）----------
-      - name: Collect raw executable
-        shell: cmd
+      # ---------- 打包整个 Release 目录（包含 exe + DLL + platforms 文件夹）----------
+      - name: Package Release folder
+        shell: pwsh
         run: |
-          if not exist artifacts mkdir artifacts
-          copy build\%BUILD_TYPE%\*.exe artifacts\
-          REM 如果 exe 位于 build\bin\Release，请取消下一行的 REM
-          REM copy build\bin\%BUILD_TYPE%\*.exe artifacts\
+          $releaseDir = "${{ github.workspace }}\build\${{ env.BUILD_TYPE }}"
+          if (Test-Path $releaseDir) {
+            Write-Host "Contents of Release folder:"
+            Get-ChildItem -Recurse $releaseDir
+            Compress-Archive -Path "$releaseDir\*" -DestinationPath "${{ github.workspace }}\RemoteControl-Windows.zip"
+          } else {
+            Write-Error "Release folder not found at $releaseDir"
+            exit 1
+          }
 
       # ---------- 上传 artifact ----------
-      - name: Upload artifact (raw exe)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: remote-control-exe-only
-          path: artifacts\*.exe
+          name: RemoteControl-Windows
+          path: RemoteControl-Windows.zip
           retention-days: 30
 
       # ---------- 可选：创建 Release ----------
@@ -113,7 +118,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
-          files: artifacts\*.exe
+          files: RemoteControl-Windows.zip
           draft: false
           prerelease: false
           generate_release_notes: true
