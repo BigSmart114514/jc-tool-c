@@ -1,4 +1,4 @@
-name: Build Windows Application (with prebuilt P2P)
+name: Build Windows (MSVC 2022)
 
 on:
   workflow_dispatch:
@@ -9,62 +9,52 @@ on:
         default: ''
         required: false
       create_release:
-        description: 'Create a GitHub Release with artifacts'
+        description: 'Create a GitHub Release'
         type: boolean
         default: false
-        required: false
       release_tag:
-        description: 'Release tag (if create_release is true, e.g. v1.0.0)'
+        description: 'Release tag (required if create_release is true)'
         type: string
         default: ''
-        required: false
 
 env:
   BUILD_TYPE: Release
 
 jobs:
-  build-windows:
+  build:
     name: Build on Windows
     runs-on: windows-latest
 
     steps:
-      # 1. 检出当前项目源码
-      - name: Checkout current repository
+      - name: Checkout current project
         uses: actions/checkout@v4
 
-      # 2. 安装 Qt6 (MSVC 2022 版本)
-      - name: Install Qt6
+      - name: Install Qt6 (MSVC 2022)
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.*'
           arch: 'win64_msvc2022_64'
           modules: 'qt5compat'
 
-      # 3. 设置 MSVC 编译器环境
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # 4. 下载并部署 FFmpeg 到 ../ffmpeg
-      - name: Download FFmpeg
+      # ---------- FFmpeg (部署到 ../ffmpeg) ----------
+      - name: Download and deploy FFmpeg
         shell: pwsh
         run: |
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
           Expand-Archive -Path ffmpeg.zip -DestinationPath .
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
-
-          # 项目期望 FFmpeg 位于 ../ffmpeg
           $targetDir = "${{ github.workspace }}/../ffmpeg"
           New-Item -ItemType Directory -Force -Path $targetDir
           Copy-Item -Path "$($ffmpegDir.FullName)\*" -Destination $targetDir -Recurse -Force
 
-          # 设置环境变量（可选，某些 CMake 脚本可能使用）
-          echo "FFMPEG_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      # 5. 下载并部署 P2P 库到 ../p2p-client-windows
-      - name: Download P2P library
+      # ---------- P2P (部署到 ../p2p-client-windows) ----------
+      - name: Download and deploy P2P library
         shell: pwsh
         run: |
           $repo = "BigSmart114514/p2p"
@@ -76,81 +66,75 @@ jobs:
           }
           $asset = $release.assets | Where-Object { $_.name -eq "p2p-client-library-windows.zip" }
           if (-not $asset) {
-            Write-Error "Asset p2p-client-library-windows.zip not found in release $($release.tag_name)"
+            Write-Error "Asset p2p-client-library-windows.zip not found"
             exit 1
           }
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile p2p-client-library-windows.zip
-
-          # 解压两层嵌套 zip
           Expand-Archive -Path p2p-client-library-windows.zip -DestinationPath p2p-extract
           $innerZip = Get-ChildItem -Path p2p-extract -Filter "*.zip" | Select-Object -First 1
-          if (-not $innerZip) {
-            Write-Error "Inner zip not found in p2p-client-library-windows.zip"
-            exit 1
-          }
           Expand-Archive -Path $innerZip.FullName -DestinationPath p2p-lib
-
-          # 项目期望 P2P 位于 ../p2p-client-windows
           $targetDir = "${{ github.workspace }}/../p2p-client-windows"
           New-Item -ItemType Directory -Force -Path $targetDir
           Copy-Item -Path "p2p-lib\*" -Destination $targetDir -Recurse -Force
 
-          # 设置环境变量
-          echo "P2P_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      # 6. 配置 CMake（使用 Visual Studio 2022 生成器）
+      # ---------- CMake 配置 (与 build.bat 完全一致) ----------
       - name: Configure CMake
         shell: pwsh
         run: |
           cmake -B build -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
             -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" `
-            -DFFMPEG_DIR="$env:FFMPEG_DIR" `
-            -DP2P_DIR="$env:P2P_DIR"
+            -DFFMPEG_DIR="${{ github.workspace }}/../ffmpeg" `
+            -DP2P_DIR="${{ github.workspace }}/../p2p-client-windows"
 
-      # 7. 构建
+      # ---------- 编译 (与 build.bat 完全一致) ----------
       - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 8
 
-      # 8. 收集产物并打包
-      - name: Collect artifacts
-        shell: pwsh
+      # ---------- 收集产物：仅 exe，不包含任何 DLL ----------
+      - name: Collect raw executable
         run: |
-          $staging = "${{ github.workspace }}\release"
-          New-Item -ItemType Directory -Force -Path $staging
+          mkdir artifacts
+          copy build\${{ env.BUILD_TYPE }}\*.exe artifacts\
+          # 如果可执行文件在 build\bin\Release 下，取消下一行注释
+          # copy build\bin\${{ env.BUILD_TYPE }}\*.exe artifacts\
+        shell: cmd
 
-          # 复制生成的可执行文件（根据实际项目调整名称）
-          Copy-Item "build\bin\${{ env.BUILD_TYPE }}\*.exe" $staging\ -ErrorAction SilentlyContinue
-          Copy-Item "build\${{ env.BUILD_TYPE }}\*.exe" $staging\ -ErrorAction SilentlyContinue
-
-          # 复制 Qt 运行时 DLL
-          $qtBin = Split-Path (Get-Command qmake).Path -Parent
-          Get-ChildItem "$qtBin\*.dll" | Where-Object { $_.Name -match "^(Qt6|Qt5)" } | Copy-Item -Destination $staging\
-
-          # 复制 FFmpeg DLL
-          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $staging\
-
-          # 复制 P2P 及其依赖 DLL
-          Copy-Item "$env:P2P_DIR\bin\*.dll" $staging\
-
-          # 打包
-          Compress-Archive -Path "$staging\*" -DestinationPath "${{ github.workspace }}\remote-control-windows.zip"
-
-      # 9. 上传 Artifact（公开）
-      - name: Upload artifact
+      # ---------- 上传原始 exe ----------
+      - name: Upload artifact (raw exe)
         uses: actions/upload-artifact@v4
         with:
-          name: remote-control-windows
-          path: ${{ github.workspace }}\remote-control-windows.zip
+          name: remote-control-exe-only
+          path: artifacts\*.exe
           retention-days: 30
 
-      # 10. 可选：创建 GitHub Release
+      # ---------- (可选) 如果你需要完全自包含的包，请取消注释以下步骤 ----------
+      # - name: Create portable package with windeployqt
+      #   shell: pwsh
+      #   run: |
+      #     $staging = "${{ github.workspace }}\portable"
+      #     New-Item -ItemType Directory -Force -Path $staging
+      #     Copy-Item "build\${{ env.BUILD_TYPE }}\*.exe" $staging\
+      #     & windeployqt --release --no-translations "$staging\*.exe"
+      #     # 复制 FFmpeg 和 P2P 运行时 DLL (因为 windeployqt 不会处理它们)
+      #     Copy-Item "${{ github.workspace }}/../ffmpeg/bin/*.dll" $staging\
+      #     Copy-Item "${{ github.workspace }}/../p2p-client-windows/bin/*.dll" $staging\
+      #     Compress-Archive -Path "$staging\*" -DestinationPath "${{ github.workspace }}\remote-control-portable.zip"
+      #
+      # - name: Upload portable package
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: remote-control-portable
+      #     path: remote-control-portable.zip
+      #     retention-days: 30
+
+      # ---------- 创建 Release (可选) ----------
       - name: Create Release
         if: ${{ github.event.inputs.create_release == 'true' && github.event.inputs.release_tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
-          files: ${{ github.workspace }}\remote-control-windows.zip
+          files: artifacts\*.exe
           draft: false
           prerelease: false
           generate_release_notes: true
