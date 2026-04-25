@@ -47,6 +47,7 @@ private:
     std::condition_variable clientCV_;
     std::mutex clientMtx_;
     // --- 新增：动态流控配置目标值 ---
+    static constexpr int MINWIDTH = 270;
     int targetWidth_ = 0;
     int targetHeight_ = 0;
     int targetFps_ = 0;
