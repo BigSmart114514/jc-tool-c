@@ -1,4 +1,3 @@
-
 #ifndef HEVC_ENCODER_H
 #define HEVC_ENCODER_H
 
@@ -17,7 +16,8 @@ public:
     HEVCEncoder();
     ~HEVCEncoder();
 
-    bool init(int width, int height, int fps, int crf);
+    // 【修改】增加源宽高的参数
+    bool init(int srcWidth, int srcHeight, int dstWidth, int dstHeight, int fps, int crf);
     void cleanup();
     
     bool encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>& output, bool keyframe = false);
@@ -29,8 +29,12 @@ private:
     AVPacket* pkt_ = nullptr;
     SwsContext* swsCtx_ = nullptr;
     
-    int width_ = 0;
-    int height_ = 0;
+    // 【新增】保存原始输入宽高的变量
+    int srcWidth_ = 0;
+    int srcHeight_ = 0;
+
+    int width_ = 0; // 目标编码宽度
+    int height_ = 0; // 目标编码高度
     bool initialized_ = false;
     std::mutex mtx_;
 };

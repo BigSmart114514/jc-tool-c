@@ -80,11 +80,11 @@ void DesktopWindow::handleMessage(const BinaryData& data) {
         case Desktop::MsgType::VideoFrame:
             if (data.size() > 2) {
                 std::lock_guard<std::mutex> lock(queueMtx_);
-                totalFramesReceived_++;
+                //totalFramesReceived_++;
 
                 if (videoQueue_.size() > 3) {
                     int dropCount = videoQueue_.size();
-                    droppedFrames_ += dropCount;
+                    //droppedFrames_ += dropCount;
                     intervalFramesDropped_ += dropCount; // 记录区间内丢帧
 
                     std::queue<BinaryData> empty;
@@ -117,17 +117,27 @@ void DesktopWindow::handleScreenInfo(const BinaryData& data) {
     auto* info = reinterpret_cast<const Desktop::ScreenInfo*>(data.data() + 1);
     std::cout << "[Desktop] Remote Screen: " << info->width << "x" << info->height << std::endl;
 
-    // 更新原始分辨率信息
     screenWidth_ = info->width;
     screenHeight_ = info->height;
 
-    decoder_.cleanup();
-    if (decoder_.init(info->width, info->height)) {
-        decoderReady_ = true;
-        std::cout << "[Desktop] Decoder initialized" << std::endl;
-    } else {
-        std::cerr << "[Desktop] Decoder init failed" << std::endl;
-        decoderReady_ = false;
+    // 清空旧分辨率帧
+    {
+        std::lock_guard<std::mutex> lock(queueMtx_);
+        std::queue<BinaryData> empty;
+        std::swap(videoQueue_, empty);
+    }
+
+    // 【修改】加锁保护解码器的重新初始化，避免与 decodeLoop 产生数据竞争
+    {
+        std::lock_guard<std::mutex> decLock(decoderMtx_);
+        decoder_.cleanup();
+        if (decoder_.init(info->width, info->height)) {
+            decoderReady_ = true;
+            std::cout << "[Desktop] Decoder initialized" << std::endl;
+        } else {
+            std::cerr << "[Desktop] Decoder init failed" << std::endl;
+            decoderReady_ = false;
+        }
     }
 }
 
@@ -138,7 +148,6 @@ void DesktopWindow::decodeLoop() {
     while (decoding_) {
         BinaryData data;
         {
-            // 1. 等待队列数据或退出信号
             std::unique_lock<std::mutex> lock(queueMtx_);
             queueCV_.wait(lock, [this] { return !videoQueue_.empty() || !decoding_; });
             if (!decoding_) break;
@@ -147,54 +156,48 @@ void DesktopWindow::decodeLoop() {
             videoQueue_.pop();
         }
 
-        if (!decoderReady_) continue;
-
-        // 2. 准备解码数据（跳过 MsgType 1B 和 isKeyframe 1B）
         const uint8_t* rawH265 = data.data() + 2;
         size_t rawSize = data.size() - 2;
 
-        // 3. 记录解码开始时间
         auto decodeStart = std::chrono::steady_clock::now();
 
-        // 4. 执行解码
-        bool success = decoder_.decode(rawH265, static_cast<int>(rawSize), rgbData);
+        bool success = false;
+        int w = 0, h = 0, stride = 0;
 
-        // 5. 记录解码结束时间并计算耗时
+        // 【修改】加锁保护解码操作，防止网络线程在此期间销毁上下文
+        {
+            std::lock_guard<std::mutex> decLock(decoderMtx_);
+            if (!decoderReady_) continue;
+            
+            success = decoder_.decode(rawH265, static_cast<int>(rawSize), rgbData);
+            if (success) {
+                w = decoder_.getWidth();
+                h = decoder_.getHeight();
+                stride = decoder_.getStride();
+            }
+        }
+
         auto decodeEnd = std::chrono::steady_clock::now();
         
         if (success) {
-            // 累加本次解码耗时（毫秒）和成功解码帧数
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(decodeEnd - decodeStart).count();
             intervalDecodeTimeMs_ += static_cast<uint64_t>(duration);
             intervalFramesDecoded_++;
 
-            // 6. 核心逻辑：尝试根据当前区间表现调整流控参数（内部会判断是否到达5秒间隔）
             checkAndAdjustStreamQuality();
 
-            // 7. 准备 UI 渲染数据
-            int w = decoder_.getWidth();
-            int h = decoder_.getHeight();
-
-            // 【关键修改】必须从解码器获取真实的行字节数（Stride）
-            // 如果你底层封装的是 FFmpeg 的 sws_scale，这对应 dst_linesize[0]
-            int stride = decoder_.getStride(); // <--- 你需要在 decoder_ 类中暴露出这个值
-            
-            // 如果 decoder 实在无法提供 stride，且你确定底层就是 FFmpeg，通常可以尝试对齐到 32 字节计算，但最保险的还是获取真实值
-            // 构造 QImage 时，传入真实的 stride，而不是 w * 4
+            // 使用获取到的参数构造 QImage
             QImage img(rgbData.data(), w, h, stride, QImage::Format_RGB32);
             {
                 std::lock_guard<std::mutex> lock(frameMutex_);
-                decodedFrames_++;           // 总计数（用于日志）
-                latestFrame_ = img.copy();   // 深拷贝，防止渲染时内存被下一帧修改
+                latestFrame_ = img.copy();   
                 hasNewFrame_ = true;
                 screenWidth_ = w;
                 screenHeight_ = h;
             }
 
-            // 8. 通知 UI 线程更新显示
             emit frameReady(); 
         } else {
-            // 如果解码失败，通常意味着需要关键帧来修复参考链
             if (transport_ && transport_->isConnected()) {
                 auto msg = MessageBuilder::KeyframeRequest();
                 transport_->send(msg);
@@ -315,14 +318,17 @@ void DesktopWindow::wheelEvent(QWheelEvent* event) {
 
 void DesktopWindow::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
-    updateDisplay();
 
-    // 根据 displayLabel 的当前大小计算目标分辨率的长（宽）
-    if (displayLabel_) {
-        pendingResizeWidth_ = displayLabel_->width();
-        // 重新启动冷却时间（防抖），每次重新缩放都会重新计时
+    // 获取当前窗口内实际显示图像的宽度（等比缩放后）
+    int dispWidth = displayedImageSize().width();
+    if (dispWidth > 0) {
+        pendingResizeWidth_ = dispWidth;
+        // 启动防抖定时器，冷却后发送新的分辨率需求
         resizeTimer_.start(RESIZE_COOLDOWN_MS);
     }
+    // 如果 dispWidth == 0，说明还没有收到第一帧，不做任何分辨率调整
+
+    updateDisplay();  // 触发重绘，保持画面刷新
 }
 /*
 void DesktopWindow::logStatistics() {
@@ -433,4 +439,10 @@ void DesktopWindow::paintEvent(QPaintEvent* event) {
 
     // 4. 绘制到屏幕
     painter.drawImage(x, y, scaledImg);
+}
+
+QSize DesktopWindow::displayedImageSize() {
+    std::lock_guard<std::mutex> lock(frameMutex_);
+    if (latestFrame_.isNull()) return QSize(0, 0);
+    return latestFrame_.size().scaled(this->size(), Qt::KeepAspectRatio);
 }

@@ -38,6 +38,8 @@ public:
     std::atomic<bool>* pEnableMouseClick_ = nullptr;
     std::atomic<bool>* pEnableKeyboard_ = nullptr;
 
+    QSize displayedImageSize();
+
 signals:
     void frameReady();
     void closed();
@@ -69,10 +71,10 @@ private:
     QLabel* displayLabel_ = nullptr;
 
     // --- 统计相关 ---
-    uint64_t totalFramesReceived_ = 0; // 总接收帧数
-    uint64_t droppedFrames_ = 0;       // 丢弃帧数（由于队列积压）
-    uint64_t decodedFrames_ = 0;       // 成功解码帧数
-    int64_t lastLogTime_ = 0;          // 上次打印时间
+    //uint64_t totalFramesReceived_ = 0; // 总接收帧数
+    //uint64_t droppedFrames_ = 0;       // 丢弃帧数（由于队列积压）
+    //uint64_t decodedFrames_ = 0;       // 成功解码帧数
+    //int64_t lastLogTime_ = 0;          // 上次打印时间
 
     // --- 新增：动态流控常量 ---
     const int MAX_FPS = 30;
@@ -94,6 +96,8 @@ private:
     uint64_t intervalDecodeTimeMs_ = 0;
     std::chrono::steady_clock::time_point lastStatsTime_;
     std::chrono::steady_clock::time_point lastFpsChangeTime_;
+
+    std::mutex decoderMtx_;
 
     void checkAndAdjustStreamQuality(); // 新增：评估性能并调整逻辑
 

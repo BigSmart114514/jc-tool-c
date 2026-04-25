@@ -14,7 +14,8 @@ bool DesktopService::init() {
     targetFps_ = Config::FPS;
     targetKfIntervalSec_ = 5; // 默认5秒
 
-    if (!encoder_.init(targetWidth_, targetHeight_, targetFps_, Config::CRF)) {
+    // 【修改】传入源宽高和目标宽高
+    if (!encoder_.init(capture_.getWidth(), capture_.getHeight(), targetWidth_, targetHeight_, targetFps_, Config::CRF)) {
         std::cerr << "[Desktop] Encoder init failed" << std::endl;
         return false;
     }
@@ -53,13 +54,10 @@ void DesktopService::onMessage(const BinaryData& data) {
     switch (type) {
         case Desktop::MsgType::ClientReady: {
             std::cout << "[Desktop] ClientReady received, sending ScreenInfo and starting stream" << std::endl;
-
-            // 每次收到 ClientReady 都发送 ScreenInfo（支持重连和重新打开窗口）
             if (transport_ && transport_->hasClient()) {
                 auto msg = MessageBuilder::ScreenInfo(capture_.getWidth(), capture_.getHeight());
                 transport_->send(msg);
             }
-
             clientReady_ = true;
             clientCV_.notify_one();
             break;
@@ -86,19 +84,18 @@ void DesktopService::onMessage(const BinaryData& data) {
                 int origW = capture_.getWidth();
                 int origH = capture_.getHeight();
 
-                // 约束计算：服务端原始长宽比缩放
-                int newH = (origW > 0) ? (origH * cfg.width / origW) : origH;
+                int calcWidth = std::max(cfg.width , MINWIDTH);
+                int newH = (origW > 0) ? (origH * calcWidth / origW) : origH;
                 
-                // 【核心细节】：由于大部分HEVC编码器(YUV420)对分辨率要求必须为偶数，做对齐处理
-                cfg.width = (cfg.width >> 1) << 1;
-                newH = (newH >> 1) << 1;
+                // 【修改】强制 16 像素对齐，防止 HEVC 编码器内部 padding 导致步长错乱花屏
+                calcWidth = (calcWidth + 15) & ~15;
+                newH = (newH + 15) & ~15;
 
-                targetWidth_ = cfg.width;
+                targetWidth_ = calcWidth;
                 targetHeight_ = newH;
                 targetFps_ = cfg.fps > 0 ? cfg.fps : 1;
                 targetKfIntervalSec_ = cfg.keyframeIntervalSec > 0 ? cfg.keyframeIntervalSec : 5;
                 
-                // 标记配置有更改，在发送下个关键帧时应用
                 configChanged_ = true;
                 
                 std::cout << "[Desktop] Client specified Stream Config: " 
@@ -107,7 +104,6 @@ void DesktopService::onMessage(const BinaryData& data) {
             }
             break;
         }
-
         default:
             break;
     }
@@ -157,12 +153,13 @@ void DesktopService::captureLoop() {
         bool kfRequested = keyframeRequested_.exchange(false);
         // 根据客户端指定的帧率和秒数计算关键帧间隔
         bool isTimeForKeyframe = (pts % (targetFps_ * targetKfIntervalSec_) == 0) || kfRequested;
-
+        
         // 【动态修改3】如果有新的配置请求，并且当下马上要发关键帧，此时再重置编码器！
         if (configChanged_ && isTimeForKeyframe) {
             std::cout << "[Desktop] Applying new config and forcing keyframe..." << std::endl;
             encoder_.cleanup();
-            encoder_.init(targetWidth_, targetHeight_, targetFps_, Config::CRF);
+            // 【修改】重置编码器时，传入源截图宽高和新计算出的目标宽高
+            encoder_.init(capture_.getWidth(), capture_.getHeight(), targetWidth_, targetHeight_, targetFps_, Config::CRF);
             configChanged_ = false;
 
             // 极为关键的一步：告诉客户端分辨率变了，让它的解码器也立即重新初始化！

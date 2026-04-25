@@ -15,11 +15,14 @@ HEVCEncoder::~HEVCEncoder() {
     cleanup();
 }
 
-bool HEVCEncoder::init(int width, int height, int fps, int crf) {
+// 【修改】接收完整的源宽高和目标宽高
+bool HEVCEncoder::init(int srcWidth, int srcHeight, int dstWidth, int dstHeight, int fps, int crf) {
     std::lock_guard<std::mutex> lock(mtx_);
     
-    width_ = width;
-    height_ = height;
+    srcWidth_ = srcWidth;
+    srcHeight_ = srcHeight;
+    width_ = dstWidth;
+    height_ = dstHeight;
 
     const char* encoders[] = {"hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265", nullptr};
 
@@ -30,6 +33,7 @@ bool HEVCEncoder::init(int width, int height, int fps, int crf) {
         ctx_ = avcodec_alloc_context3(codec_);
         if (!ctx_) continue;
 
+        // 编码器使用目标宽高
         ctx_->width = width_;
         ctx_->height = height_;
         ctx_->time_base = {1, fps};
@@ -59,7 +63,8 @@ bool HEVCEncoder::init(int width, int height, int fps, int crf) {
         }
 
         if (avcodec_open2(ctx_, codec_, nullptr) >= 0) {
-            std::cout << "[Encoder] " << encoders[i] << std::endl;
+            std::cout << "[Encoder] " << encoders[i] << " initialized for " 
+                      << width_ << "x" << height_ << std::endl;
             break;
         }
         avcodec_free_context(&ctx_);
@@ -79,9 +84,11 @@ bool HEVCEncoder::init(int width, int height, int fps, int crf) {
 
     pkt_ = av_packet_alloc();
 
-    swsCtx_ = sws_getContext(width_, height_, AV_PIX_FMT_BGRA,
+    // 【修改】sws_getContext 必须区分源宽高和目标宽高！
+    // 并且将 SWS_POINT 替换为 SWS_FAST_BILINEAR 以消除马赛克锯齿
+    swsCtx_ = sws_getContext(srcWidth_, srcHeight_, AV_PIX_FMT_BGRA,
                               width_, height_, ctx_->pix_fmt,
-                              SWS_POINT, nullptr, nullptr, nullptr);
+                              SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 
     initialized_ = true;
     return true;
@@ -107,8 +114,11 @@ bool HEVCEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>&
     if (av_frame_make_writable(frame_) < 0) return false;
 
     const uint8_t* src[1] = {bgra};
-    int srcStride[1] = {width_ * 4};
-    sws_scale(swsCtx_, src, srcStride, 0, height_, frame_->data, frame_->linesize);
+    // 【核心修复】这里的跨度(Stride)必须是真实截图数据的宽度 (srcWidth_)，而不是压缩后的宽度！
+    int srcStride[1] = {srcWidth_ * 4}; 
+    
+    // 【核心修复】这里的高度必须是真实截图数据的高度 (srcHeight_)
+    sws_scale(swsCtx_, src, srcStride, 0, srcHeight_, frame_->data, frame_->linesize);
 
     frame_->pts = pts;
     frame_->pict_type = keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
