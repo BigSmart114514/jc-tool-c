@@ -2,6 +2,15 @@ name: Build EasyTier FFI for Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: '选择要运行的 Runner'
+        required: true
+        type: choice
+        default: 'windows-latest'
+        options:
+          - 'My Laptop (DEV)'
+          - 'windows-latest'   
   # push:
   #   branches: [ main ]
 
@@ -33,6 +42,8 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: '25.x'
+      - name: Install cbindgen
+        run: cargo install cbindgen --force
 
       # 路径修正：在正确的位置构建 easytier-ffi
       - name: Build FFI Dynamic Library
@@ -43,21 +54,45 @@ jobs:
           echo "Build completed. Contents of target/release:"
           dir ..\..\target\release
 
+      - name: Diagnostic - List outputs
+        shell: pwsh
+        run: |
+          echo "=== Release folder ==="
+          Get-ChildItem easytier-src\target\release\easytier_ffi.* 
+
       # 路径修正：从工作区根目录的 target 中复制生成的头文件和动态库
       - name: Collect Artifacts
+        shell: pwsh
         run: |
-          mkdir artifacts
-          # 动态库和静态库在 workspace 根目录的 target\release 下
-          Copy-Item "easytier-src\target\release\easytier_ffi.dll" artifacts\ -ErrorAction SilentlyContinue
-          Copy-Item "easytier-src\target\release\easytier_ffi.lib" artifacts\ -ErrorAction SilentlyContinue
-          # 头文件仍在其专属目录下
-          Copy-Item "easytier-src\easytier-contrib\easytier-ffi\header\easytier_ffi.h" artifacts\ -ErrorAction SilentlyContinue
-          echo "Artifacts collected:"
-          dir artifacts
+          New-Item -ItemType Directory -Force artifacts
+          $release = "easytier-src\target\release"
+
+          # DLL
+          Copy-Item "$release\easytier_ffi.dll" artifacts\ -ErrorAction Stop
+          Write-Host "✓ DLL"
+
+          # Import library (.dll.lib -> .lib)
+          if (Test-Path "$release\easytier_ffi.dll.lib") {
+              Copy-Item "$release\easytier_ffi.dll.lib" artifacts\easytier_ffi.lib
+              Write-Host "✓ Import Library"
+          } else {
+              Write-Warning "No .dll.lib"
+          }
+
+          # 尝试找头文件，但找不到只警告
+          $header = Get-ChildItem "easytier-src\target\release\build" -Recurse -Filter "easytier_ffi.h" | Select-Object -First 1
+          if ($header) {
+              Copy-Item $header.FullName artifacts\easytier_ffi.h
+              Write-Host "✓ Header"
+          } else {
+              Write-Warning "Header not found – continuing without it"
+          }
+
+          Get-ChildItem artifacts
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: easytier-ffi-windows-x64
           path: artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn    # 如果只有 DLL 和 .lib 也不会失败
