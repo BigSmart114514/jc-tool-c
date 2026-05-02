@@ -1,0 +1,63 @@
+name: Build EasyTier FFI for Windows
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [ main ]
+
+env:
+  RUST_TOOLCHAIN: stable
+  EASYTIER_REPO: EasyTier/EasyTier
+  EASYTIER_BRANCH: main
+
+jobs:
+  build-windows-ffi:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout EasyTier
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.EASYTIER_REPO }}
+          ref: ${{ env.EASYTIER_BRANCH }}
+          path: easytier-src
+          submodules: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '25.x'
+
+      # 路径修正：在正确的位置构建 easytier-ffi
+      - name: Build FFI Dynamic Library
+        run: |
+          cd easytier-src\easytier-contrib\easytier-ffi
+          echo "Building FFI library..."
+          cargo build --release
+          echo "Build completed. Contents of target/release:"
+          dir ..\..\target\release
+
+      # 路径修正：从工作区根目录的 target 中复制生成的头文件和动态库
+      - name: Collect Artifacts
+        run: |
+          mkdir artifacts
+          # 动态库和静态库在 workspace 根目录的 target\release 下
+          Copy-Item "easytier-src\target\release\easytier_ffi.dll" artifacts\ -ErrorAction SilentlyContinue
+          Copy-Item "easytier-src\target\release\easytier_ffi.lib" artifacts\ -ErrorAction SilentlyContinue
+          # 头文件仍在其专属目录下
+          Copy-Item "easytier-src\easytier-contrib\easytier-ffi\header\easytier_ffi.h" artifacts\ -ErrorAction SilentlyContinue
+          echo "Artifacts collected:"
+          dir artifacts
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: easytier-ffi-windows-x64
+          path: artifacts/
+          if-no-files-found: error
