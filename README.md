@@ -25,9 +25,9 @@
 
 ## 怎么使用：
 
-- 下载ffmpeg（https://github.com/BtbN/FFmpeg-Builds/releases）Windows版
+- 下载ffmpeg（ https://github.com/BtbN/FFmpeg-Builds/releases ）Windows版
 
-- 下载我的https://github.com/BigSmart114514/p2p 在releases里。
+- 下载我的 https://github.com/BigSmart114514/p2p 在releases里。
 
 - 自己改一下的build.bat
 
