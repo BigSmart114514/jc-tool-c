@@ -31,6 +31,8 @@ private:
     // 保存连接参数用于重连
     std::string savedIp_;
     int savedPort_ = 0;
+
+    const int MAXMSG = 100 * 1024 * 1024;
 };
 
 // ==================== TCP服务端传输 ====================
@@ -58,6 +60,8 @@ private:
     std::thread recvThread_;
     TransportCallbacks callbacks_;
     std::mutex sendMtx_;
+
+    const int MAXMSG = 100 * 1024 * 1024;
 };
 
 #endif // TRANSPORT_TCP_H

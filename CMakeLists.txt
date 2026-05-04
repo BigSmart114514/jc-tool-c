@@ -18,13 +18,13 @@ endif()
 include_directories(${FFMPEG_DIR}/include)
 link_directories(${FFMPEG_DIR}/lib)
 
-# P2P
-set(P2P_DIR "${CMAKE_SOURCE_DIR}/../p2p-client-windows")
-if(NOT EXISTS ${P2P_DIR})
-    message(FATAL_ERROR "P2P library not found at ${P2P_DIR}")
+# easytier
+set(EASYTIER_DIR "${CMAKE_SOURCE_DIR}/../easytier")
+if(NOT EXISTS ${EASYTIER_DIR})
+    message(FATAL_ERROR "Easytier library not found at ${EASYTIER_DIR}")
 endif()
-include_directories(${P2P_DIR}/include)
-link_directories(${P2P_DIR}/lib)
+include_directories(${EASYTIER_DIR}/include)
+link_directories(${EASYTIER_DIR}/lib)
 
 add_definitions(-D_CRT_SECURE_NO_WARNINGS -DP2P_CLIENT_STATIC)
 
@@ -34,7 +34,7 @@ endif()
 
 # 公共库列表
 set(COMMON_LIBS
-    ws2_32 crypt32 avcodec avutil swscale p2p-client datachannel juice libcrypto libssl usrsctp
+    ws2_32 crypt32 avcodec avutil swscale easytier_ffi
 )
 
 # 收集所有的源文件 (包含Client和Server的所有功能)
@@ -50,7 +50,7 @@ set(APP_SOURCES
     server/hevc_encoder.cpp
     server/screen_capture.cpp
     common/transport_tcp.cpp
-    common/transport_p2p.cpp
+    common/easytier_manager.cpp
 )
 
 set(APP_HEADERS
@@ -63,7 +63,7 @@ set(APP_HEADERS
     server/file_service.h
     server/hevc_encoder.h
     server/screen_capture.h
-    common/multi_transport.h
+    common/easytier_manager.h
 )
 
 # 创建单个可执行文件 (使用 WIN32 隐藏控制台，只显示 Qt 界面)
@@ -92,7 +92,7 @@ if(WIN32)
     message(STATUS "Qt bin directory: ${QT_BIN_DIR}")
 
     file(GLOB FFMPEG_DLLS "${FFMPEG_DIR}/bin/*.dll")
-    file(GLOB P2P_DLLS "${P2P_DIR}/bin/*.dll")
+    file(GLOB EASYTIER_DLLS "${EASYTIER_DIR}/bin/*.dll")
 
     # Qt 核心 DLL（根据实际需要添加，可用 windeployqt --dry-run 查看）
     set(QT_DLLS
@@ -106,7 +106,7 @@ if(WIN32)
 
     add_custom_command(TARGET RemoteControl POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:RemoteControl>/platforms
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${P2P_DLLS} ${QT_DLLS} $<TARGET_FILE_DIR:RemoteControl>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${EASYTIER_DLLS} ${QT_DLLS} $<TARGET_FILE_DIR:RemoteControl>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qwindows.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
         # 根据需要添加其他平台插件
         # COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qdirect2d.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/

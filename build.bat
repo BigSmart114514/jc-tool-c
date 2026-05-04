@@ -29,12 +29,12 @@ if not exist "%FFMPEG_DIR%" (
 )
 
 :: 检查 P2P
-if not defined P2P_DIR (
-    set P2P_DIR=%~dp0..\p2p-client-windows
+if not defined EASYTIER_DIR (
+    set EASYTIER_DIR=%~dp0..\easytier
 )
-if not exist "%P2P_DIR%" (
-    echo Warning: P2P library not found at %P2P_DIR%
-    echo Please ensure P2P library is installed correctly
+if not exist "%EASYTIER_DIR%" (
+    echo Warning: Easytier library not found at %EASYTIER_DIR%
+    echo Please ensure Easytier library is installed correctly
 )
 
 :: 检查 CMake
@@ -47,8 +47,8 @@ if errorlevel 1 (
 
 :: 清理旧构建
 if exist build (
-    echo Cleaning old build...
-    rmdir /s /q build
+    echo Not Cleaning old build...
+    @REM rmdir /s /q build
 )
 
 :: 创建构建目录
@@ -67,7 +67,7 @@ if errorlevel 1 (
     echo Please check:
     echo 1. Qt path is correct
     echo 2. FFmpeg is at: %FFMPEG_DIR%
-    echo 3. P2P library is at: %P2P_DIR%
+    echo 3. easytier library is at: %EASYTIER_DIR%
     echo.
     cd ..
     pause

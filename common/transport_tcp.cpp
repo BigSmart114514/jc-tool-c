@@ -85,7 +85,7 @@ void TCPClientTransport::recvLoop() {
         uint32_t msgSize;
         if (!NetUtil::RecvAll(socket_, &msgSize, sizeof(msgSize))) break;
 
-        if (msgSize == 0 || msgSize > 10 * 1024 * 1024) continue;
+        if (msgSize == 0 || msgSize > MAXMSG) continue;
 
         buffer.resize(msgSize);
         if (!NetUtil::RecvAll(socket_, buffer.data(), msgSize)) break;
@@ -240,7 +240,7 @@ void TCPServerTransport::recvLoop() {
             break;
         }
 
-        if (msgSize == 0 || msgSize > 10 * 1024 * 1024) continue;
+        if (msgSize == 0 || msgSize > MAXMSG) continue;
 
         buffer.resize(msgSize);
         if (!NetUtil::RecvAll(clientSocket_, buffer.data(), msgSize)) {

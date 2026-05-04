@@ -3,113 +3,114 @@
 #include <QInputDialog>
 #include <QDialog>
 #include <QVBoxLayout>
-#include <QHBoxLayout>
 #include <QFormLayout>
 #include <QPushButton>
 #include <QLabel>
 #include <QLineEdit>
-#include <QCheckBox>
 #include <iostream>
 
 #include "../common/protocol.h"
-#include "../common/transport_tcp.h"
-#include "../common/transport_p2p.h"
-#include "../common/multi_transport.h"
+#include "../common/transport_tcp.h"        // 仅保留 TCP
+#include "../common/easytier_manager.h"            // 新增
 
-// Client Headers
+// 客户端窗口
 #include "../client/control_panel.h"
 
-// Server Headers
+// 服务端服务
 #include "../server/desktop_service.h"
 #include "../server/file_service.h"
-#include <timeapi.h>
 
+#include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 
-// ======================= CLIENT 逻辑 =======================
+// ======================= CLIENT =======================
 int runClient() {
-    p2p::P2PClient::setLogLevel(2);
+    // 1. 构造客户端 EasyTier 配置对话框
+    QDialog dlg;
+    dlg.setWindowTitle("Client - EasyTier Setup");
+    dlg.setMinimumWidth(420);
+    QFormLayout form(&dlg);
 
-    QStringList modes = {"TCP", "P2P", "Relay"};
+    QLineEdit* leInstName   = new QLineEdit("jc-client");
+    QLineEdit* leNetName    = new QLineEdit("jc-tool-vpn");
+    QLineEdit* leNetSecret  = new QLineEdit("your_secret_here");
+    QLineEdit* leIpv4       = new QLineEdit("");          // 留空表示自动分配
+    leIpv4->setPlaceholderText("Leave empty for auto-assign");
+    QLineEdit* leListenPort = new QLineEdit("11012");
+    QLineEdit* lePeerUrl    = new QLineEdit("tcp://225284.xyz:11010");
+
+    form.addRow("Instance Name:", leInstName);
+    form.addRow("Network Name:", leNetName);
+    form.addRow("Network Secret:", leNetSecret);
+    form.addRow("Virtual IPv4 (optional):", leIpv4);
+    form.addRow("Listen Port:", leListenPort);
+    form.addRow("Public Peer URL:", lePeerUrl);
+
+    QPushButton* btnOk = new QPushButton("Next");
+    form.addRow(btnOk);
+    QObject::connect(btnOk, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+    if (dlg.exec() != QDialog::Accepted)
+        return 0;
+
+    // 生成 TOML（ipv4 可空）
+    std::string toml = EasytierManager::MakeConfig(
+        leInstName->text().toStdString(),
+        leNetName->text().toStdString(),
+        leNetSecret->text().toStdString(),
+        leIpv4->text().toStdString(),       // 空字符串将不写 ipv4 字段
+        leListenPort->text().toInt(),
+        lePeerUrl->text().toStdString()
+    );
+
+    EasytierManager easytierMgr(toml);
+    if (!easytierMgr.start()) {
+        QMessageBox::critical(nullptr, "EasyTier Error", "Could not start EasyTier network.");
+        return 1;
+    }
+
+    // 显示本机虚拟 IP
+    QMessageBox::information(nullptr, "Connected",
+        "Your virtual IP: " + QString::fromStdString(easytierMgr.getVirtualIp()));
+
+    // 2. 询问服务端信息（服务端虚拟 IP 仍然需要输入）
     bool ok;
-    QString mode = QInputDialog::getItem(nullptr, "Transport Mode", "Select transport mode:", modes, 0, false, &ok);
-    if (!ok) return 0;
+    QString serverIp = QInputDialog::getText(nullptr, "Server Virtual IP",
+        "Enter server virtual IP:", QLineEdit::Normal, "10.0.0.1", &ok);
+    if (!ok || serverIp.isEmpty()) return 0;
 
-    std::string modeText, connectInfo;
-    std::string ip, sigUrl, desktopPeerId, filePeerId, relayPassword;
-    int desktopPort = 0, filePort = 0;
-    bool useRelay = false;
-    TransportMode transportMode;
+    int desktopPort = QInputDialog::getInt(nullptr, "Desktop Port",
+        "Desktop service port:", Config::DEFAULT_DESKTOP_PORT);
+    int filePort = QInputDialog::getInt(nullptr, "File Port",
+        "File service port:", Config::DEFAULT_FILE_PORT);
+    if (desktopPort == 0 || filePort == 0) return 0;
 
-    if (mode == "Relay" || mode == "P2P") {
-        useRelay = (mode == "Relay");
-        transportMode = useRelay ? TransportMode::Relay : TransportMode::P2P;
-        modeText = mode.toStdString();
+    // 3. TCP 连接
+    auto* desktopTransport = new TCPClientTransport();
+    auto* fileTransport = new TCPClientTransport();
 
-        sigUrl = QInputDialog::getText(nullptr, "Signaling Server", "Signaling URL:", QLineEdit::Normal, "ws://localhost:8080").toStdString();
-        desktopPeerId = QInputDialog::getText(nullptr, "Desktop Peer", "Desktop Peer ID:").toStdString();
-        filePeerId = QInputDialog::getText(nullptr, "File Peer", "File Peer ID:").toStdString();
-
-        if (desktopPeerId.empty() || filePeerId.empty()) {
-            QMessageBox::critical(nullptr, "Error", "Peer IDs required");
-            return 1;
-        }
-
-        if (useRelay) {
-            relayPassword = QInputDialog::getText(nullptr, "Relay Password", "Password:", QLineEdit::Password).toStdString();
-        }
-        connectInfo = desktopPeerId + " / " + filePeerId;
-    } else {
-        transportMode = TransportMode::TCP;
-        modeText = "TCP";
-
-        ip = QInputDialog::getText(nullptr, "Server IP", "Server IP:", QLineEdit::Normal, "127.0.0.1").toStdString();
-        desktopPort = QInputDialog::getInt(nullptr, "Desktop Port", "Desktop port:", Config::DEFAULT_DESKTOP_PORT);
-        filePort = QInputDialog::getInt(nullptr, "File Port", "File port:", Config::DEFAULT_FILE_PORT);
-
-        connectInfo = ip + ":" + std::to_string(desktopPort) + "/" + std::to_string(filePort);
+    if (!desktopTransport->connect(serverIp.toStdString(), desktopPort) ||
+        !fileTransport->connect(serverIp.toStdString(), filePort)) {
+        QMessageBox::critical(nullptr, "Connection Failed",
+            "Cannot connect to server via EasyTier.");
+        delete desktopTransport;
+        delete fileTransport;
+        return 1;
     }
 
-    ITransport* desktopTransport = nullptr;
-    ITransport* fileTransport = nullptr;
-
-    if (transportMode == TransportMode::TCP) {
-        auto* dt = new TCPClientTransport();
-        auto* ft = new TCPClientTransport();
-
-        if (!dt->connect(ip, desktopPort) || !ft->connect(ip, filePort)) {
-            QMessageBox::critical(nullptr, "Connection Failed", "Failed to connect via TCP!");
-            delete dt; delete ft;
-            return 1;
-        }
-        desktopTransport = dt;
-        fileTransport = ft;
-    } else {
-        auto* dt = new P2PClientTransport();
-        auto* ft = new P2PClientTransport();
-
-        if (!dt->connect(sigUrl, desktopPeerId, ServiceType::Desktop, useRelay, relayPassword) ||
-            !ft->connect(sigUrl, filePeerId, ServiceType::FileManager, useRelay, relayPassword)) {
-            QMessageBox::critical(nullptr, "Connection Failed", "Failed to connect via P2P/Relay!");
-            dt->disconnect(); delete dt; delete ft;
-            return 1;
-        }
-        desktopTransport = dt;
-        fileTransport = ft;
-    }
-
+    // 4. 控制面板
     ControlPanelConfig panelConfig;
     panelConfig.desktopTransport = desktopTransport;
     panelConfig.fileTransport = fileTransport;
-    panelConfig.modeText = modeText;
-    panelConfig.connectInfo = connectInfo;
+    panelConfig.modeText = "EasyTier";
+    panelConfig.connectInfo = serverIp.toStdString() + ":" + std::to_string(desktopPort);
 
     ControlPanel controlPanel;
     controlPanel.setConfig(panelConfig);
     controlPanel.setupTransportCallbacks();
     controlPanel.show();
 
-    int result = qApp->exec(); // Client Event Loop
+    int result = qApp->exec();
 
     desktopTransport->disconnect();
     fileTransport->disconnect();
@@ -118,147 +119,114 @@ int runClient() {
     return result;
 }
 
-// ======================= SERVER 逻辑 =======================
+// ======================= SERVER =======================
 int runServer() {
     timeBeginPeriod(1);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-    p2p::P2PClient::setLogLevel(2);
 
-    // 1. Qt Server Configuration Dialog
-    QDialog configDlg;
-    configDlg.setWindowTitle("Server Setup");
-    configDlg.setMinimumWidth(400);
-    QFormLayout form(&configDlg);
+    // 1. 服务端 EasyTier 配置对话框
+    QDialog dlg;
+    dlg.setWindowTitle("Server - EasyTier Setup");
+    dlg.setMinimumWidth(420);
+    QFormLayout form(&dlg);
 
-    QCheckBox* cbTcp = new QCheckBox("Enable TCP");
-    cbTcp->setChecked(true);
+    QLineEdit* leInstName   = new QLineEdit("jc-server");
+    QLineEdit* leNetName    = new QLineEdit("jc-tool-vpn");
+    QLineEdit* leNetSecret  = new QLineEdit("your_secret_here");
+    QLineEdit* leIpv4       = new QLineEdit("10.0.0.1");
+    QLineEdit* leListenPort = new QLineEdit("11011");
+    QLineEdit* lePeerUrl    = new QLineEdit("tcp://225284.xyz:11010");
+
     QLineEdit* leDesktopPort = new QLineEdit(QString::number(Config::DEFAULT_DESKTOP_PORT));
-    QLineEdit* leFilePort = new QLineEdit(QString::number(Config::DEFAULT_FILE_PORT));
-    
-    QCheckBox* cbP2p = new QCheckBox("Enable P2P");
-    cbP2p->setChecked(true);
-    QLineEdit* leSigUrl = new QLineEdit("ws://localhost:8080");
-    QLineEdit* leDesktopPeerId = new QLineEdit("");
-    leDesktopPeerId->setPlaceholderText("Leave empty for Auto ID");
-    QLineEdit* leFilePeerId = new QLineEdit("");
-    leFilePeerId->setPlaceholderText("Leave empty for Auto ID");
+    QLineEdit* leFilePort    = new QLineEdit(QString::number(Config::DEFAULT_FILE_PORT));
 
-    form.addRow(cbTcp);
-    form.addRow("Desktop Port:", leDesktopPort);
-    form.addRow("File Port:", leFilePort);
-    form.addRow(new QLabel("--------------------------------------"));
-    form.addRow(cbP2p);
-    form.addRow("Signaling URL:", leSigUrl);
-    form.addRow("Desktop Peer ID:", leDesktopPeerId);
-    form.addRow("File Peer ID:", leFilePeerId);
+    form.addRow("Instance Name:", leInstName);
+    form.addRow("Network Name:", leNetName);
+    form.addRow("Network Secret:", leNetSecret);
+    form.addRow("Virtual IPv4:", leIpv4);
+    form.addRow("Listen Port:", leListenPort);
+    form.addRow("Public Peer URL:", lePeerUrl);
+    form.addRow("Desktop Service Port:", leDesktopPort);
+    form.addRow("File Service Port:", leFilePort);
 
     QPushButton* btnStart = new QPushButton("Start Server");
     form.addRow(btnStart);
-    QObject::connect(btnStart, &QPushButton::clicked, &configDlg, &QDialog::accept);
+    QObject::connect(btnStart, &QPushButton::clicked, &dlg, &QDialog::accept);
 
-    if (configDlg.exec() != QDialog::Accepted) {
+    if (dlg.exec() != QDialog::Accepted) {
         timeEndPeriod(1);
         return 0;
     }
 
-    bool tcpEnabled = cbTcp->isChecked();
-    bool p2pEnabled = cbP2p->isChecked();
+    int desktopPort = leDesktopPort->text().toInt();
+    int filePort    = leFilePort->text().toInt();
 
-    if (!tcpEnabled && !p2pEnabled) {
-        QMessageBox::warning(nullptr, "Error", "You must enable at least one transport mode.");
+    std::string toml = EasytierManager::MakeConfig(
+        leInstName->text().toStdString(),
+        leNetName->text().toStdString(),
+        leNetSecret->text().toStdString(),
+        leIpv4->text().toStdString(),
+        leListenPort->text().toInt(),
+        lePeerUrl->text().toStdString()
+    );
+
+    EasytierManager easytierMgr(toml);
+    if (!easytierMgr.start()) {
+        QMessageBox::critical(nullptr, "EasyTier Error", "Could not start EasyTier network.");
         timeEndPeriod(1);
         return 1;
     }
 
-    // 2. Initialize Services
+    std::string myVirtualIp = easytierMgr.getVirtualIp();
+
+    // 2. 初始化服务并绑定 TCP 传输
     DesktopService desktopService;
     FileService fileService;
     if (!desktopService.init()) {
         QMessageBox::critical(nullptr, "Error", "Desktop service init failed!");
+        timeEndPeriod(1);
         return 1;
     }
 
-    MultiServerTransport desktopMultiTransport;
-    MultiServerTransport fileMultiTransport;
+    auto desktopTCP = std::make_unique<TCPServerTransport>(desktopPort);
+    auto fileTCP    = std::make_unique<TCPServerTransport>(filePort);
 
-    // TCP Setup
-    if (tcpEnabled) {
-        int dPort = leDesktopPort->text().toInt();
-        int fPort = leFilePort->text().toInt();
-        auto desktopTCP = std::make_unique<TCPServerTransport>(dPort);
-        auto fileTCP = std::make_unique<TCPServerTransport>(fPort);
-
-        if (desktopTCP->start() && fileTCP->start()) {
-            desktopMultiTransport.addOwnedTransport(std::move(desktopTCP), "TCP:" + std::to_string(dPort));
-            fileMultiTransport.addOwnedTransport(std::move(fileTCP), "TCP:" + std::to_string(fPort));
-        } else {
-            QMessageBox::critical(nullptr, "TCP Error", "Failed to start TCP transports. Port may be in use.");
-            timeEndPeriod(1);
-            return 1;
-        }
+    if (!desktopTCP->start() || !fileTCP->start()) {
+        QMessageBox::critical(nullptr, "TCP Error", "Failed to start TCP transport.");
+        timeEndPeriod(1);
+        return 1;
     }
 
-    // P2P Setup
-    std::string finalDesktopId = "Auto-generated";
-    std::string finalFileId = "Auto-generated";
-    if (p2pEnabled) {
-        auto desktopP2P = std::make_unique<P2PServerTransport>(ServiceType::Desktop);
-        auto fileP2P = std::make_unique<P2PServerTransport>(ServiceType::FileManager);
-        desktopP2P->setConfig(leSigUrl->text().toStdString(), leDesktopPeerId->text().toStdString());
-        fileP2P->setConfig(leSigUrl->text().toStdString(), leFilePeerId->text().toStdString());
-
-        if (desktopP2P->start() && fileP2P->start()) {
-            finalDesktopId = desktopP2P->getLocalId();
-            finalFileId = fileP2P->getLocalId();
-            desktopMultiTransport.addOwnedTransport(std::move(desktopP2P), "P2P");
-            fileMultiTransport.addOwnedTransport(std::move(fileP2P), "P2P");
-        } else {
-            QMessageBox::critical(nullptr, "P2P Error", "Failed to start P2P transports.");
-            timeEndPeriod(1);
-            return 1;
-        }
-    }
-
-    // 3. Start Multi Transports and Services
-    desktopMultiTransport.start();
-    fileMultiTransport.start();
-    desktopService.setTransport(&desktopMultiTransport);
-    fileService.setTransport(&fileMultiTransport);
+    desktopService.setTransport(desktopTCP.get());
+    fileService.setTransport(fileTCP.get());
     desktopService.start();
     fileService.start();
 
-    // 4. Server Control Window (Replaces console while loop)
-    QDialog serverStatusWin;
-    serverStatusWin.setWindowTitle("Server Running");
-    serverStatusWin.setMinimumSize(350, 200);
-    QVBoxLayout vLayout(&serverStatusWin);
-    
-    vLayout.addWidget(new QLabel(QString("<b>Resolution:</b> %1x%2").arg(desktopService.getWidth()).arg(desktopService.getHeight())));
-    if (tcpEnabled) {
-        vLayout.addWidget(new QLabel(QString("<b>TCP Desktop Port:</b> %1").arg(leDesktopPort->text())));
-        vLayout.addWidget(new QLabel(QString("<b>TCP File Port:</b> %1").arg(leFilePort->text())));
-    }
-    if (p2pEnabled) {
-        vLayout.addWidget(new QLabel(QString("<b>P2P Desktop ID:</b> %1").arg(QString::fromStdString(finalDesktopId))));
-        vLayout.addWidget(new QLabel(QString("<b>P2P File ID:</b> %1").arg(QString::fromStdString(finalFileId))));
-    }
-
+    // 3. 服务器状态窗口
+    QDialog statusWin;
+    statusWin.setWindowTitle("Server Running on EasyTier");
+    statusWin.setMinimumSize(400, 250);
+    QVBoxLayout vLayout(&statusWin);
+    vLayout.addWidget(new QLabel(QString("Virtual IP: %1").arg(myVirtualIp.c_str())));
+    vLayout.addWidget(new QLabel(QString("Desktop Port: %1").arg(desktopPort)));
+    vLayout.addWidget(new QLabel(QString("File Port: %1").arg(filePort)));
+    vLayout.addWidget(new QLabel(QString("Resolution: %1x%2")
+        .arg(desktopService.getWidth()).arg(desktopService.getHeight())));
     vLayout.addStretch();
     QPushButton* btnStop = new QPushButton("Stop Server");
     btnStop->setStyleSheet("background-color: #c9302c; color: white; padding: 8px;");
     vLayout.addWidget(btnStop);
-    QObject::connect(btnStop, &QPushButton::clicked, &serverStatusWin, &QDialog::accept);
+    QObject::connect(btnStop, &QPushButton::clicked, &statusWin, &QDialog::accept);
+    statusWin.show();
 
-    serverStatusWin.show();
+    qApp->exec();
 
-    // 等待用户点击 Stop Server 关闭窗口
-    qApp->exec(); 
-
-    // 5. Cleanup
+    // 4. 清理
     desktopService.stop();
     fileService.stop();
-    desktopMultiTransport.stop();
-    fileMultiTransport.stop();
+    desktopTCP->stop();
+    fileTCP->stop();
+    easytierMgr.stop();
     timeEndPeriod(1);
 
     return 0;
@@ -268,19 +236,18 @@ int runServer() {
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
 
-    // 初始化全局 Winsock (对 Client 和 Server 都是必须的)
     if (!NetUtil::InitWinsock()) {
         QMessageBox::critical(nullptr, "Error", "WSAStartup failed!");
         return 1;
     }
 
-    // 启动选择窗口
+    // 模式选择
     QDialog startupDlg;
     startupDlg.setWindowTitle("JC Tool Mode Selector");
     startupDlg.setFixedSize(300, 150);
     QVBoxLayout layout(&startupDlg);
-    
-    QLabel* label = new QLabel("Select application mode to start:");
+
+    QLabel* label = new QLabel("Select application mode:");
     label->setAlignment(Qt::AlignCenter);
     layout.addWidget(label);
 
@@ -288,11 +255,10 @@ int main(int argc, char* argv[]) {
     QPushButton* btnServer = new QPushButton("Start as Server");
     btnClient->setMinimumHeight(35);
     btnServer->setMinimumHeight(35);
-
     layout.addWidget(btnClient);
     layout.addWidget(btnServer);
 
-    int mode = 0; // 1 = Client, 2 = Server
+    int mode = 0;
     QObject::connect(btnClient, &QPushButton::clicked, [&](){ mode = 1; startupDlg.accept(); });
     QObject::connect(btnServer, &QPushButton::clicked, [&](){ mode = 2; startupDlg.accept(); });
 
@@ -302,11 +268,10 @@ int main(int argc, char* argv[]) {
     }
 
     int result = 0;
-    if (mode == 1) {
+    if (mode == 1)
         result = runClient();
-    } else if (mode == 2) {
+    else if (mode == 2)
         result = runServer();
-    }
 
     WSACleanup();
     return result;
