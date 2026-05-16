@@ -10,8 +10,8 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
-# FFmpeg
-set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/../ffmpeg")
+# FFmpeg (minimal build)
+set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/../ffmpeg-minimal")
 if(NOT EXISTS ${FFMPEG_DIR})
     message(FATAL_ERROR "FFmpeg not found at ${FFMPEG_DIR}")
 endif()
@@ -92,7 +92,6 @@ if(WIN32)
     get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)
     message(STATUS "Qt bin directory: ${QT_BIN_DIR}")
 
-    file(GLOB FFMPEG_DLLS "${FFMPEG_DIR}/bin/*.dll")
     file(GLOB EASYTIER_DLLS "${EASYTIER_DIR}/bin/*.dll")
 
     # Qt 核心 DLL（根据实际需要添加，可用 windeployqt --dry-run 查看）
@@ -101,6 +100,13 @@ if(WIN32)
         "${QT_BIN_DIR}/Qt6Gui.dll"
         "${QT_BIN_DIR}/Qt6Widgets.dll"
         "${QT_BIN_DIR}/Qt6Network.dll"
+    )
+
+    set(FFMPEG_DLLS
+        "${FFMPEG_DIR}/bin/avcodec-61.dll"
+        "${FFMPEG_DIR}/bin/avutil-59.dll"
+        "${FFMPEG_DIR}/bin/swscale-8.dll"
+        "${FFMPEG_DIR}/bin/swresample-5.dll"
     )
 
     # 如果使用其他模块，请补充对应的 DLL
