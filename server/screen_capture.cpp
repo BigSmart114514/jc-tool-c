@@ -70,10 +70,15 @@ bool ScreenCapture::initDXGI() {
     }
 
     frameBuffer_ = new uint8_t[size_t(width_) * height_ * 4];
+    memset(frameBuffer_, 0, size_t(width_) * height_ * 4);
+
     useGDI_ = false;
     initialized_ = true;
 
-    std::cout << "[Capture] DXGI: " << width_ << "x" << height_ << std::endl;
+    std::cout << "[Capture] DXGI initialized: "
+            << width_ << "x" << height_
+            << ", bufferSize=" << size_t(width_) * height_ * 4
+            << std::endl;
     return true;
 }
 
@@ -145,10 +150,27 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
 
     DXGI_OUTDUPL_FRAME_INFO fi;
     IDXGIResource* res = nullptr;
-    HRESULT hr = duplication_->AcquireNextFrame(0, &fi, &res);
+    HRESULT hr = duplication_->AcquireNextFrame(16, &fi, &res);
 
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return frameBuffer_;
-    if (FAILED(hr)) return frameBuffer_;
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        return frameBuffer_;
+    }
+
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        std::cerr << "[Capture] DXGI access lost, recreating duplication" << std::endl;
+        resetDXGI();
+        return nullptr;
+    }
+
+    if (FAILED(hr)) {
+        static int failCount = 0;
+        if (++failCount % 60 == 0) {
+            std::cerr << "[Capture] DXGI AcquireNextFrame failed, hr=0x"
+                    << std::hex << hr << std::dec << std::endl;
+        }
+
+        return nullptr;
+    }
 
     frameAcquired_ = true;
     hasNew = true;
@@ -175,4 +197,52 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
     }
 
     return frameBuffer_;
+}
+
+void ScreenCapture::cleanupDXGIOnly() {
+    if (frameAcquired_ && duplication_) {
+        duplication_->ReleaseFrame();
+        frameAcquired_ = false;
+    }
+
+    if (stagingTexture_) {
+        stagingTexture_->Release();
+        stagingTexture_ = nullptr;
+    }
+
+    if (duplication_) {
+        duplication_->Release();
+        duplication_ = nullptr;
+    }
+
+    if (context_) {
+        context_->Release();
+        context_ = nullptr;
+    }
+
+    if (device_) {
+        device_->Release();
+        device_ = nullptr;
+    }
+
+    if (!useGDI_ && frameBuffer_) {
+        delete[] frameBuffer_;
+        frameBuffer_ = nullptr;
+    }
+
+    initialized_ = false;
+}
+
+bool ScreenCapture::resetDXGI() {
+    std::cerr << "[Capture] Resetting DXGI duplication..." << std::endl;
+
+    cleanupDXGIOnly();
+
+    if (initDXGI()) {
+        std::cout << "[Capture] DXGI reset OK" << std::endl;
+        return true;
+    }
+
+    std::cerr << "[Capture] DXGI reset failed, falling back to GDI" << std::endl;
+    return initGDI();
 }

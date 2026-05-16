@@ -12,7 +12,7 @@ extern "C" {
 namespace {
 
 void LogInfo(const std::string& msg) {
-    std::cout << "[EasyTier] " << msg << std::endl;
+    //std::cout << "[EasyTier] " << msg << std::endl;
 }
 
 void LogError(const std::string& msg) {
@@ -75,13 +75,18 @@ std::string EasytierManager::MakeConfig(const std::string& instanceName,
     // [instance] 部分
     ss << "instance_name = \"" << instanceName << "\"\n";
     ss << "hostname = \"" << instanceName << "\"\n";  // 用实例名代替主机名
-    if (!ipv4.empty())
+    // 在 [instance] 部分
+    if (!ipv4.empty()) {
         ss << "ipv4 = \"" << ipv4 << "\"\n";
-    ss << "dhcp = true\n";
+
+    } else {
+        ss << "dhcp = true\n";
+    }
     ss << "\n";
     ss << "listeners = [\n";
     ss << "  \"tcp://0.0.0.0:" << listenPort << "\",\n";
     ss << "  \"udp://0.0.0.0:" << listenPort << "\",\n";
+    //ss << "  \"wg://0.0.0.0:" << (listenPort + 1) << "\"\n";
     // 可选监听 ws/wss/wg，这里为了简单只开 tcp 和 udp
     ss << "]\n\n";
 
@@ -235,7 +240,7 @@ bool EasytierManager::loadIpFromInstances() {
             uint32_t addr = std::stoul(addrStr);
             virtualIp_ = addrToIp(addr);
             
-            LogInfo("Found virtual IP: " + virtualIp_ + " in key '" + pairs[i].key + "'");
+            //LogInfo("Found virtual IP: " + virtualIp_ + " in key '" + pairs[i].key + "'");
             return true;
         }
     }
@@ -280,9 +285,12 @@ void EasytierManager::monitorLoop() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         if (!active_) continue;
 
-        // 简单健康检查：重新读一次 IP，如果丢了说明实例异常
         std::string oldIp = virtualIp_;
-        if (!loadIpFromInstances() || virtualIp_.empty()) {
+        if (loadIpFromInstances()) {
+            if (!virtualIp_.empty() && virtualIp_ != oldIp) {
+                LogInfo("IP changed from " + oldIp + " to " + virtualIp_);
+            }
+        } else {
             LogError("Monitor: lost virtual IP, attempting reconnect...");
             attemptReconnect();
         }

@@ -147,7 +147,17 @@ void DesktopService::captureLoop() {
 
         bool hasNew = false;
         const uint8_t* frame = capture_.capture(hasNew);
-        if (!frame) { Sleep(10); continue; }
+
+        if (!frame) {
+            std::cerr << "[Desktop Server] Capture returned null" << std::endl;
+            Sleep(10);
+            continue;
+        }
+
+        if (!hasNew) {
+            Sleep(1);
+            continue;
+        }
 
         // 【动态修改2】判断本次是否应该发送关键帧
         bool kfRequested = keyframeRequested_.exchange(false);

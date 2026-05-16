@@ -82,10 +82,14 @@ void TCPClientTransport::recvLoop() {
     std::vector<uint8_t> buffer;
 
     while (connected_) {
-        uint32_t msgSize;
+        uint32_t msgSize = 0;
         if (!NetUtil::RecvAll(socket_, &msgSize, sizeof(msgSize))) break;
 
-        if (msgSize == 0 || msgSize > MAXMSG) continue;
+        if (msgSize == 0 || msgSize > MAXMSG) {
+            std::cerr << "[TCP Client] Invalid message size: " << msgSize
+                      << ", closing connection to avoid stream desync" << std::endl;
+            break;
+        }
 
         buffer.resize(msgSize);
         if (!NetUtil::RecvAll(socket_, buffer.data(), msgSize)) break;
@@ -240,7 +244,11 @@ void TCPServerTransport::recvLoop() {
             break;
         }
 
-        if (msgSize == 0 || msgSize > MAXMSG) continue;
+        if (msgSize == 0 || msgSize > MAXMSG) {
+            std::cerr << "[TCP Server] Invalid message size: " << msgSize
+                    << ", closing connection to avoid stream desync" << std::endl;
+            break;
+        }
 
         buffer.resize(msgSize);
         if (!NetUtil::RecvAll(clientSocket_, buffer.data(), msgSize)) {
