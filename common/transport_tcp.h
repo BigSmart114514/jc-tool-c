@@ -32,7 +32,7 @@ private:
     std::string savedIp_;
     int savedPort_ = 0;
 
-    const int MAXMSG = 100 * 1024 * 1024;
+    const int MAXMSG = 64 * 1024 * 1024;
 };
 
 // ==================== TCP服务端传输 ====================

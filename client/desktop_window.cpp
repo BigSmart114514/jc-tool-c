@@ -187,7 +187,10 @@ void DesktopWindow::decodeLoop() {
             checkAndAdjustStreamQuality();
 
             // 使用获取到的参数构造 QImage
-            QImage img(rgbData.data(), w, h, stride, QImage::Format_RGB32);
+            QImage img(rgbData.data(), w, h, w * 4, QImage::Format_RGB32);
+            if (img.isNull()) {
+                continue;
+            }
             {
                 std::lock_guard<std::mutex> lock(frameMutex_);
                 latestFrame_ = img.copy();   

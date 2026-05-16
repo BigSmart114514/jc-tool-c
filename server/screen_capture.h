@@ -26,6 +26,9 @@ private:
     bool initDXGI();
     bool initGDI();
 
+    void cleanupDXGIOnly();
+    bool resetDXGI();
+
     // DXGI
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;

@@ -69,13 +69,14 @@ set(APP_HEADERS
 # 创建单个可执行文件 (使用 WIN32 隐藏控制台，只显示 Qt 界面)
 #add_executable(RemoteControl WIN32 ${APP_SOURCES} ${APP_HEADERS})
 add_executable(RemoteControl ${APP_SOURCES} ${APP_HEADERS})
+set_property(TARGET RemoteControl APPEND_STRING PROPERTY LINK_FLAGS " /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
 
 target_include_directories(RemoteControl PRIVATE ${CMAKE_SOURCE_DIR})
 
 target_link_libraries(RemoteControl
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network
     ${COMMON_LIBS}
-    gdi32 user32 winmm d3d11 dxgi # Server所需库
+    gdi32 user32 winmm d3d11 dxgi wtsapi32# Server所需库
 )
 
 # 输出目录

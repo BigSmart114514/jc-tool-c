@@ -131,6 +131,7 @@ bool HEVCEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>&
         ret = avcodec_receive_packet(ctx_, pkt_);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
         if (ret < 0) return false;
+
         output.insert(output.end(), pkt_->data, pkt_->data + pkt_->size);
         av_packet_unref(pkt_);
     }

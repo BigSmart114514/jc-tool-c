@@ -47,6 +47,9 @@ bool HEVCDecoder::init(int width, int height) {
     rgbFrame_->height = height_;
     av_frame_get_buffer(rgbFrame_, 32);
 
+    stride_ = rgbFrame_->linesize[0];
+    if (stride_ == 0) stride_ = width_ * 4;
+
     initialized_ = true;
     return true;
 }
