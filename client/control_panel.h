@@ -12,16 +12,24 @@
 #include <QMessageBox>
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include "../common/protocol.h"
 #include "../common/transport.h"
 #include "desktop_window.h"
-#include "file_window.h"
+
+class SshSession;
+class SftpWindow;
+class SshTerminalWindow;
 
 struct ControlPanelConfig {
+    SshSession* sshSession = nullptr;
     ITransport* desktopTransport = nullptr;
-    ITransport* fileTransport = nullptr;
     std::string modeText;
     std::string connectInfo;
+    std::string sshHost;
+    int sshPort = 2222;
+    std::string sshUser;
+    std::string sshPassword;
 };
 
 class ControlPanel : public QMainWindow {
@@ -32,14 +40,17 @@ public:
     ~ControlPanel();
 
     void setConfig(const ControlPanelConfig& config);
-    void setupTransportCallbacks();
+    void setupDesktopTransportCallbacks();
 
 private slots:
     void toggleDesktop();
-    void toggleFileManager();
+    void toggleSftp();
+    void toggleSshTerminal();
+    void onExternalTerminal();
     void onDisconnect();
     void onDesktopWindowClosed();
-    void onFileWindowClosed();
+    void onSftpWindowClosed();
+    void onSshTerminalClosed();
     void onMouseMoveToggled(bool checked);
     void onMouseClickToggled(bool checked);
     void onKeyboardToggled(bool checked);
@@ -48,27 +59,28 @@ private:
     void createUI();
     void updateStatus(const QString& text);
     bool ensureDesktopConnected();
-    bool ensureFileConnected();
 
-    // UI组件
     QLabel* lblMode_;
     QLabel* lblInfo_;
     QStatusBar* statusBar_;
     QPushButton* btnDesktop_;
-    QPushButton* btnFileManager_;
+    QPushButton* btnSftp_;
+    QPushButton* btnSshTerminal_;
+    QPushButton* btnExternalTerminal_;
     QPushButton* btnDisconnect_;
     QCheckBox* chkMouseMove_;
     QCheckBox* chkMouseClick_;
     QCheckBox* chkKeyboard_;
 
-    // 配置和状态
     ControlPanelConfig config_;
     DesktopWindow* desktopWindow_ = nullptr;
-    FileWindow* fileWindow_ = nullptr;
+    SftpWindow* sftpWindow_ = nullptr;
+    SshTerminalWindow* sshTerminalWindow_ = nullptr;
     std::mutex windowMtx_;
 
     bool desktopOpen_ = false;
-    bool fileManagerOpen_ = false;
+    bool sftpOpen_ = false;
+    bool sshTerminalOpen_ = false;
 
     std::atomic<bool> enableMouseMove_{true};
     std::atomic<bool> enableMouseClick_{true};
