@@ -12,6 +12,7 @@ struct AVCodecParserContext;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct AVBufferRef;
 
 class HEVCDecoder {
 public:
@@ -28,13 +29,18 @@ public:
     int getStride() const { return stride_; }
 
 private:
+    bool initHwAccel();
+
     const AVCodec* codec_ = nullptr;
     AVCodecContext* ctx_ = nullptr;
     AVCodecParserContext* parser_ = nullptr;
     AVFrame* frame_ = nullptr;
     AVFrame* rgbFrame_ = nullptr;
+    AVFrame* swFrame_ = nullptr;
     AVPacket* pkt_ = nullptr;
     SwsContext* swsCtx_ = nullptr;
+    AVBufferRef* hwDeviceCtx_ = nullptr;
+    int hwPixFmt_ = 0;
     
     int width_ = 0;
     int height_ = 0;
