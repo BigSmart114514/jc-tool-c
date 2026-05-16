@@ -67,7 +67,9 @@ namespace Desktop {
     #pragma pack(pop)
 }
 
-// ==================== 文件管理消息 ====================
+// ==================== 文件管理消息 (已废弃 - 由 libssh SFTP 替代) ====================
+// 保留仅为兼容 server 模式的旧 file_service
+// 新 client 代码使用 common/ssh_session.h 中的 SshSession + SFTP API
 namespace FileManager {
     enum class MsgType : uint8_t {
         ListDrives      = 0x10,
