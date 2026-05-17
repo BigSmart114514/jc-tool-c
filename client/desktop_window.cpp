@@ -43,13 +43,11 @@ DesktopWindow::DesktopWindow(QWidget* parent)
 }
 
 DesktopWindow::~DesktopWindow() {
-    // 停止解码线程
     decoding_ = false;
     queueCV_.notify_all();
     if (decodeThread_.joinable()) {
-        decodeThread_.join();
+        decodeThread_.detach();
     }
-    
     decoderReady_ = false;
     decoder_.cleanup();
 }

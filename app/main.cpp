@@ -266,20 +266,23 @@ int runServer() {
     QPushButton* btnStop = new QPushButton("Stop Server");
     btnStop->setStyleSheet("background-color: #c9302c; color: white; padding: 8px;");
     vLayout.addWidget(btnStop);
-    QObject::connect(btnStop, &QPushButton::clicked, [&statusWin]() {
-        statusWin.accept();
-        QApplication::quit();
+    QObject::connect(btnStop, &QPushButton::clicked, [&]() {
+        std::cout << "[Server] Stop requested..." << std::endl;
+        statusWin.hide();
+        // Stop service loops immediately (non-blocking for threads that block
+        // on I/O — those threads are detached and will exit on their own).
+        sshServer.stop();
+        desktopService.stop();
+        fileService.stop();
+        desktopTCP->stop();
+        fileTCP->stop();
+        if (easytierMgr) easytierMgr->stop();
+        qApp->quit();
     });
     statusWin.show();
 
     qApp->exec();
 
-    sshServer.stop();
-    desktopService.stop();
-    fileService.stop();
-    desktopTCP->stop();
-    fileTCP->stop();
-    if (easytierMgr) easytierMgr->stop();
     timeEndPeriod(1);
     return 0;
 }

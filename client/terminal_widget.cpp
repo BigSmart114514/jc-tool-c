@@ -227,6 +227,13 @@ void TerminalWidget::setTerminalSize(int cols, int rows) {
 
 void TerminalWidget::putChar(QChar ch) {
     ushort uc = ch.unicode();
+    bool isWide = (uc >= 0x1100 && uc <= 0x11FF) ||  // Hangul Jamo
+                  (uc >= 0x2E80 && uc <= 0x9FFF) ||  // CJK + Yi
+                  (uc >= 0xAC00 && uc <= 0xD7AF) ||  // Hangul Syllables
+                  (uc >= 0xF900 && uc <= 0xFAFF) ||  // CJK Comp. Ideographs
+                  (uc >= 0xFE30 && uc <= 0xFE4F) ||  // CJK Comp. Forms
+                  (uc >= 0xFF01 && uc <= 0xFF60) ||  // Fullwidth Forms
+                  (uc >= 0xFFE0 && uc <= 0xFFE6);    // Fullwidth Signs
 
     if (uc == 0x07) {
     } else if (uc == 0x08) {
@@ -251,6 +258,16 @@ void TerminalWidget::putChar(QChar ch) {
         cell.underline = curUnderline_;
         cell.reverse = curReverse_;
         cursorX_++;
+
+        // Wide character: occupy next cell too
+        if (isWide && cursorX_ < cols_) {
+            auto& next = screen_[cursorY_][cursorX_];
+            next.ch = QChar(0x200B); // zero-width space
+            next.fg = curFg_;
+            next.bg = curBg_;
+            next.bold = false; next.underline = false; next.reverse = false;
+            cursorX_++;
+        }
     }
 }
 

@@ -34,6 +34,11 @@ endif()
 include_directories(${LIBSSH_DIR}/include)
 link_directories(${LIBSSH_DIR}/lib)
 
+# qtermwidget (terminal emulation engine)
+add_subdirectory(thirdparty/qtermwidget)
+include_directories(${CMAKE_SOURCE_DIR}/thirdparty/qtermwidget)
+include_directories(${CMAKE_SOURCE_DIR}/../qtermwidget-2.3.0/lib)
+
 add_definitions(-D_CRT_SECURE_NO_WARNINGS -DP2P_CLIENT_STATIC -DWITH_SERVER)
 
 if(MSVC)
@@ -52,7 +57,6 @@ set(APP_SOURCES
     client/desktop_window.cpp
     client/sftp_window.cpp
     client/ssh_terminal.cpp
-    client/terminal_widget.cpp
     client/connection_dialog.cpp
     client/hevc_decoder.cpp
     client/display_buffer.cpp
@@ -71,7 +75,6 @@ set(APP_HEADERS
     client/desktop_window.h
     client/sftp_window.h
     client/ssh_terminal.h
-    client/terminal_widget.h
     client/connection_dialog.h
     client/hevc_decoder.h
     client/display_buffer.h
@@ -93,6 +96,7 @@ target_include_directories(RemoteControl PRIVATE ${CMAKE_SOURCE_DIR})
 
 target_link_libraries(RemoteControl
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network
+    qtermwidget
     ${COMMON_LIBS}
     gdi32 user32 winmm d3d11 dxgi wtsapi32
     ssh

@@ -1,4 +1,5 @@
 #include "ssh_server.h"
+#include <winsock2.h>
 #include <libssh/sftp.h>
 #include <iostream>
 #include <vector>
@@ -223,11 +224,32 @@ bool SshServer::start(int port, const std::string& password) {
 
 void SshServer::stop() {
     running_ = false;
+
+    // Make a raw TCP connection to ourselves to unblock ssh_bind_accept().
+    // A full SSH handshake is not needed — just the TCP connect is enough.
+    if (sshbind_ && port_ > 0) {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s != INVALID_SOCKET) {
+            struct sockaddr_in addr;
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            addr.sin_port = htons(u_short(port_));
+            // Use non-blocking so we don't wait, then just close
+            u_long mode = 1;
+            ioctlsocket(s, FIONBIO, &mode);
+            connect(s, (struct sockaddr*)&addr, sizeof(addr));
+            closesocket(s);
+        }
+    }
+
     if (sshbind_) {
         ssh_bind_free(sshbind_);
         sshbind_ = nullptr;
     }
-    if (acceptThread_.joinable()) acceptThread_.join();
+
+    // accept thread detaches — it will exit when running_ becomes false.
+    if (acceptThread_.joinable())
+        acceptThread_.detach();
 }
 
 void SshServer::acceptLoop() {

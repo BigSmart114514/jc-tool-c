@@ -2,13 +2,16 @@
 #define SSH_TERMINAL_H
 
 #include <QMainWindow>
-#include <QMainWindow>
 #include <QTimer>
 #include <QCloseEvent>
 #include <memory>
 
+namespace Konsole {
+class Vt102Emulation;
+class TerminalDisplay;
+}
+
 class SshSession;
-class TerminalWidget;
 
 class SshTerminalWindow : public QMainWindow {
     Q_OBJECT
@@ -23,13 +26,15 @@ protected:
     void closeEvent(QCloseEvent* event) override;
 
 private slots:
-    void onDataReady(const QByteArray& data);
     void onPollTimer();
+    void onEmulationTitleChanged(int titleType, const QString& newTitle);
+    void onContentSizeChanged(int height, int width);
 
 private:
     SshSession* session_ = nullptr;
     std::unique_ptr<SshSession> ownedSession_;
-    TerminalWidget* terminal_ = nullptr;
+    Konsole::Vt102Emulation* emulation_ = nullptr;
+    Konsole::TerminalDisplay* terminal_ = nullptr;
     QTimer* pollTimer_ = nullptr;
 };
 

@@ -123,7 +123,7 @@ void TCPClientTransport::disconnect() {
         closesocket(socket_);
         socket_ = INVALID_SOCKET;
     }
-    if (recvThread_.joinable()) recvThread_.join();
+    if (recvThread_.joinable()) recvThread_.detach();
 }
 
 void TCPClientTransport::setCallbacks(const TransportCallbacks& callbacks) {
@@ -290,8 +290,10 @@ void TCPServerTransport::stop() {
         clientSocket_ = INVALID_SOCKET;
     }
 
-    if (listenThread_.joinable()) listenThread_.join();
-    if (recvThread_.joinable()) recvThread_.join();
+    // Detach threads — they will see running_==false and exit promptly.
+    // The process will clean up remaining threads on exit.
+    if (listenThread_.joinable()) listenThread_.detach();
+    if (recvThread_.joinable()) recvThread_.detach();
 }
 
 void TCPServerTransport::setCallbacks(const TransportCallbacks& callbacks) {

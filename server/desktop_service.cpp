@@ -118,7 +118,7 @@ void DesktopService::stop() {
     running_ = false;
     clientReady_ = false;
     clientCV_.notify_all();
-    if (captureThread_.joinable()) captureThread_.join();
+    if (captureThread_.joinable()) captureThread_.detach();
 }
 
 void DesktopService::captureLoop() {
@@ -132,7 +132,7 @@ void DesktopService::captureLoop() {
     while (running_) {
         {
             std::unique_lock<std::mutex> lock(clientMtx_);
-            clientCV_.wait_for(lock, std::chrono::milliseconds(500), [this]() {
+            clientCV_.wait_for(lock, std::chrono::milliseconds(50), [this]() {
                 return (clientReady_.load() && transport_ && transport_->hasClient()) || !running_;
             });
             if (!running_) break;
@@ -205,7 +205,16 @@ void DesktopService::processInput() {
         inputQueue_.pop();
 
         if (ev.type == 0) {
-            SetCursorPos(ev.x, ev.y);
+            // Client sends coordinates in the encoded-image space (targetWidth_ x targetHeight_).
+            // Scale them to the physical capture space (capture_.getWidth() x capture_.getHeight())
+            // so that SetCursorPos / mouse_event land on the correct pixel.
+            int physX = ev.x, physY = ev.y;
+            int capW = capture_.getWidth(), capH = capture_.getHeight();
+            if (targetWidth_ > 0 && targetHeight_ > 0 && capW > 0 && capH > 0) {
+                physX = ev.x * capW / targetWidth_;
+                physY = ev.y * capH / targetHeight_;
+            }
+            SetCursorPos(physX, physY);
             switch (ev.key) {
                 case 1: mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0); break;
                 case 2: mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0); break;
