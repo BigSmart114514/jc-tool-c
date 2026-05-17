@@ -1,10 +1,13 @@
 #include "ssh_session.h"
 #include <iostream>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 #include <fcntl.h>
 #include <cerrno>
+#include <io.h>
 #include <windows.h>
+#include <bcrypt.h>
 
 static std::wstring widen(const std::string& utf8) {
     if (utf8.empty()) return {};
@@ -13,6 +16,15 @@ static std::wstring widen(const std::string& utf8) {
     std::wstring wstr(len - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wstr[0], len);
     return wstr;
+}
+
+static std::string narrow(const std::wstring& wstr) {
+    if (wstr.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string str(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], len, nullptr, nullptr);
+    return str;
 }
 
 SshSession::SshSession() {}
@@ -24,6 +36,11 @@ SshSession::~SshSession() {
 bool SshSession::connect(const std::string& host, int port,
                          const std::string& username, const std::string& password) {
     if (connected_) disconnect();
+
+    host_ = host;
+    port_ = port;
+    username_ = username;
+    password_ = password;
 
     session_ = ssh_new();
     if (!session_) {
@@ -59,6 +76,30 @@ bool SshSession::connect(const std::string& host, int port,
     return true;
 }
 
+bool SshSession::reconnect() {
+    error_.clear();
+    bool hadSftp = sftpInitialized_;
+    bool hadShell = (shellChannel_ != nullptr);
+    disconnect();
+
+    if (host_.empty()) {
+        error_ = "No saved connection parameters";
+        return false;
+    }
+
+    if (!connect(host_, port_, username_, password_)) {
+        return false;
+    }
+
+    if (hadSftp) {
+        if (!sftpInit()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void SshSession::disconnect() {
     closeShell();
 
@@ -77,6 +118,12 @@ void SshSession::disconnect() {
     }
 
     connected_ = false;
+}
+
+bool SshSession::ensureConnected() {
+    if (connected_ && session_) return true;
+    if (host_.empty()) return false;
+    return reconnect();
 }
 
 bool SshSession::sftpInit() {
@@ -103,6 +150,7 @@ bool SshSession::sftpInit() {
 
 bool SshSession::sftpListDir(const std::string& path, std::vector<SFtpEntry>& entries) {
     entries.clear();
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
     sftp_dir dir = sftp_opendir(sftp_, path.c_str());
@@ -120,8 +168,22 @@ bool SshSession::sftpListDir(const std::string& path, std::vector<SFtpEntry>& en
         SFtpEntry entry;
         entry.name = file->name;
         entry.isDir = (file->type == SSH_FILEXFER_TYPE_DIRECTORY);
+        entry.isSymlink = (file->type == SSH_FILEXFER_TYPE_SYMLINK);
         entry.size = file->size;
         entry.modifyTime = file->mtime;
+        entry.permissions = file->permissions;
+        entry.owner = file->owner ? file->owner : "";
+        entry.group = file->group ? file->group : "";
+
+        if (entry.isSymlink) {
+            std::string fullPath = path + "/" + file->name;
+            char* target = sftp_readlink(sftp_, fullPath.c_str());
+            if (target) {
+                entry.symlinkTarget = target;
+                free(target);
+            }
+        }
+
         entries.push_back(entry);
         sftp_attributes_free(file);
     }
@@ -138,6 +200,12 @@ bool SshSession::sftpListDir(const std::string& path, std::vector<SFtpEntry>& en
 
 bool SshSession::sftpDownload(const std::string& remotePath, const std::string& localPath,
                               std::function<bool(int64_t, int64_t)> progress) {
+    return sftpDownload(remotePath, localPath, 0, progress);
+}
+
+bool SshSession::sftpDownload(const std::string& remotePath, const std::string& localPath,
+                              int64_t offset, std::function<bool(int64_t, int64_t)> progress) {
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
     sftp_file file = sftp_open(sftp_, remotePath.c_str(), O_RDONLY, (mode_t)0);
@@ -146,12 +214,16 @@ bool SshSession::sftpDownload(const std::string& remotePath, const std::string& 
         return false;
     }
 
+    if (offset > 0) {
+        sftp_seek(file, offset);
+    }
+
     sftp_attributes attr = sftp_stat(sftp_, remotePath.c_str());
     int64_t totalSize = attr ? attr->size : 0;
     if (attr) sftp_attributes_free(attr);
 
     std::wstring wlocal = widen(localPath);
-    FILE* local = _wfopen(wlocal.c_str(), L"wb");
+    FILE* local = _wfopen(wlocal.c_str(), offset > 0 ? L"ab" : L"wb");
     if (!local) {
         error_ = "Cannot open local file for writing: " + localPath + " (errno=" + std::to_string(errno) + ")";
         sftp_close(file);
@@ -159,7 +231,7 @@ bool SshSession::sftpDownload(const std::string& remotePath, const std::string& 
     }
 
     std::vector<char> buffer(65536);
-    int64_t received = 0;
+    int64_t received = offset;
     bool ok = true;
 
     while (true) {
@@ -184,7 +256,9 @@ bool SshSession::sftpDownload(const std::string& remotePath, const std::string& 
     sftp_close(file);
 
     if (!ok) {
-        remove(localPath.c_str());
+        if (offset == 0) {
+            remove(localPath.c_str());
+        }
         return false;
     }
 
@@ -193,6 +267,12 @@ bool SshSession::sftpDownload(const std::string& remotePath, const std::string& 
 
 bool SshSession::sftpUpload(const std::string& localPath, const std::string& remotePath,
                             std::function<bool(int64_t, int64_t)> progress) {
+    return sftpUpload(localPath, remotePath, 0, progress);
+}
+
+bool SshSession::sftpUpload(const std::string& localPath, const std::string& remotePath,
+                            int64_t offset, std::function<bool(int64_t, int64_t)> progress) {
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
     FILE* local = _wfopen(widen(localPath).c_str(), L"rb");
@@ -201,19 +281,32 @@ bool SshSession::sftpUpload(const std::string& localPath, const std::string& rem
         return false;
     }
 
-    sftp_file file = sftp_open(sftp_, remotePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, (mode_t)0644);
+    if (offset > 0) {
+        fseek(local, offset, SEEK_SET);
+    }
+
+    int flags = O_WRONLY | O_CREAT;
+    if (offset == 0) {
+        flags |= O_TRUNC;
+    }
+
+    sftp_file file = sftp_open(sftp_, remotePath.c_str(), flags, (mode_t)0644);
     if (!file) {
         error_ = "sftp_open (write) failed: " + std::string(ssh_get_error(session_));
         fclose(local);
         return false;
     }
 
+    if (offset > 0) {
+        sftp_seek(file, offset);
+    }
+
     fseek(local, 0, SEEK_END);
     int64_t totalSize = ftell(local);
-    fseek(local, 0, SEEK_SET);
+    fseek(local, offset, SEEK_SET);
 
     std::vector<char> buffer(65536);
-    int64_t sent = 0;
+    int64_t sent = offset;
     bool ok = true;
 
     while (true) {
@@ -238,7 +331,9 @@ bool SshSession::sftpUpload(const std::string& localPath, const std::string& rem
     sftp_close(file);
 
     if (!ok) {
-        sftp_unlink(sftp_, remotePath.c_str());
+        if (offset == 0) {
+            sftp_unlink(sftp_, remotePath.c_str());
+        }
         return false;
     }
 
@@ -246,26 +341,28 @@ bool SshSession::sftpUpload(const std::string& localPath, const std::string& rem
 }
 
 bool SshSession::sftpDelete(const std::string& path) {
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
-    sftp_attributes attr = sftp_stat(sftp_, path.c_str());
+    sftp_attributes attr = sftp_lstat(sftp_, path.c_str());
     if (!attr) {
-        error_ = "sftp_stat failed: " + std::string(ssh_get_error(session_));
+        error_ = "sftp_lstat failed: " + std::string(ssh_get_error(session_));
         return false;
     }
 
+    bool isSymlink = (attr->type == SSH_FILEXFER_TYPE_SYMLINK);
     bool isDir = (attr->type == SSH_FILEXFER_TYPE_DIRECTORY);
     sftp_attributes_free(attr);
 
     int rc;
-    if (isDir) {
-        rc = sftp_rmdir(sftp_, path.c_str());
-    } else {
+    if (isSymlink || !isDir) {
         rc = sftp_unlink(sftp_, path.c_str());
+    } else {
+        rc = sftp_rmdir(sftp_, path.c_str());
     }
 
     if (rc != SSH_OK) {
-        error_ = (isDir ? "sftp_rmdir" : "sftp_unlink") + std::string(" failed: ") + ssh_get_error(session_);
+        error_ = std::string(isDir ? "sftp_rmdir" : "sftp_unlink") + " failed: " + ssh_get_error(session_);
         return false;
     }
 
@@ -273,6 +370,7 @@ bool SshSession::sftpDelete(const std::string& path) {
 }
 
 bool SshSession::sftpMkdir(const std::string& path) {
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
     int rc = sftp_mkdir(sftp_, path.c_str(), 0755);
@@ -285,6 +383,7 @@ bool SshSession::sftpMkdir(const std::string& path) {
 }
 
 bool SshSession::sftpRename(const std::string& oldPath, const std::string& newPath) {
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
     int rc = sftp_rename(sftp_, oldPath.c_str(), newPath.c_str());
@@ -297,6 +396,7 @@ bool SshSession::sftpRename(const std::string& oldPath, const std::string& newPa
 }
 
 bool SshSession::sftpFileExists(const std::string& path) {
+    if (!ensureConnected()) return false;
     if (!sftpInit()) return false;
 
     sftp_attributes attr = sftp_stat(sftp_, path.c_str());
@@ -305,6 +405,247 @@ bool SshSession::sftpFileExists(const std::string& path) {
         return true;
     }
     return false;
+}
+
+bool SshSession::sftpFileInfo(const std::string& path, SFtpEntry& info) {
+    if (!ensureConnected()) return false;
+    if (!sftpInit()) return false;
+
+    sftp_attributes attr = sftp_lstat(sftp_, path.c_str());
+    if (!attr) {
+        error_ = "sftp_lstat failed: " + std::string(ssh_get_error(session_));
+        return false;
+    }
+
+    auto pos = path.find_last_of("/\\");
+    info.name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
+    info.isDir = (attr->type == SSH_FILEXFER_TYPE_DIRECTORY);
+    info.isSymlink = (attr->type == SSH_FILEXFER_TYPE_SYMLINK);
+    info.size = attr->size;
+    info.modifyTime = attr->mtime;
+    info.permissions = attr->permissions;
+    info.owner = attr->owner ? attr->owner : "";
+    info.group = attr->group ? attr->group : "";
+
+    if (info.isSymlink) {
+        char* target = sftp_readlink(sftp_, path.c_str());
+        if (target) {
+            info.symlinkTarget = target;
+            free(target);
+        }
+    }
+
+    sftp_attributes_free(attr);
+    return true;
+}
+
+bool SshSession::sftpDownloadRecursive(const std::string& remoteDir, const std::string& localDir,
+                                       std::function<bool(int64_t, int64_t)> progress) {
+    if (!ensureConnected()) return false;
+    if (!sftpInit()) return false;
+
+    if (!CreateDirectoryW(widen(localDir).c_str(), nullptr)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS) {
+            error_ = "Failed to create local directory: " + localDir + " (error=" + std::to_string(err) + ")";
+            return false;
+        }
+    }
+
+    std::vector<SFtpEntry> entries;
+    if (!sftpListDir(remoteDir, entries)) return false;
+
+    for (const auto& entry : entries) {
+        std::string childRemote = remoteDir + "/" + entry.name;
+        std::string childLocal = localDir + "\\" + entry.name;
+
+        if (entry.isDir) {
+            if (!sftpDownloadRecursive(childRemote, childLocal, progress)) return false;
+        } else {
+            if (!sftpDownload(childRemote, childLocal, progress)) return false;
+        }
+    }
+
+    return true;
+}
+
+bool SshSession::sftpUploadRecursive(const std::string& localDir, const std::string& remoteDir,
+                                     std::function<bool(int64_t, int64_t)> progress) {
+    if (!ensureConnected()) return false;
+    if (!sftpInit()) return false;
+
+    sftp_mkdir(sftp_, remoteDir.c_str(), 0755);
+
+    std::wstring pattern = widen(localDir + "\\*");
+    struct _wfinddata_t findData;
+    intptr_t hFind = _wfindfirst(pattern.c_str(), &findData);
+    if (hFind == -1) {
+        error_ = "Failed to list local directory: " + localDir;
+        return false;
+    }
+
+    do {
+        std::wstring wname = findData.name;
+        if (wname == L"." || wname == L"..") continue;
+
+        std::string name = narrow(wname);
+        std::string childLocal = localDir + "\\" + name;
+        std::string childRemote = remoteDir + "/" + name;
+
+        if (findData.attrib & _A_SUBDIR) {
+            if (!sftpUploadRecursive(childLocal, childRemote, progress)) {
+                _findclose(hFind);
+                return false;
+            }
+        } else {
+            if (!sftpUpload(childLocal, childRemote, progress)) {
+                _findclose(hFind);
+                return false;
+            }
+        }
+    } while (_wfindnext(hFind, &findData) == 0);
+
+    _findclose(hFind);
+    return true;
+}
+
+bool SshSession::sftpDeleteRecursive(const std::string& path) {
+    if (!ensureConnected()) return false;
+    if (!sftpInit()) return false;
+
+    sftp_attributes attr = sftp_lstat(sftp_, path.c_str());
+    if (!attr) {
+        error_ = "sftp_lstat failed: " + std::string(ssh_get_error(session_));
+        return false;
+    }
+
+    bool isSymlink = (attr->type == SSH_FILEXFER_TYPE_SYMLINK);
+    bool isDir = (attr->type == SSH_FILEXFER_TYPE_DIRECTORY);
+    sftp_attributes_free(attr);
+
+    if (isDir && !isSymlink) {
+        std::vector<SFtpEntry> entries;
+        if (!sftpListDir(path, entries)) return false;
+
+        for (const auto& entry : entries) {
+            std::string childPath = path + "/" + entry.name;
+            if (!sftpDeleteRecursive(childPath)) return false;
+        }
+
+        int rc = sftp_rmdir(sftp_, path.c_str());
+        if (rc != SSH_OK) {
+            error_ = "sftp_rmdir failed: " + std::string(ssh_get_error(session_));
+            return false;
+        }
+    } else {
+        int rc = sftp_unlink(sftp_, path.c_str());
+        if (rc != SSH_OK) {
+            error_ = "sftp_unlink failed: " + std::string(ssh_get_error(session_));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool SshSession::sftpChecksum(const std::string& remotePath, std::string& sha256hex) {
+    if (!ensureConnected()) return false;
+    if (!sftpInit()) return false;
+
+    sftp_file file = sftp_open(sftp_, remotePath.c_str(), O_RDONLY, (mode_t)0);
+    if (!file) {
+        error_ = "sftp_open (checksum) failed: " + std::string(ssh_get_error(session_));
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        error_ = "BCryptOpenAlgorithmProvider failed";
+        sftp_close(file);
+        return false;
+    }
+
+    DWORD hashObjLen = 0;
+    DWORD hashLen = 0;
+    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&hashObjLen, sizeof(hashObjLen), &hashLen, 0);
+    BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PBYTE)&hashLen, sizeof(hashLen), &hashLen, 0);
+
+    std::vector<BYTE> hashObject(hashObjLen);
+    std::vector<BYTE> hash(hashLen);
+
+    status = BCryptCreateHash(hAlg, &hHash, hashObject.data(), hashObjLen, NULL, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        error_ = "BCryptCreateHash failed";
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        sftp_close(file);
+        return false;
+    }
+
+    std::vector<char> buffer(65536);
+    bool ok = true;
+
+    while (true) {
+        int n = sftp_read(file, buffer.data(), buffer.size());
+        if (n == SSH_ERROR) {
+            error_ = "sftp_read error: " + std::string(ssh_get_error(session_));
+            ok = false;
+            break;
+        }
+        if (n == 0) break;
+
+        BCryptHashData(hHash, (PBYTE)buffer.data(), n, 0);
+    }
+
+    if (ok) {
+        status = BCryptFinishHash(hHash, hash.data(), hash.size(), 0);
+        if (BCRYPT_SUCCESS(status)) {
+            char hex[65] = {0};
+            for (DWORD i = 0; i < hashLen && i < 32; i++) {
+                sprintf(hex + i * 2, "%02x", hash[i]);
+            }
+            sha256hex = hex;
+        } else {
+            error_ = "BCryptFinishHash failed";
+            ok = false;
+        }
+    }
+
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    sftp_close(file);
+
+    return ok;
+}
+
+bool SshSession::sftpSymlink(const std::string& target, const std::string& linkPath) {
+    if (!ensureConnected()) return false;
+    if (!sftpInit()) return false;
+
+    int rc = sftp_symlink(sftp_, target.c_str(), linkPath.c_str());
+    if (rc != SSH_OK) {
+        error_ = "sftp_symlink failed: " + std::string(ssh_get_error(session_));
+        return false;
+    }
+
+    return true;
+}
+
+std::string SshSession::sftpReadlink(const std::string& path) {
+    if (!ensureConnected()) return "";
+    if (!sftpInit()) return "";
+
+    char* target = sftp_readlink(sftp_, path.c_str());
+    if (!target) {
+        error_ = "sftp_readlink failed: " + std::string(ssh_get_error(session_));
+        return "";
+    }
+
+    std::string result(target);
+    free(target);
+    return result;
 }
 
 bool SshSession::openShell(ShellDataCallback onData) {

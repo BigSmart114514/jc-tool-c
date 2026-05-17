@@ -47,7 +47,7 @@ endif()
 
 # 公共库列表
 set(COMMON_LIBS
-    ws2_32 crypt32 avcodec avutil swscale easytier_ffi
+    ws2_32 crypt32 avcodec avutil swscale easytier_ffi bcrypt
 )
 
 # 收集所有的源文件 (包含Client和Server的所有功能)

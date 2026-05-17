@@ -3,8 +3,37 @@
 #include <Vt102Emulation.h>
 #include <TerminalDisplay.h>
 #include <ScreenWindow.h>
+#include <CharacterColor.h>
 #include <QVBoxLayout>
 #include <QStatusBar>
+
+// Windows Terminal Campbell color scheme
+static const Konsole::ColorEntry campbellColorTable[TABLE_COLORS] = {
+    // Normal: Default fore, Default back
+    Konsole::ColorEntry(QColor(0xCC,0xCC,0xCC), false),
+    Konsole::ColorEntry(QColor(0x0C,0x0C,0x0C), true),
+    // ANSI 0-7: Black, Red, Green, Yellow, Blue, Magenta, Cyan, White
+    Konsole::ColorEntry(QColor(0x0C,0x0C,0x0C), false),
+    Konsole::ColorEntry(QColor(0xC5,0x0F,0x1F), false),
+    Konsole::ColorEntry(QColor(0x13,0xA1,0x0E), false),
+    Konsole::ColorEntry(QColor(0xC1,0x9C,0x00), false),
+    Konsole::ColorEntry(QColor(0x00,0x37,0xDA), false),
+    Konsole::ColorEntry(QColor(0x88,0x17,0x98), false),
+    Konsole::ColorEntry(QColor(0x3A,0x96,0xDD), false),
+    Konsole::ColorEntry(QColor(0xCC,0xCC,0xCC), false),
+    // Intense: Default fore, Default back
+    Konsole::ColorEntry(QColor(0xF2,0xF2,0xF2), false),
+    Konsole::ColorEntry(QColor(0x0C,0x0C,0x0C), true),
+    // ANSI 8-15: Bright Black, Red, Green, Yellow, Blue, Magenta, Cyan, White
+    Konsole::ColorEntry(QColor(0x76,0x76,0x76), false),
+    Konsole::ColorEntry(QColor(0xE7,0x48,0x56), false),
+    Konsole::ColorEntry(QColor(0x16,0xC6,0x0C), false),
+    Konsole::ColorEntry(QColor(0xF9,0xF1,0xA5), false),
+    Konsole::ColorEntry(QColor(0x3B,0x78,0xFF), false),
+    Konsole::ColorEntry(QColor(0xB4,0x00,0x9E), false),
+    Konsole::ColorEntry(QColor(0x61,0xD6,0xD6), false),
+    Konsole::ColorEntry(QColor(0xF2,0xF2,0xF2), false),
+};
 
 SshTerminalWindow::SshTerminalWindow(std::unique_ptr<SshSession> session, QWidget* parent)
     : QMainWindow(parent), session_(session.get()), ownedSession_(std::move(session)) {
@@ -24,12 +53,13 @@ SshTerminalWindow::SshTerminalWindow(std::unique_ptr<SshSession> session, QWidge
     emulation_->setKeyBindings("default");
 
     terminal_ = new Konsole::TerminalDisplay(this);
-    terminal_->setVTFont(QFont("Consolas", 10));
+    terminal_->setVTFont(QFont("Consolas", 11));
     terminal_->setScrollBarPosition(QTermWidgetInterface::ScrollBarRight);
     terminal_->setAntialias(true);
     terminal_->setKeyboardCursorShape(Konsole::Emulation::KeyboardCursorShape::BlockCursor);
     terminal_->setBlinkingCursor(true);
     terminal_->setMargin(0);
+    terminal_->setColorTable(campbellColorTable);
 
     auto* screenWindow = emulation_->createWindow();
     terminal_->setScreenWindow(screenWindow);
@@ -51,6 +81,14 @@ SshTerminalWindow::SshTerminalWindow(std::unique_ptr<SshSession> session, QWidge
             this, &SshTerminalWindow::onEmulationTitleChanged);
     connect(terminal_, &Konsole::TerminalDisplay::changedContentSizeSignal,
             this, &SshTerminalWindow::onContentSizeChanged);
+    // Forward mouse to remote when TUI app requests it (DECSET 1000/1002/1006)
+    // Note: qtermwidget's setUsesMouse(true) means "local selection mode",
+    // so we INVERT: when program requests mouse → forwarding mode (setUsesMouse(false))
+    connect(emulation_, &Konsole::Emulation::programUsesMouseChanged,
+            this, [this](bool usesMouse) {
+        terminal_->setUsesMouse(!usesMouse);
+    });
+    terminal_->setUsesMouse(!emulation_->programUsesMouse());
 
     if (session_) {
         session_->openShell([this](const char* data, int len) {
@@ -64,6 +102,16 @@ SshTerminalWindow::SshTerminalWindow(std::unique_ptr<SshSession> session, QWidge
     pollTimer_ = new QTimer(this);
     connect(pollTimer_, &QTimer::timeout, this, &SshTerminalWindow::onPollTimer);
     pollTimer_->start(50);
+
+    // Sync initial PTY size after widget is laid out
+    QTimer::singleShot(0, this, [this]() {
+        int cols = terminal_->columns();
+        int rows = terminal_->lines();
+        if (cols > 0 && rows > 0) {
+            emulation_->setImageSize(rows, cols);
+            if (session_) session_->setTerminalSize(cols, rows);
+        }
+    });
 }
 
 SshTerminalWindow::~SshTerminalWindow() {
@@ -74,14 +122,15 @@ void SshTerminalWindow::onPollTimer() {
     if (session_ && session_->isConnected()) {
         session_->pollChannel(0);
 
+        // Safety net: correct size if emulation and widget are out of sync
         int cols = terminal_->columns();
         int rows = terminal_->lines();
-        static int lastCols = 0, lastRows = 0;
-        if (cols != lastCols || rows != lastRows) {
-            lastCols = cols;
-            lastRows = rows;
-            emulation_->setImageSize(rows, cols);
-            session_->setTerminalSize(cols, rows);
+        if (cols > 0 && rows > 0) {
+            QSize cur = emulation_->imageSize();
+            if (cur.width() != cols || cur.height() != rows) {
+                emulation_->setImageSize(rows, cols);
+                session_->setTerminalSize(cols, rows);
+            }
         }
     }
 }

@@ -1,3 +1,7 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include "ssh_server.h"
 #include <winsock2.h>
 #include <libssh/sftp.h>
@@ -6,6 +10,39 @@
 #include <cstring>
 #include <cstdlib>
 #include <windows.h>
+#include <winioctl.h>
+#include <intrin.h>
+
+// ==================== Reparse point helpers ====================
+// Windows SDK may not define REPARSE_DATA_BUFFER in all versions.
+// Define the minimum struct we need for reading symlinks/junctions.
+
+#ifndef MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE (16 * 1024)
+#endif
+
+struct ReparseBuffer {
+    ULONG ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    // SymbolicLinkReparseBuffer
+    struct {
+        USHORT SubstituteNameOffset;
+        USHORT SubstituteNameLength;
+        USHORT PrintNameOffset;
+        USHORT PrintNameLength;
+        ULONG Flags;
+        WCHAR PathBuffer[1];
+    } SymbolicLinkReparseBuffer;
+    // MountPointReparseBuffer
+    struct {
+        USHORT SubstituteNameOffset;
+        USHORT SubstituteNameLength;
+        USHORT PrintNameOffset;
+        USHORT PrintNameLength;
+        WCHAR PathBuffer[1];
+    } MountPointReparseBuffer;
+};
 
 // File type bits for SFTP permissions encoding (from sys/stat.h)
 #ifndef S_IFDIR
@@ -36,6 +73,15 @@ static std::string narrow(const wchar_t* wide) {
 }
 
 static std::string narrow(const std::wstring& ws) { return narrow(ws.c_str()); }
+
+static std::string narrow(const wchar_t* wide, int len) {
+    if (!wide || len <= 0) return {};
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wide, len, nullptr, 0, nullptr, nullptr);
+    if (u8len <= 0) return {};
+    std::string str(u8len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, len, &str[0], u8len, nullptr, nullptr);
+    return str;
+}
 
 // ==================== SFTP internal types ====================
 
@@ -379,6 +425,55 @@ void SshServer::handleSession(ssh_session session) {
     ssh_free(session);
 }
 
+// ==================== SFTP error mapping ====================
+
+// libssh only defines these status codes.
+// Define additional standard SFTPv6 status codes used internally.
+#ifndef SSH_FX_DIR_NOT_EMPTY
+#define SSH_FX_DIR_NOT_EMPTY 14
+#endif
+#ifndef SSH_FX_NO_SPACE_ON_FILESYSTEM
+#define SSH_FX_NO_SPACE_ON_FILESYSTEM 15
+#endif
+#ifndef SSH_FX_INVALID_FILENAME
+#define SSH_FX_INVALID_FILENAME 16
+#endif
+#ifndef SSH_FX_NOT_A_DIRECTORY
+#define SSH_FX_NOT_A_DIRECTORY 18
+#endif
+#ifndef SSH_FX_LOCK_CONFLICT
+#define SSH_FX_LOCK_CONFLICT 20
+#endif
+
+static uint32_t mapWin32ErrorToFx(DWORD err) {
+    switch (err) {
+    case ERROR_SUCCESS: return SSH_FX_OK;
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND: return SSH_FX_NO_SUCH_FILE;
+    case ERROR_ACCESS_DENIED: return SSH_FX_PERMISSION_DENIED;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS: return SSH_FX_FILE_ALREADY_EXISTS;
+    case ERROR_DIR_NOT_EMPTY: return SSH_FX_DIR_NOT_EMPTY;
+    case ERROR_WRITE_PROTECT: return SSH_FX_PERMISSION_DENIED;
+    case ERROR_DISK_FULL: return SSH_FX_NO_SPACE_ON_FILESYSTEM;
+    case ERROR_INVALID_NAME: return SSH_FX_INVALID_FILENAME;
+    case ERROR_BAD_PATHNAME: return SSH_FX_INVALID_FILENAME;
+    case ERROR_HANDLE_EOF: return SSH_FX_EOF;
+    case ERROR_NOT_SAME_DEVICE: return SSH_FX_NOT_A_DIRECTORY;
+    case ERROR_DIRECTORY: return SSH_FX_NOT_A_DIRECTORY;
+    case ERROR_SHARING_VIOLATION: return SSH_FX_LOCK_CONFLICT;
+    case ERROR_LOCK_VIOLATION: return SSH_FX_LOCK_CONFLICT;
+    case ERROR_BROKEN_PIPE: return SSH_FX_CONNECTION_LOST;
+    case ERROR_INVALID_HANDLE: return SSH_FX_INVALID_HANDLE;
+    default: return SSH_FX_FAILURE;
+    }
+}
+
+// SSH_FXP_LINK (SFTPv6) - not defined in this libssh version
+#ifndef SSH_FXP_LINK
+#define SSH_FXP_LINK 21
+#endif
+
 // ==================== SFTP Server ====================
 
 void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
@@ -490,15 +585,7 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
                                    nullptr, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (h == INVALID_HANDLE_VALUE) {
-                DWORD err = GetLastError();
-                uint32_t fxErr = SSH_FX_FAILURE;
-                if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
-                    fxErr = SSH_FX_NO_SUCH_FILE;
-                else if (err == ERROR_ACCESS_DENIED)
-                    fxErr = SSH_FX_PERMISSION_DENIED;
-                else if (err == ERROR_FILE_EXISTS)
-                    fxErr = SSH_FX_FILE_ALREADY_EXISTS;
-                sftp_reply_status(msg, fxErr, "Open failed");
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Open failed");
                 break;
             }
 
@@ -595,14 +682,40 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
         case SSH_FXP_SETSTAT: {
             std::wstring wpath = sftpPathToWin32(filename);
             if (wpath.empty()) { sftp_reply_status(msg, SSH_FX_FAILURE, "Invalid path"); break; }
+
+            bool anyChange = false;
             if (msg->attr) {
-                if (msg->attr->permissions & 0200) {
-                    SetFileAttributesW(wpath.c_str(), FILE_ATTRIBUTE_NORMAL);
-                } else {
-                    SetFileAttributesW(wpath.c_str(), FILE_ATTRIBUTE_READONLY);
+                // Handle permissions
+                if (msg->attr->flags & SSH_FILEXFER_ATTR_PERMISSIONS) {
+                    DWORD attrs = GetFileAttributesW(wpath.c_str());
+                    if (attrs != INVALID_FILE_ATTRIBUTES) {
+                        if (msg->attr->permissions & 0200) {
+                            attrs &= ~FILE_ATTRIBUTE_READONLY;
+                        } else {
+                            attrs |= FILE_ATTRIBUTE_READONLY;
+                        }
+                        SetFileAttributesW(wpath.c_str(), attrs);
+                        anyChange = true;
+                    }
+                }
+                // Handle mtime/atime
+                if (msg->attr->flags & SSH_FILEXFER_ATTR_ACMODTIME) {
+                    HANDLE h = CreateFileW(wpath.c_str(), FILE_WRITE_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        FILETIME ft;
+                        ULARGE_INTEGER li;
+                        li.QuadPart = (uint64_t)(msg->attr->mtime + 11644473600ULL) * 10000000ULL;
+                        ft.dwLowDateTime = li.LowPart;
+                        ft.dwHighDateTime = li.HighPart;
+                        SetFileTime(h, nullptr, nullptr, &ft);
+                        CloseHandle(h);
+                        anyChange = true;
+                    }
                 }
             }
-            sftp_reply_status(msg, SSH_FX_OK, "OK");
+            sftp_reply_status(msg, anyChange ? SSH_FX_OK : SSH_FX_FAILURE, anyChange ? "OK" : "No changes applied");
             break;
         }
         case SSH_FXP_MKDIR: {
@@ -611,10 +724,7 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
             if (CreateDirectoryW(wpath.c_str(), nullptr)) {
                 sftp_reply_status(msg, SSH_FX_OK, "OK");
             } else {
-                DWORD err = GetLastError();
-                uint32_t fxErr = (err == ERROR_ALREADY_EXISTS)
-                                 ? SSH_FX_FILE_ALREADY_EXISTS : SSH_FX_FAILURE;
-                sftp_reply_status(msg, fxErr, "Mkdir failed");
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Mkdir failed");
             }
             break;
         }
@@ -624,7 +734,7 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
             if (RemoveDirectoryW(wpath.c_str())) {
                 sftp_reply_status(msg, SSH_FX_OK, "OK");
             } else {
-                sftp_reply_status(msg, SSH_FX_FAILURE, "Rmdir failed");
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Rmdir failed");
             }
             break;
         }
@@ -634,7 +744,7 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
             if (DeleteFileW(wpath.c_str())) {
                 sftp_reply_status(msg, SSH_FX_OK, "OK");
             } else {
-                sftp_reply_status(msg, SSH_FX_FAILURE, "Remove failed");
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Remove failed");
             }
             break;
         }
@@ -652,7 +762,7 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
             if (MoveFileW(oldp.c_str(), newp.c_str())) {
                 sftp_reply_status(msg, SSH_FX_OK, "OK");
             } else {
-                sftp_reply_status(msg, SSH_FX_FAILURE, "Rename failed");
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Rename failed");
             }
             break;
         }
@@ -780,10 +890,154 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
             }
             break;
         }
-        case SSH_FXP_READLINK:
-        case SSH_FXP_SYMLINK:
-            sftp_reply_status(msg, SSH_FX_OP_UNSUPPORTED, "Not supported");
+        case SSH_FXP_READLINK: {
+            std::wstring wpath = sftpPathToWin32(filename);
+            if (wpath.empty()) {
+                sftp_reply_status(msg, SSH_FX_FAILURE, "Invalid path");
+                break;
+            }
+            HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ,
+                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Cannot open reparse point");
+                break;
+            }
+            char rpBuf[MAXIMUM_REPARSE_DATA_BUFFER_SIZE] = {0};
+            auto& rp = *(ReparseBuffer*)rpBuf;
+            DWORD ret = 0;
+            if (DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, nullptr, 0,
+                                rpBuf, sizeof(rpBuf), &ret, nullptr)) {
+                std::string target;
+                if (rp.ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+                    int len = rp.SymbolicLinkReparseBuffer.PrintNameLength / sizeof(WCHAR);
+                    int off = rp.SymbolicLinkReparseBuffer.PrintNameOffset / sizeof(WCHAR);
+                    target = narrow(&rp.SymbolicLinkReparseBuffer.PathBuffer[off], len);
+                    if (target.find("\\??\\") == 0) target = target.substr(4);
+                } else if (rp.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+                    int len = rp.MountPointReparseBuffer.PrintNameLength / sizeof(WCHAR);
+                    int off = rp.MountPointReparseBuffer.PrintNameOffset / sizeof(WCHAR);
+                    target = narrow(&rp.MountPointReparseBuffer.PathBuffer[off], len);
+                } else {
+                    CloseHandle(h);
+                    sftp_reply_status(msg, SSH_FX_OP_UNSUPPORTED, "Not a symlink/junction");
+                    break;
+                }
+                for (auto& ch : target) if (ch == '\\') ch = '/';
+                sftp_reply_name(msg, target.c_str(), nullptr);
+            } else {
+                sftp_reply_status(msg, SSH_FX_FAILURE, "IOCTL failed");
+            }
+            CloseHandle(h);
             break;
+        }
+        case SSH_FXP_SYMLINK: {
+            const char* linkTarget = sftp_client_message_get_data(msg);
+            if (!linkTarget || !filename) {
+                sftp_reply_status(msg, SSH_FX_FAILURE, "Missing args");
+                break;
+            }
+            std::wstring wtarget = widen(linkTarget);
+            std::wstring wlink = sftpPathToWin32(filename);
+            for (auto& ch : wtarget) if (ch == L'/') ch = L'\\';
+
+            BOOL ok = CreateSymbolicLinkW(wlink.c_str(), wtarget.c_str(),
+                (GetFileAttributesW(wtarget.c_str()) & FILE_ATTRIBUTE_DIRECTORY) ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0);
+            if (ok) {
+                sftp_reply_status(msg, SSH_FX_OK, "OK");
+            } else {
+                DWORD err = GetLastError();
+                if (err == ERROR_ACCESS_DENIED || err == ERROR_PRIVILEGE_NOT_HELD) {
+                    sftp_reply_status(msg, SSH_FX_PERMISSION_DENIED, "Symlink creation requires privilege or developer mode");
+                } else {
+                    sftp_reply_status(msg, mapWin32ErrorToFx(err), "Symlink failed");
+                }
+            }
+            break;
+        }
+        case SSH_FXP_LINK: {
+            const char* existing = sftp_client_message_get_data(msg);
+            if (!existing || !filename) {
+                sftp_reply_status(msg, SSH_FX_FAILURE, "Missing args");
+                break;
+            }
+            bool isSymlink = (sftp_client_message_get_flags(msg) != 0);
+            std::wstring wexisting = sftpPathToWin32(existing);
+            std::wstring wlink = sftpPathToWin32(filename);
+
+            if (isSymlink) {
+                for (auto& ch : wexisting) if (ch == L'/') ch = L'\\';
+                BOOL ok = CreateSymbolicLinkW(wlink.c_str(), wexisting.c_str(),
+                    (GetFileAttributesW(wexisting.c_str()) & FILE_ATTRIBUTE_DIRECTORY) ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0);
+                if (ok) {
+                    sftp_reply_status(msg, SSH_FX_OK, "OK");
+                } else {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_ACCESS_DENIED || err == ERROR_PRIVILEGE_NOT_HELD)
+                        sftp_reply_status(msg, SSH_FX_PERMISSION_DENIED, "Symlink creation requires privilege or developer mode");
+                    else
+                        sftp_reply_status(msg, mapWin32ErrorToFx(err), "Symlink failed");
+                }
+            } else {
+                if (CreateHardLinkW(wlink.c_str(), wexisting.c_str(), nullptr)) {
+                    sftp_reply_status(msg, SSH_FX_OK, "OK");
+                } else {
+                    DWORD err = GetLastError();
+                    uint32_t fxErr = SSH_FX_FAILURE;
+                    if (err == ERROR_NOT_SAME_DEVICE) fxErr = SSH_FX_NOT_A_DIRECTORY;
+                    else if (err == ERROR_ACCESS_DENIED) fxErr = SSH_FX_PERMISSION_DENIED;
+                    else if (err == ERROR_FILE_EXISTS) fxErr = SSH_FX_FILE_ALREADY_EXISTS;
+                    sftp_reply_status(msg, fxErr, "Hard link failed");
+                }
+            }
+            break;
+        }
+        case SSH_FXP_EXTENDED: {
+            const char* subType = sftp_client_message_get_submessage(msg);
+            if (!subType) {
+                sftp_reply_status(msg, SSH_FX_OP_UNSUPPORTED, "Unknown extension");
+                break;
+            }
+            if (strcmp(subType, "statvfs@openssh.com") == 0 || strcmp(subType, "fstatvfs@openssh.com") == 0) {
+                // statvfs not supported in this libssh version (no sftp_reply_extended_reply)
+                sftp_reply_status(msg, SSH_FX_OP_UNSUPPORTED, "statvfs not implemented");
+            }
+            else if (strcmp(subType, "fsync@openssh.com") == 0) {
+                void* handle_data = sftp_handle(sftp, msg->handle);
+                if (!handle_data) {
+                    sftp_reply_status(msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
+                    break;
+                }
+                if (FlushFileBuffers(static_cast<HANDLE>(handle_data))) {
+                    sftp_reply_status(msg, SSH_FX_OK, "OK");
+                } else {
+                    sftp_reply_status(msg, SSH_FX_FAILURE, "Fsync failed");
+                }
+            }
+            else if (strcmp(subType, "hardlink@openssh.com") == 0) {
+                const char* existing = sftp_client_message_get_data(msg);
+                if (!existing || !filename) {
+                    sftp_reply_status(msg, SSH_FX_FAILURE, "Missing args");
+                    break;
+                }
+                std::wstring wexisting = sftpPathToWin32(existing);
+                std::wstring wnewlink = sftpPathToWin32(filename);
+                if (CreateHardLinkW(wnewlink.c_str(), wexisting.c_str(), nullptr)) {
+                    sftp_reply_status(msg, SSH_FX_OK, "OK");
+                } else {
+                    DWORD err = GetLastError();
+                    uint32_t fxErr = SSH_FX_FAILURE;
+                    if (err == ERROR_NOT_SAME_DEVICE) fxErr = SSH_FX_NOT_A_DIRECTORY;
+                    else if (err == ERROR_ACCESS_DENIED) fxErr = SSH_FX_PERMISSION_DENIED;
+                    else if (err == ERROR_FILE_EXISTS) fxErr = SSH_FX_FILE_ALREADY_EXISTS;
+                    sftp_reply_status(msg, fxErr, "Hard link failed");
+                }
+            }
+            else {
+                sftp_reply_status(msg, SSH_FX_OP_UNSUPPORTED, "Unknown extension");
+            }
+            break;
+        }
         default:
             sftp_reply_status(msg, SSH_FX_OP_UNSUPPORTED, "Unknown op");
             break;
@@ -915,8 +1169,8 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
                 DWORD n = 0;
                 if (ReadFile(hPtyOutRd, rbuf.data(), (DWORD)rbuf.size(), &n, nullptr)) {
                     if (n > 0) {
-                        std::string u8 = acpToUtf8(rbuf.data(), n);
-                        ssh_channel_write(channel, u8.data(), u8.size());
+                        // ConPTY output is always UTF-8 — write directly
+                        ssh_channel_write(channel, rbuf.data(), n);
                     }
                 } else {
                     if (GetLastError() != ERROR_BROKEN_PIPE)
