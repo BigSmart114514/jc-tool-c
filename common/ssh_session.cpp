@@ -710,7 +710,7 @@ void SshSession::setTerminalSize(int cols, int rows) {
 void SshSession::pollChannel(int timeoutMs) {
     if (!shellChannel_ || !shellOnData_) return;
 
-    std::vector<char> buffer(65536);
+    static std::vector<char> buffer(65536);
 
     while (true) {
         int rc = ssh_channel_read_nonblocking(shellChannel_, buffer.data(), buffer.size(), 0);

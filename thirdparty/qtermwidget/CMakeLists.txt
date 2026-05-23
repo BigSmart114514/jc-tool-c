@@ -9,7 +9,7 @@ set(CMAKE_AUTOUIC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
-set(QTERMWIDGET_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../qtermwidget-2.3.0/lib")
+set(QTERMWIDGET_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../qtermwidget-2.4.0/lib")
 
 set(QTERMWIDGET_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/Emulation.cpp

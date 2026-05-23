@@ -9,8 +9,9 @@ echo.
 
 :: 设置 Qt 路径
 set QT_DIR=%QT6_DIR%
+if not exist "%QT_DIR%" set QT_DIR=C:\Qt\6.11.1\msvc2022_64
 if not exist "%QT_DIR%" (
-    echo Error: Qt not found at %QT_DIR%
+    echo Error: Qt not found. Set QT6_DIR env var or install Qt.
     pause
     exit /b 1
 )

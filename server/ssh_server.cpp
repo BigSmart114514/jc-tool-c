@@ -13,6 +13,12 @@
 #include <winioctl.h>
 #include <intrin.h>
 
+// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE for pre-Win10 SDK compatibility
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE \
+    ProcThreadAttributeValue(22, FALSE, TRUE, FALSE)
+#endif
+
 // ==================== Reparse point helpers ====================
 // Windows SDK may not define REPARSE_DATA_BUFFER in all versions.
 // Define the minimum struct we need for reading symlinks/junctions.
@@ -271,29 +277,13 @@ bool SshServer::start(int port, const std::string& password) {
 void SshServer::stop() {
     running_ = false;
 
-    // Make a raw TCP connection to ourselves to unblock ssh_bind_accept().
-    // A full SSH handshake is not needed — just the TCP connect is enough.
-    if (sshbind_ && port_ > 0) {
-        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s != INVALID_SOCKET) {
-            struct sockaddr_in addr;
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-            addr.sin_port = htons(u_short(port_));
-            // Use non-blocking so we don't wait, then just close
-            u_long mode = 1;
-            ioctlsocket(s, FIONBIO, &mode);
-            connect(s, (struct sockaddr*)&addr, sizeof(addr));
-            closesocket(s);
-        }
-    }
-
+    // Free bind closes the listening socket, causing ssh_bind_accept()
+    // in the accept thread to return with an error so the thread exits.
     if (sshbind_) {
         ssh_bind_free(sshbind_);
         sshbind_ = nullptr;
     }
 
-    // accept thread detaches — it will exit when running_ becomes false.
     if (acceptThread_.joinable())
         acceptThread_.detach();
 }
@@ -1048,58 +1038,36 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
     sftp_server_free(sftp);
 }
 
-// ==================== ConPTY Shell Handler ====================
-
-#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
-#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x20016
-#endif
-
-typedef HRESULT (WINAPI *CreatePseudoConsoleFn)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
-typedef HRESULT (WINAPI *ResizePseudoConsoleFn)(HPCON, COORD);
-typedef void (WINAPI *ClosePseudoConsoleFn)(HPCON);
-
-static bool tryConPty(HANDLE hIn, HANDLE hOut, SHORT cols, SHORT rows, HPCON* phPty) {
-    auto fn = (CreatePseudoConsoleFn)GetProcAddress(
-        GetModuleHandleW(L"kernel32.dll"), "CreatePseudoConsole");
-    if (!fn) return false;
-    COORD size = {cols > 0 ? cols : 80, rows > 0 ? rows : 24};
-    return SUCCEEDED(fn(size, hIn, hOut, 0, phPty));
-}
-
-static void closeConPty(HPCON hPty) {
-    auto fn = (ClosePseudoConsoleFn)GetProcAddress(
-        GetModuleHandleW(L"kernel32.dll"), "ClosePseudoConsole");
-    if (fn) fn(hPty);
-}
+// ==================== Shell Handler ====================
 
 void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
                                     int cols, int rows) {
-    std::cerr << "[SSH Shell] Starting shell channel" << std::endl;
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
     HANDLE hPtyInRd = INVALID_HANDLE_VALUE;
     HANDLE hPtyInWr = INVALID_HANDLE_VALUE;
     HANDLE hPtyOutRd = INVALID_HANDLE_VALUE;
     HANDLE hPtyOutWr = INVALID_HANDLE_VALUE;
-    HPCON hPty = INVALID_HANDLE_VALUE;
+    HPCON hPC = nullptr;
     PROCESS_INFORMATION pi = {};
+    HANDLE hJob = nullptr;
     std::atomic<bool> shellRunning{true};
-    wchar_t shellExe[] = L"cmd.exe";
-    std::thread reader;
-    bool readerStarted = false;
-    bool useConPty = false;
+    wchar_t shellCmd[] = L"cmd.exe /d";
+    bool usingConPty = false;
+    HMODULE hKernel32 = nullptr;
+    auto pCreatePC = (HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*))nullptr;
+    auto pClosePC = (VOID(WINAPI*)(HPCON))nullptr;
+    std::vector<char> buf(65536);
+    std::vector<char> rbuf(65536);
 
-    // Helper: convert pipe output to UTF-8. Data may already be UTF-8
-    // (modern Windows ConPTY) or need ACP→UTF-8 conversion (legacy).
+    // Helper: OEMCP→UTF-8 (plain pipe fallback only)
     auto acpToUtf8 = [](const char* src, int srclen) -> std::string {
         if (srclen <= 0) return {};
-        // Check if already valid UTF-8
         if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, srclen, nullptr, 0) > 0)
             return {src, (size_t)srclen};
-        // Not valid UTF-8 → convert from system ACP (e.g. GBK on Chinese Windows)
-        int wn = MultiByteToWideChar(CP_ACP, 0, src, srclen, nullptr, 0);
+        int wn = MultiByteToWideChar(CP_OEMCP, 0, src, srclen, nullptr, 0);
         if (wn <= 0) return {src, (size_t)srclen};
         std::wstring ws(wn, L'\0');
-        MultiByteToWideChar(CP_ACP, 0, src, srclen, &ws[0], wn);
+        MultiByteToWideChar(CP_OEMCP, 0, src, srclen, &ws[0], wn);
         int u8n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), wn, nullptr, 0, nullptr, nullptr);
         if (u8n <= 0) return {src, (size_t)srclen};
         std::string u8(u8n, '\0');
@@ -1107,163 +1075,151 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
         return u8;
     };
 
-    // Helper: convert UTF-8 input to system ACP before writing to pipe
-    auto utf8ToAcp = [](const char* src, int srclen) -> std::string {
-        if (srclen <= 0) return {};
-        int wn = MultiByteToWideChar(CP_UTF8, 0, src, srclen, nullptr, 0);
-        if (wn <= 0) return {src, (size_t)srclen};
-        std::wstring ws(wn, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, src, srclen, &ws[0], wn);
-        int acpn = WideCharToMultiByte(CP_ACP, 0, ws.c_str(), wn, nullptr, 0, nullptr, nullptr);
-        if (acpn <= 0) return {src, (size_t)srclen};
-        std::string acp(acpn, '\0');
-        WideCharToMultiByte(CP_ACP, 0, ws.c_str(), wn, &acp[0], acpn, nullptr, nullptr);
-        return acp;
-    };
-
     // Create pipes
-    if (!CreatePipe(&hPtyOutRd, &hPtyOutWr, &sa, 0)) {
+    if (!CreatePipe(&hPtyOutRd, &hPtyOutWr, &sa, 65536)) {
         std::cerr << "[SSH Shell] CreatePipe output failed" << std::endl;
         goto cleanup;
     }
-    if (!CreatePipe(&hPtyInRd, &hPtyInWr, &sa, 0)) {
+    if (!CreatePipe(&hPtyInRd, &hPtyInWr, &sa, 65536)) {
         std::cerr << "[SSH Shell] CreatePipe input failed" << std::endl;
         goto cleanup;
     }
 
-    // Try ConPTY first; fall back to plain pipe
-    useConPty = tryConPty(hPtyInRd, hPtyOutWr, (SHORT)cols, (SHORT)rows, &hPty);
+    // ─── Try ConPTY (Windows 10 1809+) ──────────────────────────────────
+    hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    pCreatePC = (HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*))
+        GetProcAddress(hKernel32, "CreatePseudoConsole");
+    pClosePC = (VOID(WINAPI*)(HPCON))
+        GetProcAddress(hKernel32, "ClosePseudoConsole");
 
-    if (useConPty) {
-        // ─── ConPTY path ─────────────────────────────────────────
-        std::cerr << "[SSH Shell] Using ConPTY" << std::endl;
+    if (pCreatePC && pClosePC && cols > 0 && rows > 0) {
+        HRESULT hr = pCreatePC({(SHORT)cols, (SHORT)rows}, hPtyInRd, hPtyOutWr, 0, &hPC);
+        if (SUCCEEDED(hr)) {
+            usingConPty = true;
+
+            // ConPTY has its own copies; close ours to prevent inheritance leaks
+            CloseHandle(hPtyInRd); hPtyInRd = INVALID_HANDLE_VALUE;
+            CloseHandle(hPtyOutWr); hPtyOutWr = INVALID_HANDLE_VALUE;
+
+            STARTUPINFOEXW si = { sizeof(si) };
+            SIZE_T attrSize = 0;
+            InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+            auto attrList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attrSize);
+            if (attrList) {
+                InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize);
+                UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                          hPC, sizeof(HPCON), nullptr, nullptr);
+            }
+            si.lpAttributeList = attrList;
+
+            // bInheritHandles=FALSE: ConPTY manages child via attribute list, not pipe inheritance
+            if (!CreateProcessW(nullptr, shellCmd, nullptr, nullptr, FALSE,
+                                EXTENDED_STARTUPINFO_PRESENT,
+                                nullptr, nullptr, &si.StartupInfo, &pi)) {
+                std::cerr << "[SSH Shell] CreateProcess: " << GetLastError() << std::endl;
+                if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
+                pClosePC(hPC); hPC = nullptr;
+                goto cleanup;
+            }
+            if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
+        }
+    }
+
+    // ─── Plain pipe fallback (ConPTY unavailable or failed) ──────────────
+    if (!usingConPty) {
+        // Manual inheritance for the two ends inherited by cmd.exe via HANDLE_LIST
+        SetHandleInformation(hPtyInRd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(hPtyOutWr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+        HANDLE inheritHandles[2] = { hPtyInRd, hPtyOutWr };
         SIZE_T attrSize = 0;
         InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
-        STARTUPINFOEXW si = {};
-        si.StartupInfo.cb = sizeof(si);
-        si.lpAttributeList = (PPROC_THREAD_ATTRIBUTE_LIST)malloc(attrSize);
-        if (!si.lpAttributeList) goto cleanup;
-        if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attrSize))
-            { free(si.lpAttributeList); goto cleanup; }
-        if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPty, sizeof(HPCON), nullptr, nullptr))
-            { DeleteProcThreadAttributeList(si.lpAttributeList); free(si.lpAttributeList); goto cleanup; }
-
-        if (!CreateProcessW(nullptr, shellExe, nullptr, nullptr, TRUE,
-                            EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
-                            &si.StartupInfo, &pi)) {
-            std::cerr << "[SSH Shell] ConPTY CreateProcess: " << GetLastError() << std::endl;
-            DeleteProcThreadAttributeList(si.lpAttributeList);
-            free(si.lpAttributeList);
-            goto cleanup;
+        auto attrList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attrSize);
+        if (attrList) {
+            InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize);
+            UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      inheritHandles, sizeof(inheritHandles), nullptr, nullptr);
         }
-        DeleteProcThreadAttributeList(si.lpAttributeList);
-        free(si.lpAttributeList);
-        CloseHandle(pi.hThread); pi.hThread = nullptr;
-        CloseHandle(hPtyInRd); hPtyInRd = INVALID_HANDLE_VALUE;
-        CloseHandle(hPtyOutWr); hPtyOutWr = INVALID_HANDLE_VALUE;
 
-        reader = std::thread([&]() {
-            std::vector<char> rbuf(65536);
-            while (shellRunning && running_) {
-                DWORD n = 0;
-                if (ReadFile(hPtyOutRd, rbuf.data(), (DWORD)rbuf.size(), &n, nullptr)) {
-                    if (n > 0) {
-                        // ConPTY output is always UTF-8 — write directly
-                        ssh_channel_write(channel, rbuf.data(), n);
-                    }
-                } else {
-                    if (GetLastError() != ERROR_BROKEN_PIPE)
-                        std::cerr << "[SSH Shell] ReadFile: " << GetLastError() << std::endl;
-                    break;
-                }
-            }
-        });
-        readerStarted = true;
+        STARTUPINFOEXW si = { sizeof(si) };
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = hPtyInRd;
+        si.StartupInfo.hStdOutput = hPtyOutWr;
+        si.StartupInfo.hStdError = hPtyOutWr;
+        si.lpAttributeList = attrList;
 
-        std::vector<char> buf(65536);
-        while (shellRunning && running_) {
-            int rc = ssh_channel_read_nonblocking(channel, buf.data(), buf.size(), 0);
-            if (rc > 0) {
-                DWORD w = 0;
-                std::string acp = utf8ToAcp(buf.data(), rc);
-                WriteFile(hPtyInWr, acp.data(), (DWORD)acp.size(), &w, nullptr);
-            } else if (rc == SSH_ERROR) {
-                break;
-            } else {
-                Sleep(20);
-            }
-        }
-        std::cerr << "[SSH Shell] ConPTY loop done" << std::endl;
-
-    } else {
-        // ─── Fallback: plain pipe path ─────────────────────────
-        std::cerr << "[SSH Shell] Plain pipe fallback" << std::endl;
-        STARTUPINFOW si = { sizeof(si), 0 };
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = hPtyInRd;
-        si.hStdOutput = hPtyOutWr;
-        si.hStdError = hPtyOutWr;
-
-        if (!CreateProcessW(nullptr, shellExe, nullptr, nullptr, TRUE,
-                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        if (!CreateProcessW(nullptr, shellCmd, nullptr, nullptr, TRUE,
+                            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                            nullptr, nullptr, &si.StartupInfo, &pi)) {
             std::cerr << "[SSH Shell] CreateProcess: " << GetLastError() << std::endl;
+            if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
             goto cleanup;
         }
-        std::cerr << "[SSH Shell] cmd.exe PID=" << pi.dwProcessId << std::endl;
-        CloseHandle(pi.hThread); pi.hThread = nullptr;
+        if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
+
         CloseHandle(hPtyInRd); hPtyInRd = INVALID_HANDLE_VALUE;
         CloseHandle(hPtyOutWr); hPtyOutWr = INVALID_HANDLE_VALUE;
+    }
 
-        reader = std::thread([&]() {
-            std::vector<char> rbuf(65536);
-            while (shellRunning && running_) {
-                DWORD n = 0;
-                if (ReadFile(hPtyOutRd, rbuf.data(), (DWORD)rbuf.size(), &n, nullptr)) {
-                    if (n > 0) {
-                        std::string u8 = acpToUtf8(rbuf.data(), n);
-                        ssh_channel_write(channel, u8.data(), u8.size());
-                    }
-                } else {
-                    if (GetLastError() != ERROR_BROKEN_PIPE)
-                        std::cerr << "[SSH Shell] ReadFile: " << GetLastError() << std::endl;
-                    break;
-                }
-            }
-        });
-        readerStarted = true;
+    // ─── Job object (common to both paths) ──────────────────────────────
+    hJob = CreateJobObjectW(nullptr, nullptr);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)))
+            AssignProcessToJobObject(hJob, pi.hProcess);
+    }
+    CloseHandle(pi.hThread); pi.hThread = nullptr;
 
-        std::vector<char> buf(65536);
-        while (shellRunning && running_) {
-            int rc = ssh_channel_read_nonblocking(channel, buf.data(), buf.size(), 0);
-            if (rc > 0) {
-                DWORD w = 0;
-                std::string acp = utf8ToAcp(buf.data(), rc);
-                WriteFile(hPtyInWr, acp.data(), (DWORD)acp.size(), &w, nullptr);
-            } else if (rc == SSH_ERROR) {
+    // ─── I/O loop: raw byte forwarding, no interpretation ──────────────
+    while (shellRunning && running_) {
+        int rc = ssh_channel_read_nonblocking(channel, buf.data(), buf.size(), 0);
+        if (rc > 0) {
+            DWORD w = 0;
+            if (!WriteFile(hPtyInWr, buf.data(), (DWORD)rc, &w, nullptr))
+                std::cerr << "[SSH Shell] WriteFile input: err=" << GetLastError() << std::endl;
+        } else if (rc == SSH_ERROR) {
+            break;
+        }
+
+        DWORD n = 0;
+        if (!PeekNamedPipe(hPtyOutRd, nullptr, 0, nullptr, &n, nullptr)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_BROKEN_PIPE) {
+                std::cerr << "[SSH Shell] PeekNamedPipe: " << err << std::endl;
                 break;
-            } else {
-                Sleep(20);
+            }
+        } else if (n > 0) {
+            DWORD read = 0;
+            if (ReadFile(hPtyOutRd, rbuf.data(), (DWORD)min(rbuf.size(), (size_t)n), &read, nullptr) && read > 0) {
+                const char* outData = rbuf.data();
+                int outLen = (int)read;
+                std::string u8;
+                if (!usingConPty) {
+                    u8 = acpToUtf8(rbuf.data(), (int)read);
+                    outData = u8.data();
+                    outLen = (int)u8.size();
+                }
+                if (ssh_channel_write(channel, outData, outLen) != outLen)
+                    break;
             }
         }
-        std::cerr << "[SSH Shell] Pipe loop done" << std::endl;
+
+        if (ssh_channel_is_eof(channel)) {
+            std::cerr << "[SSH Shell] Channel EOF" << std::endl;
+            break;
+        }
+        Sleep(10);
     }
 
 cleanup:
-    std::cerr << "[SSH Shell] Cleanup" << std::endl;
     shellRunning = false;
-    // Close read pipe to unblock reader thread before joining
-    if (hPtyOutRd != INVALID_HANDLE_VALUE) {
-        CloseHandle(hPtyOutRd);
-        hPtyOutRd = INVALID_HANDLE_VALUE;
-    }
-    if (readerStarted && reader.joinable()) reader.join();
+    if (hPC && pClosePC) pClosePC(hPC);
     if (pi.hProcess) { TerminateProcess(pi.hProcess, 0); CloseHandle(pi.hProcess); }
     if (pi.hThread) CloseHandle(pi.hThread);
-    if (hPty != INVALID_HANDLE_VALUE) closeConPty(hPty);
+    if (hJob) CloseHandle(hJob);
     if (hPtyInRd != INVALID_HANDLE_VALUE) CloseHandle(hPtyInRd);
     if (hPtyInWr != INVALID_HANDLE_VALUE) CloseHandle(hPtyInWr);
     if (hPtyOutRd != INVALID_HANDLE_VALUE) CloseHandle(hPtyOutRd);
     if (hPtyOutWr != INVALID_HANDLE_VALUE) CloseHandle(hPtyOutWr);
-    std::cerr << "[SSH Shell] Done" << std::endl;
 }

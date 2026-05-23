@@ -18,6 +18,7 @@ bool TCPClientTransport::connect(const std::string& ip, int port) {
         std::cerr << "[TCP Client] socket() failed: " << WSAGetLastError() << std::endl;
         return false;
     }
+    SetHandleInformation((HANDLE)socket_, HANDLE_FLAG_INHERIT, 0);
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -143,6 +144,7 @@ bool TCPServerTransport::start() {
         std::cerr << "[TCP Server] socket() failed: " << WSAGetLastError() << std::endl;
         return false;
     }
+    SetHandleInformation((HANDLE)listenSocket_, HANDLE_FLAG_INHERIT, 0);
 
     int opt = 1;
     setsockopt(listenSocket_, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
@@ -190,6 +192,7 @@ void TCPServerTransport::listenLoop() {
             }
             break;
         }
+        SetHandleInformation((HANDLE)client, HANDLE_FLAG_INHERIT, 0);
 
         if (hasClient_) {
             std::cout << "[TCP Server] Reject extra client (already has one)" << std::endl;
@@ -280,6 +283,7 @@ void TCPServerTransport::stop() {
     running_ = false;
     hasClient_ = false;
 
+    // Close sockets to unblock accept() / recv() immediately
     if (listenSocket_ != INVALID_SOCKET) {
         closesocket(listenSocket_);
         listenSocket_ = INVALID_SOCKET;
@@ -291,7 +295,7 @@ void TCPServerTransport::stop() {
     }
 
     // Detach threads — they will see running_==false and exit promptly.
-    // The process will clean up remaining threads on exit.
+    // The kernel will clean up remaining threads on process exit.
     if (listenThread_.joinable()) listenThread_.detach();
     if (recvThread_.joinable()) recvThread_.detach();
 }

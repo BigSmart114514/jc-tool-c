@@ -37,7 +37,7 @@ link_directories(${LIBSSH_DIR}/lib)
 # qtermwidget (terminal emulation engine)
 add_subdirectory(thirdparty/qtermwidget)
 include_directories(${CMAKE_SOURCE_DIR}/thirdparty/qtermwidget)
-include_directories(${CMAKE_SOURCE_DIR}/../qtermwidget-2.3.0/lib)
+include_directories(${CMAKE_SOURCE_DIR}/../qtermwidget-2.4.0/lib)
 
 add_definitions(-D_CRT_SECURE_NO_WARNINGS -DP2P_CLIENT_STATIC -DWITH_SERVER)
 
