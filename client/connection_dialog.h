@@ -24,6 +24,7 @@ struct ConnectionConfig {
     std::string easytierIpv4;
     int easytierListenPort = 11012;
     std::string easytierPeerUrl;
+    std::string easytierServerVip;        // 服务器的 VPN 虚拟 IP（用于 SSH/SFTP/Desktop）
 };
 
 class ConnectionDialog : public QDialog {
@@ -52,6 +53,7 @@ private:
     QLineEdit* leNetName_;
     QLineEdit* leNetSecret_;
     QLineEdit* leIpv4_;
+    QLineEdit* leServerVip_;
     QLineEdit* leListenPort_;
     QLineEdit* lePeerUrl_;
 };

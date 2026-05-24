@@ -61,11 +61,14 @@ void ConnectionDialog::createUI() {
     leIpv4_->setPlaceholderText("Leave empty for auto-assign");
     leListenPort_ = new QLineEdit("11012");
     lePeerUrl_ = new QLineEdit("tcp://225284.xyz:11010");
+    leServerVip_ = new QLineEdit();
+    leServerVip_->setPlaceholderText("Server's VPN virtual IP (e.g. 10.144.0.1)");
 
     etForm->addRow("Instance name:", leInstName_);
     etForm->addRow("Network name:", leNetName_);
     etForm->addRow("Network key:", leNetSecret_);
-    etForm->addRow("Virtual IP:", leIpv4_);
+    etForm->addRow("My Virtual IP:", leIpv4_);
+    etForm->addRow("Server Virtual IP:", leServerVip_);
     etForm->addRow("Listen port:", leListenPort_);
     etForm->addRow("Peer URL:", lePeerUrl_);
     etLayout->addLayout(etForm);
@@ -90,6 +93,7 @@ void ConnectionDialog::onEasyTierToggled(bool checked) {
     leNetName_->setEnabled(checked);
     leNetSecret_->setEnabled(checked);
     leIpv4_->setEnabled(checked);
+    leServerVip_->setEnabled(checked);
     leListenPort_->setEnabled(checked);
     lePeerUrl_->setEnabled(checked);
 }
@@ -120,6 +124,7 @@ void ConnectionDialog::onConnect() {
     config_.easytierNetworkName = leNetName_->text().toStdString();
     config_.easytierNetworkSecret = leNetSecret_->text().toStdString();
     config_.easytierIpv4 = leIpv4_->text().toStdString();
+    config_.easytierServerVip = leServerVip_->text().toStdString();
     config_.easytierListenPort = leListenPort_->text().toInt();
     config_.easytierPeerUrl = lePeerUrl_->text().toStdString();
 

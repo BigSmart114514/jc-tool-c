@@ -56,11 +56,15 @@ int runClient() {
             return 1;
         }
 
-        // Get virtual IP - but keep original SSH host config
+        // 如果用户提供了服务器的 VPN 虚拟 IP，则用它将所有流量走 EasyTier
+        if (!cfg.easytierServerVip.empty()) {
+            targetHost = cfg.easytierServerVip;
+        }
+
         QMessageBox::information(nullptr, "EasyTier Connected",
             "Your virtual IP: " + QString::fromStdString(easytierMgr->getVirtualIp()));
 
-        connectInfo = "SSH: " + cfg.host + ":" + std::to_string(cfg.sshPort)
+        connectInfo = "SSH: " + targetHost + ":" + std::to_string(cfg.sshPort)
                      + " | VPN: " + easytierMgr->getVirtualIp();
     } else {
         connectInfo = cfg.host + ":" + std::to_string(cfg.sshPort);
