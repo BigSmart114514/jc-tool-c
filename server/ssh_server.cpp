@@ -5,6 +5,7 @@
 #include "ssh_server.h"
 #include <winsock2.h>
 #include <libssh/sftp.h>
+#include <libssh/callbacks.h>
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -1057,6 +1058,7 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
     HMODULE hDll = nullptr;
     auto pCreatePC = (HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*))nullptr;
     auto pClosePC = (VOID(WINAPI*)(HPCON))nullptr;
+    auto pResizePC = (HRESULT(WINAPI*)(HPCON, COORD))nullptr;
     std::vector<char> buf(65536);
     std::vector<char> rbuf(65536);
 
@@ -1077,6 +1079,8 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
         GetProcAddress(hDll, "CreatePseudoConsole");
     pClosePC = (VOID(WINAPI*)(HPCON))
         GetProcAddress(hDll, "ClosePseudoConsole");
+    pResizePC = (HRESULT(WINAPI*)(HPCON, COORD))
+        GetProcAddress(hDll, "ResizePseudoConsole");
     std::cout << "[SSH Shell] ConPTY from: " << (hConPty ? "conpty.dll" : "kernel32.dll") << std::endl;
 
     if (pCreatePC && pClosePC && cols > 0 && rows > 0) {
@@ -1125,9 +1129,31 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
             AssignProcessToJobObject(hJob, pi.hProcess);
     }
     CloseHandle(pi.hThread); pi.hThread = nullptr;
+
+    // Make session non-blocking so we can poll for window-change messages
+    ssh_set_blocking(session, 0);
+
     std::cout << "[SSH Shell] Successfully entered I/O loop!" << std::endl;
 
     while (shellRunning && running_) {
+        // ───【轮询：窗口大小变化】───
+        ssh_message msg;
+        while ((msg = ssh_message_get(session)) != nullptr) {
+            if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL &&
+                ssh_message_subtype(msg) == SSH_CHANNEL_REQUEST_WINDOW_CHANGE) {
+                int newCols = ssh_message_channel_request_pty_width(msg);
+                int newRows = ssh_message_channel_request_pty_height(msg);
+                if (pResizePC) {
+                    pResizePC(hPC, {(SHORT)newCols, (SHORT)newRows});
+                    std::cout << "[SSH Shell] Resized to " << newCols << "x" << newRows << std::endl;
+                }
+                ssh_message_channel_request_reply_success(msg);
+            } else {
+                ssh_message_reply_default(msg);
+            }
+            ssh_message_free(msg);
+        }
+
         // ───【第一道防线：Windows Terminal 哲学，只看进程死没死】───
         if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
             DWORD exitCode = 0;

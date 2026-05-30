@@ -72,7 +72,10 @@ SshTerminalWindow::SshTerminalWindow(std::unique_ptr<SshSession> session, QWidge
     connect(terminal_, &Konsole::TerminalDisplay::keyPressedSignal,
             emulation_, &Konsole::Emulation::sendKeyEvent);
     connect(terminal_, &Konsole::TerminalDisplay::mouseSignal,
-            emulation_, &Konsole::Emulation::sendMouseEvent);
+            this, [this](int cb, int cx, int cy, int eventType) {
+        if (forwardMouse_)
+            emulation_->sendMouseEvent(cb, cx, cy, eventType);
+    });
     connect(emulation_, &Konsole::Emulation::sendData,
             this, [this](const char* data, int len) {
         if (session_) session_->writeShell(data, len);
@@ -81,14 +84,16 @@ SshTerminalWindow::SshTerminalWindow(std::unique_ptr<SshSession> session, QWidge
             this, &SshTerminalWindow::onEmulationTitleChanged);
     connect(terminal_, &Konsole::TerminalDisplay::changedContentSizeSignal,
             this, &SshTerminalWindow::onContentSizeChanged);
-    // Forward mouse to remote when TUI app requests it (DECSET 1000/1002/1006)
-    // Note: qtermwidget's setUsesMouse(true) means "local selection mode",
-    // so we INVERT: when program requests mouse → forwarding mode (setUsesMouse(false))
+    // qtermwidget 2.4.0 has inverted programUsesMouseChanged signal:
+    //   setMode (enable mouse) → emits false
+    //   resetMode (disable mouse) → emits true
+    // So we use !usesMouse to get the actual intent.
     connect(emulation_, &Konsole::Emulation::programUsesMouseChanged,
             this, [this](bool usesMouse) {
-        terminal_->setUsesMouse(!usesMouse);
+        forwardMouse_ = !usesMouse;
+        terminal_->setUsesMouse(usesMouse);
     });
-    terminal_->setUsesMouse(!emulation_->programUsesMouse());
+    terminal_->setUsesMouse(true);
 
     if (session_) {
         session_->openShell([this](const char* data, int len) {

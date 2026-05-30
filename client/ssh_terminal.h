@@ -36,6 +36,7 @@ private:
     Konsole::Vt102Emulation* emulation_ = nullptr;
     Konsole::TerminalDisplay* terminal_ = nullptr;
     QTimer* pollTimer_ = nullptr;
+    bool forwardMouse_ = false;
 };
 
 #endif
