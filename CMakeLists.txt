@@ -135,12 +135,20 @@ if(WIN32)
 
     # 如果使用其他模块，请补充对应的 DLL
 
+    set(CONPTY_DIR "${CMAKE_SOURCE_DIR}/../Microsoft.Windows.Console.ConPTY")
+    if(EXISTS "${CONPTY_DIR}/runtimes/win-x64/native/conpty.dll")
+        set(CONPTY_DLLS
+            "${CONPTY_DIR}/runtimes/win-x64/native/conpty.dll"
+            "${CONPTY_DIR}/build/native/runtimes/x64/OpenConsole.exe"
+        )
+    endif()
+
     add_custom_command(TARGET RemoteControl POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:RemoteControl>/platforms
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${EASYTIER_DLLS} ${LIBSSH_DLLS} ${QT_DLLS} $<TARGET_FILE_DIR:RemoteControl>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${EASYTIER_DLLS} ${LIBSSH_DLLS} ${QT_DLLS} ${CONPTY_DLLS} $<TARGET_FILE_DIR:RemoteControl>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qwindows.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
         # 根据需要添加其他平台插件
         # COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qdirect2d.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
-        COMMENT "Copying runtime DLLs and Qt platform plugin..."
+        COMMENT "Copying runtime DLLs, Qt platform plugin, and ConPTY binaries..."
     )
 endif()

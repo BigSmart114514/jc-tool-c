@@ -1053,7 +1053,8 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
     std::atomic<bool> shellRunning{true};
     wchar_t shellCmd[] = L"powershell.exe -NoLogo";
     bool usingConPty = false;
-    HMODULE hKernel32 = nullptr;
+    HMODULE hConPty = nullptr;
+    HMODULE hDll = nullptr;
     auto pCreatePC = (HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*))nullptr;
     auto pClosePC = (VOID(WINAPI*)(HPCON))nullptr;
     std::vector<char> buf(65536);
@@ -1069,12 +1070,14 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
         goto cleanup;
     }
 
-    // ─── Try ConPTY (Windows 10 1809+) ──────────────────────────────────
-    hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    // ─── Try ConPTY (conpty.dll first, fallback to kernel32) ────────────
+    hConPty = LoadLibraryW(L"conpty.dll");
+    hDll = hConPty ? hConPty : GetModuleHandleW(L"kernel32.dll");
     pCreatePC = (HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*))
-        GetProcAddress(hKernel32, "CreatePseudoConsole");
+        GetProcAddress(hDll, "CreatePseudoConsole");
     pClosePC = (VOID(WINAPI*)(HPCON))
-        GetProcAddress(hKernel32, "ClosePseudoConsole");
+        GetProcAddress(hDll, "ClosePseudoConsole");
+    std::cout << "[SSH Shell] ConPTY from: " << (hConPty ? "conpty.dll" : "kernel32.dll") << std::endl;
 
     if (pCreatePC && pClosePC && cols > 0 && rows > 0) {
         HRESULT hr = pCreatePC({(SHORT)cols, (SHORT)rows}, hPtyInRd, hPtyOutWr, 0, &hPC);
@@ -1124,45 +1127,50 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
     CloseHandle(pi.hThread); pi.hThread = nullptr;
     std::cout << "[SSH Shell] Successfully entered I/O loop!" << std::endl;
 
-    // ─── I/O loop: raw byte forwarding, no interpretation ──────────────
     while (shellRunning && running_) {
-        // Monitor if shell process died unexpectedly
+        // ───【第一道防线：Windows Terminal 哲学，只看进程死没死】───
         if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
             DWORD exitCode = 0;
             GetExitCodeProcess(pi.hProcess, &exitCode);
-            std::cout << "[SSH Shell] FATAL: Shell process (powershell) died unexpectedly! Exit code: " << exitCode << std::endl;
-            break;
+            std::cout << "[SSH Shell] Shell process genuinely exited. Exit code: " << exitCode << std::endl;
+            break; // 这是唯一合法的退出理由！
         }
 
+        // ───【处理输入（SSH 读 -> 管道 写）】───
         int rc = ssh_channel_read_nonblocking(channel, buf.data(), buf.size(), 0);
         if (rc > 0) {
             DWORD w = 0;
             if (!WriteFile(hPtyInWr, buf.data(), (DWORD)rc, &w, nullptr)) {
-                std::cout << "[SSH Shell] WriteFile failed: err=" << GetLastError() << std::endl;
-                break;
+                DWORD err = GetLastError();
+                // 拦截 232 和 109：此时管道正在抖动，千万不要 break！
+                if (err == ERROR_NO_DATA || err == ERROR_BROKEN_PIPE) {
+                    Sleep(10);
+                    continue; // 丢弃当前写入，等待管道恢复
+                } else {
+                    std::cout << "[SSH Shell] WriteFile fatal err=" << err << std::endl;
+                    break;
+                }
             }
         } else if (rc == SSH_ERROR) {
-            std::cout << "[SSH Shell] SSH client explicitly disconnected." << std::endl;
-            break;
+            std::cout << "[SSH Shell] SSH client disconnected." << std::endl;
+            break; // 客户端主动断开
         }
 
+        // ───【处理输出（管道 读 -> SSH 写）】───
         DWORD n = 0;
         if (!PeekNamedPipe(hPtyOutRd, nullptr, 0, nullptr, &n, nullptr)) {
             DWORD err = GetLastError();
-            if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) {
-                // 关键：学 Windows Terminal，先看大房东 cmd.exe 死没死
-                if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
-                    // 只有 cmd 真的彻底凉了，才退出循环
-                    break; 
-                }
-                // 如果 cmd 还活着，说明只是管道在“打嗝”（TUI退出震荡）
-                // 睡 10 毫秒，直接 continue，假装什么都没发生，等待 conhost 恢复
+            // 拦截 232 和 109：此时管道正在抖动，千万不要 break！
+            if (err == ERROR_NO_DATA || err == ERROR_BROKEN_PIPE) {
                 Sleep(10);
-                continue;
+                continue; // 忽略报错，等待管道恢复并吐出新的提示符
+            } else {
+                std::cout << "[SSH Shell] PeekNamedPipe fatal err=" << err << std::endl;
+                break;
             }
-            break;
         }
 
+        // 正常读取并转发给 SSH
         if (n > 0) {
             DWORD read = 0;
             if (ReadFile(hPtyOutRd, rbuf.data(), (DWORD)min(rbuf.size(), (size_t)n), &read, nullptr) && read > 0) {
@@ -1174,10 +1182,10 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
         }
 
         if (ssh_channel_is_eof(channel)) {
-            std::cout << "[SSH Shell] SSH Channel EOF received." << std::endl;
             break;
         }
-        Sleep(10);
+        
+        Sleep(10); // 降低 CPU 占用
     }
     std::cout << "[SSH Shell] Exiting I/O loop normally." << std::endl;
 
