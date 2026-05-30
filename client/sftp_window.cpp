@@ -65,6 +65,11 @@ void SftpWindow::createUI() {
     connect(btnUpload_, &QPushButton::clicked, this, &SftpWindow::uploadFile);
     toolbarLayout->addWidget(btnUpload_);
 
+    QPushButton* btnUploadFolder = new QPushButton("Upload Folder", this);
+    btnUploadFolder->setFixedWidth(110);
+    connect(btnUploadFolder, &QPushButton::clicked, this, &SftpWindow::uploadFolder);
+    toolbarLayout->addWidget(btnUploadFolder);
+
     btnMkdir_ = new QPushButton("New Folder", this);
     btnMkdir_->setFixedWidth(90);
     connect(btnMkdir_, &QPushButton::clicked, this, &SftpWindow::mkdirItem);
@@ -242,6 +247,8 @@ void SftpWindow::onItemRightClicked(const QPoint& pos) {
         QMenu menu(this);
         QAction* uploadAction = menu.addAction("Upload File...");
         connect(uploadAction, &QAction::triggered, this, &SftpWindow::uploadFile);
+        QAction* uploadFolderAction = menu.addAction("Upload Folder...");
+        connect(uploadFolderAction, &QAction::triggered, this, &SftpWindow::uploadFolder);
         menu.addSeparator();
         QAction* mkdirAction = menu.addAction("Create Directory...");
         connect(mkdirAction, &QAction::triggered, this, &SftpWindow::mkdirItem);
@@ -307,6 +314,8 @@ void SftpWindow::onItemRightClicked(const QPoint& pos) {
     // Upload & New Folder available on any item context
     QAction* uploadHereAction = menu.addAction("Upload File...");
     connect(uploadHereAction, &QAction::triggered, this, &SftpWindow::uploadFile);
+    QAction* uploadFolderHereAction = menu.addAction("Upload Folder...");
+    connect(uploadFolderHereAction, &QAction::triggered, this, &SftpWindow::uploadFolder);
     QAction* mkdirHereAction = menu.addAction("Create Directory...");
     connect(mkdirHereAction, &QAction::triggered, this, &SftpWindow::mkdirItem);
     menu.addSeparator();
@@ -453,6 +462,54 @@ void SftpWindow::uploadFile() {
     }
 }
 
+void SftpWindow::uploadFolder() {
+    if (!session_ || !session_->isConnected()) return;
+
+    QString localDir = QFileDialog::getExistingDirectory(this, "Select folder to upload");
+    if (localDir.isEmpty()) return;
+
+    QFileInfo fi(localDir);
+    QString remotePath = currentPath_;
+    remotePath.replace('\\', '/');
+    if (!remotePath.endsWith('/')) remotePath += "/";
+    remotePath += fi.fileName();
+
+    statusBar_->showMessage("Uploading folder...");
+    progressDialog_ = new QProgressDialog("Uploading folder...", "Cancel", 0, 100, this);
+    progressDialog_->setWindowModality(Qt::WindowModal);
+    progressDialog_->setMinimumDuration(0);
+    progressDialog_->setValue(0);
+
+    bool ok = session_->sftpUploadRecursive(
+        localDir.toStdString(),
+        remotePath.toStdString(),
+        [this](int64_t sent, int64_t total) -> bool {
+            if (total > 0) {
+                int pct = static_cast<int>((sent * 100) / total);
+                QMetaObject::invokeMethod(this, [this, pct]() {
+                    if (progressDialog_) progressDialog_->setValue(pct);
+                    statusBar_->showMessage(QString("Uploading folder... %1%").arg(pct));
+                }, Qt::QueuedConnection);
+            }
+            return !progressDialog_->wasCanceled();
+        }
+    );
+
+    if (progressDialog_) {
+        progressDialog_->close();
+        progressDialog_->deleteLater();
+        progressDialog_ = nullptr;
+    }
+
+    if (ok) {
+        statusBar_->showMessage("Folder upload complete");
+        onRefreshClicked();
+    } else {
+        statusBar_->showMessage("Folder upload failed");
+        QMessageBox::critical(this, "Error", "Folder upload failed: " + QString::fromStdString(session_->getError()));
+    }
+}
+
 void SftpWindow::uploadFiles(const QStringList& localPaths) {
     if (!session_ || !session_->isConnected() || localPaths.isEmpty()) return;
 
@@ -476,14 +533,25 @@ void SftpWindow::uploadFiles(const QStringList& localPaths) {
         remotePath += fi.fileName();
 
         activeTransferCount_++;
-        bool ok = session_->sftpUpload(
-            localPaths[i].toStdString(),
-            remotePath.toStdString(),
-            [this](int64_t sent, int64_t total) -> bool {
-                Q_UNUSED(sent) Q_UNUSED(total)
-                return !progressDialog_->wasCanceled();
-            }
-        );
+        bool ok;
+        if (fi.isDir()) {
+            ok = session_->sftpUploadRecursive(
+                localPaths[i].toStdString(),
+                remotePath.toStdString(),
+                [this](int64_t, int64_t) -> bool {
+                    return !progressDialog_->wasCanceled();
+                }
+            );
+        } else {
+            ok = session_->sftpUpload(
+                localPaths[i].toStdString(),
+                remotePath.toStdString(),
+                [this](int64_t sent, int64_t total) -> bool {
+                    Q_UNUSED(sent) Q_UNUSED(total)
+                    return !progressDialog_->wasCanceled();
+                }
+            );
+        }
         activeTransferCount_--;
 
         if (!ok) {

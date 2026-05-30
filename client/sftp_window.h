@@ -64,6 +64,7 @@ private:
     void populateFileList();
     void downloadFile(int index);
     void uploadFile();
+    void uploadFolder();
     void uploadFiles(const QStringList& localPaths);
     void deleteItem(int index);
     void mkdirItem();
