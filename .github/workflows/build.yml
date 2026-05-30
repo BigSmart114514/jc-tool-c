@@ -36,57 +36,12 @@ jobs:
         with:
           arch: x64
 
-      # ---------- FFmpeg (build from source, minimal) ----------
-      - name: Checkout FFmpeg 7.1 source
-        shell: pwsh
-        run: |
-          git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git "${{ github.workspace }}/../ffmpeg-7.1"
-
-      - name: Install MSYS2 build tools
-        shell: pwsh
-        run: |
-          $env:PATH = "C:\msys64\usr\bin;$env:PATH"
-          bash -c "pacman -S --needed --noconfirm make diffutils pkg-config"
-
-      - name: Build and install FFmpeg minimal
-        shell: pwsh
-        run: |
-          $env:PATH = "C:\msys64\usr\bin;$env:PATH"
-          $env:MSYS2_ARG_CONV_EXCL = "*"
-          $env:FFMPEG_SRC = "${{ github.workspace }}/../ffmpeg-7.1" -replace '\\', '/' -replace '^([A-Za-z]):', '/$1'
-          $env:FFMPEG_PREFIX = "${{ github.workspace }}/../ffmpeg-minimal" -replace '\\', '/' -replace '^([A-Za-z]):', '/$1'
-          bash -c '
-            cd "$FFMPEG_SRC" && \
-            ./configure \
-              --toolchain=msvc \
-              --prefix="$FFMPEG_PREFIX" \
-              --enable-shared \
-              --disable-static \
-              --disable-programs \
-              --disable-doc \
-              --disable-avdevice \
-              --disable-avformat \
-              --disable-avfilter \
-              --disable-postproc \
-              --disable-network \
-              --disable-everything \
-              --enable-swscale \
-              --enable-avcodec \
-              --enable-avutil \
-              --enable-swresample \
-              --enable-decoder=hevc \
-              --enable-encoder=hevc_nvenc,hevc_qsv,hevc_amf \
-              --enable-parser=hevc \
-              --enable-hwaccel=hevc_dxva2,hevc_d3d11va,hevc_nvenc \
-              --extra-cflags=-DWIN32_LEAN_AND_MEAN && \
-            make -j$(nproc) && \
-            make install
-          '
-
-      - name: Debug FFmpeg install tree
-        shell: pwsh
-        run: |
-          Get-ChildItem -Recurse "${{ github.workspace }}/../ffmpeg-minimal" | Select-Object FullName, Length | Format-Table -AutoSize
+      # ---------- FFmpeg (minimal) ----------
+      - name: Download FFmpeg
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-windows
+          path: ${{ github.workspace }}/../ffmpeg-minimal
 
       # ---------- EasyTier ----------
       - name: Download EasyTier FFI artifact

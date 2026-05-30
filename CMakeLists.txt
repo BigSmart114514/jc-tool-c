@@ -16,7 +16,7 @@ if(NOT EXISTS ${FFMPEG_DIR})
     message(FATAL_ERROR "FFmpeg not found at ${FFMPEG_DIR}")
 endif()
 include_directories(${FFMPEG_DIR}/include)
-link_directories(${FFMPEG_DIR}/lib)
+link_directories(${FFMPEG_DIR}/bin)
 
 # easytier
 set(EASYTIER_DIR "${CMAKE_SOURCE_DIR}/../easytier")
