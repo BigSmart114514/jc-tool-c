@@ -162,6 +162,8 @@ void DesktopWindow::decodeLoop() {
         bool success = false;
         int w = 0, h = 0, stride = 0;
 
+
+
         // 【修改】加锁保护解码操作，防止网络线程在此期间销毁上下文
         {
             std::lock_guard<std::mutex> decLock(decoderMtx_);
@@ -195,6 +197,7 @@ void DesktopWindow::decodeLoop() {
                 hasNewFrame_ = true;
                 screenWidth_ = w;
                 screenHeight_ = h;
+                frameReadyTime_ = std::chrono::steady_clock::now();
             }
 
             emit frameReady(); 
@@ -213,8 +216,8 @@ void DesktopWindow::updateDisplay() {
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
         if (!hasNewFrame_) return; 
-        // 我们不需要在这里 copy，paintEvent 会处理最新的 latestFrame_
     }
+
     
     // 触发系统的 paintEvent。这是 Qt 最标准的做法。
     // 它会将多次 update() 调用合并为一次重绘，极大地节省 CPU。
@@ -413,6 +416,7 @@ void DesktopWindow::onResizeCooldown() {
 
 void DesktopWindow::paintEvent(QPaintEvent* event) {
     Q_UNUSED(event);
+    auto t0 = std::chrono::steady_clock::now();
 
     QImage imageToDraw;
     {
@@ -440,6 +444,8 @@ void DesktopWindow::paintEvent(QPaintEvent* event) {
 
     // 4. 绘制到屏幕
     painter.drawImage(x, y, scaledImg);
+
+
 }
 
 QSize DesktopWindow::displayedImageSize() {

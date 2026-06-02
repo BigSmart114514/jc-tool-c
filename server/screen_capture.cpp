@@ -16,24 +16,32 @@ bool ScreenCapture::init() {
 }
 
 bool ScreenCapture::initDXGI() {
-    D3D_FEATURE_LEVEL fl;
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                                    nullptr, 0, D3D11_SDK_VERSION, &device_, &fl, &context_);
-    if (FAILED(hr)) return false;
+    if (!device_) {
+        D3D_FEATURE_LEVEL fl;
+        UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                        nullptr, 0, D3D11_SDK_VERSION, &device_, &fl, &context_);
+        if (FAILED(hr)) return false;
+    }
+    return initDuplication();
+}
+
+bool ScreenCapture::initDuplication() {
+    if (!device_) return false;
 
     IDXGIDevice* dxgiDev = nullptr;
-    hr = device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev);
-    if (FAILED(hr)) { device_->Release(); device_ = nullptr; return false; }
+    HRESULT hr = device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev);
+    if (FAILED(hr)) return false;
 
     IDXGIAdapter* adapter = nullptr;
     hr = dxgiDev->GetAdapter(&adapter);
     dxgiDev->Release();
-    if (FAILED(hr)) { device_->Release(); device_ = nullptr; return false; }
+    if (FAILED(hr)) return false;
 
     IDXGIOutput* output = nullptr;
     hr = adapter->EnumOutputs(0, &output);
     adapter->Release();
-    if (FAILED(hr)) { device_->Release(); device_ = nullptr; return false; }
+    if (FAILED(hr)) return false;
 
     DXGI_OUTPUT_DESC desc;
     output->GetDesc(&desc);
@@ -41,36 +49,54 @@ bool ScreenCapture::initDXGI() {
     IDXGIOutput1* output1 = nullptr;
     hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
     output->Release();
-    if (FAILED(hr)) { device_->Release(); device_ = nullptr; return false; }
+    if (FAILED(hr)) return false;
 
     hr = output1->DuplicateOutput(device_, &duplication_);
     output1->Release();
-    if (FAILED(hr)) { device_->Release(); device_ = nullptr; return false; }
+    if (FAILED(hr)) return false;
 
     width_ = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
     height_ = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
 
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = width_;
-    td.Height = height_;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_STAGING;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-    hr = device_->CreateTexture2D(&td, nullptr, &stagingTexture_);
-    if (FAILED(hr)) {
-        duplication_->Release();
-        device_->Release();
-        duplication_ = nullptr;
-        device_ = nullptr;
-        return false;
+    if (!stagingTexture_) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = width_;
+        td.Height = height_;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        hr = device_->CreateTexture2D(&td, nullptr, &stagingTexture_);
+        if (FAILED(hr)) {
+            duplication_->Release(); duplication_ = nullptr;
+            return false;
+        }
     }
 
-    frameBuffer_ = new uint8_t[size_t(width_) * height_ * 4];
-    memset(frameBuffer_, 0, size_t(width_) * height_ * 4);
+    if (!gpuCopyTexture_) {
+        D3D11_TEXTURE2D_DESC gpuDesc = {};
+        gpuDesc.Width = width_;
+        gpuDesc.Height = height_;
+        gpuDesc.MipLevels = 1;
+        gpuDesc.ArraySize = 1;
+        gpuDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        gpuDesc.SampleDesc.Count = 1;
+        gpuDesc.Usage = D3D11_USAGE_DEFAULT;
+        gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        hr = device_->CreateTexture2D(&gpuDesc, nullptr, &gpuCopyTexture_);
+        if (FAILED(hr)) {
+            stagingTexture_->Release(); stagingTexture_ = nullptr;
+            duplication_->Release(); duplication_ = nullptr;
+            return false;
+        }
+    }
+
+    if (!frameBuffer_) {
+        frameBuffer_ = new uint8_t[size_t(width_) * height_ * 4];
+        memset(frameBuffer_, 0, size_t(width_) * height_ * 4);
+    }
 
     useGDI_ = false;
     initialized_ = true;
@@ -114,13 +140,10 @@ bool ScreenCapture::initGDI() {
 }
 
 void ScreenCapture::cleanup() {
-    if (frameAcquired_ && duplication_) {
-        duplication_->ReleaseFrame();
-        frameAcquired_ = false;
-    }
+    cleanupDuplicationOnly();
 
+    if (gpuCopyTexture_) { gpuCopyTexture_->Release(); gpuCopyTexture_ = nullptr; }
     if (stagingTexture_) { stagingTexture_->Release(); stagingTexture_ = nullptr; }
-    if (duplication_) { duplication_->Release(); duplication_ = nullptr; }
     if (context_) { context_->Release(); context_ = nullptr; }
     if (device_) { device_->Release(); device_ = nullptr; }
 
@@ -199,20 +222,69 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
     return frameBuffer_;
 }
 
-void ScreenCapture::cleanupDXGIOnly() {
+bool ScreenCapture::captureTexture(ID3D11Texture2D** outTex) {
+    if (!outTex) return false;
+    *outTex = nullptr;
+    if (!initialized_ || useGDI_) return false;
+
+    if (frameAcquired_) {
+        duplication_->ReleaseFrame();
+        frameAcquired_ = false;
+    }
+
+    DXGI_OUTDUPL_FRAME_INFO fi;
+    IDXGIResource* res = nullptr;
+    HRESULT hr = duplication_->AcquireNextFrame(16, &fi, &res);
+
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        return false;
+    }
+
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        resetDXGI();
+        return false;
+    }
+
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    frameAcquired_ = true;
+
+    ID3D11Texture2D* tex = nullptr;
+    hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+    res->Release();
+    if (FAILED(hr)) return false;
+
+    context_->CopyResource(gpuCopyTexture_, tex);
+    tex->Release();
+
+    *outTex = gpuCopyTexture_;
+    return true;
+}
+
+void ScreenCapture::cleanupDuplicationOnly() {
     if (frameAcquired_ && duplication_) {
         duplication_->ReleaseFrame();
         frameAcquired_ = false;
+    }
+    if (duplication_) {
+        duplication_->Release();
+        duplication_ = nullptr;
+    }
+}
+
+void ScreenCapture::cleanupDXGIOnly() {
+    cleanupDuplicationOnly();
+
+    if (gpuCopyTexture_) {
+        gpuCopyTexture_->Release();
+        gpuCopyTexture_ = nullptr;
     }
 
     if (stagingTexture_) {
         stagingTexture_->Release();
         stagingTexture_ = nullptr;
-    }
-
-    if (duplication_) {
-        duplication_->Release();
-        duplication_ = nullptr;
     }
 
     if (context_) {
@@ -236,13 +308,14 @@ void ScreenCapture::cleanupDXGIOnly() {
 bool ScreenCapture::resetDXGI() {
     std::cerr << "[Capture] Resetting DXGI duplication..." << std::endl;
 
-    cleanupDXGIOnly();
+    cleanupDuplicationOnly();
 
-    if (initDXGI()) {
+    if (initDuplication()) {
         std::cout << "[Capture] DXGI reset OK" << std::endl;
         return true;
     }
 
     std::cerr << "[Capture] DXGI reset failed, falling back to GDI" << std::endl;
+    cleanupDXGIOnly();
     return initGDI();
 }

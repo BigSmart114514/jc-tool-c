@@ -14,7 +14,7 @@
 
 #include "../common/transport.h"
 #include "../common/protocol.h"
-#include "hevc_decoder.h"
+#include "media_decoder.h"
 
 class DesktopWindow : public QWidget {
     Q_OBJECT
@@ -56,8 +56,8 @@ private:
     std::condition_variable queueCV_;
     std::queue<BinaryData> videoQueue_;
 
-    // --- 关键修正：类名必须匹配 hevc_decoder.h 中的 HEVCDecoder ---
-    HEVCDecoder decoder_; 
+    // --- 关键修正：类名必须匹配 media_decoder.h 中的 MediaDecoder ---
+    MediaDecoder decoder_; 
     // -------------------------------------------------------
     
     bool decoderReady_ = false;
@@ -96,6 +96,7 @@ private:
     uint64_t intervalDecodeTimeMs_ = 0;
     std::chrono::steady_clock::time_point lastStatsTime_;
     std::chrono::steady_clock::time_point lastFpsChangeTime_;
+    std::chrono::steady_clock::time_point frameReadyTime_;
 
     std::mutex decoderMtx_;
 

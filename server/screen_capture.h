@@ -18,14 +18,20 @@ public:
     void cleanup();
     
     const uint8_t* capture(bool& hasNew);
+    bool captureTexture(ID3D11Texture2D** outTex);
+    
+    ID3D11Device* getDevice() const { return device_; }
+    ID3D11DeviceContext* getContext() const { return context_; }
     
     int getWidth() const { return width_; }
     int getHeight() const { return height_; }
 
 private:
     bool initDXGI();
+    bool initDuplication();
     bool initGDI();
 
+    void cleanupDuplicationOnly();
     void cleanupDXGIOnly();
     bool resetDXGI();
 
@@ -34,6 +40,7 @@ private:
     ID3D11DeviceContext* context_ = nullptr;
     IDXGIOutputDuplication* duplication_ = nullptr;
     ID3D11Texture2D* stagingTexture_ = nullptr;
+    ID3D11Texture2D* gpuCopyTexture_ = nullptr;
     bool frameAcquired_ = false;
 
     // GDI fallback

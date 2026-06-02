@@ -10,14 +10,6 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
-# FFmpeg (minimal build)
-set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/../ffmpeg-minimal")
-if(NOT EXISTS ${FFMPEG_DIR})
-    message(FATAL_ERROR "FFmpeg not found at ${FFMPEG_DIR}")
-endif()
-include_directories(${FFMPEG_DIR}/include)
-link_directories(${FFMPEG_DIR}/bin)
-
 # easytier
 set(EASYTIER_DIR "${CMAKE_SOURCE_DIR}/../easytier")
 if(NOT EXISTS ${EASYTIER_DIR})
@@ -47,7 +39,8 @@ endif()
 
 # 公共库列表
 set(COMMON_LIBS
-    ws2_32 crypt32 avcodec avutil swscale easytier_ffi bcrypt
+    ws2_32 crypt32 easytier_ffi bcrypt
+    mfplat mfuuid mfreadwrite propsys
 )
 
 # 收集所有的源文件 (包含Client和Server的所有功能)
@@ -58,11 +51,10 @@ set(APP_SOURCES
     client/sftp_window.cpp
     client/ssh_terminal.cpp
     client/connection_dialog.cpp
-    client/hevc_decoder.cpp
-    client/display_buffer.cpp
+    client/media_decoder.cpp
     server/desktop_service.cpp
     server/file_service.cpp
-    server/hevc_encoder.cpp
+    server/media_encoder.cpp
     server/screen_capture.cpp
     server/ssh_server.cpp
     common/transport_tcp.cpp
@@ -76,11 +68,10 @@ set(APP_HEADERS
     client/sftp_window.h
     client/ssh_terminal.h
     client/connection_dialog.h
-    client/hevc_decoder.h
-    client/display_buffer.h
+    client/media_decoder.h
     server/desktop_service.h
     server/file_service.h
-    server/hevc_encoder.h
+    server/media_encoder.h
     server/screen_capture.h
     server/ssh_server.h
     common/easytier_manager.h
@@ -98,7 +89,7 @@ target_link_libraries(RemoteControl
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network
     qtermwidget
     ${COMMON_LIBS}
-    gdi32 user32 winmm d3d11 dxgi wtsapi32
+    gdi32 user32 winmm d3d11 dxgi d3dcompiler wtsapi32
     ssh
 )
 
@@ -126,15 +117,6 @@ if(WIN32)
         "${QT_BIN_DIR}/Qt6Network.dll"
     )
 
-    set(FFMPEG_DLLS
-        "${FFMPEG_DIR}/bin/avcodec-61.dll"
-        "${FFMPEG_DIR}/bin/avutil-59.dll"
-        "${FFMPEG_DIR}/bin/swscale-8.dll"
-        "${FFMPEG_DIR}/bin/swresample-5.dll"
-    )
-
-    # 如果使用其他模块，请补充对应的 DLL
-
     set(CONPTY_DIR "${CMAKE_SOURCE_DIR}/../Microsoft.Windows.Console.ConPTY")
     if(EXISTS "${CONPTY_DIR}/runtimes/win-x64/native/conpty.dll")
         set(CONPTY_DLLS
@@ -145,7 +127,7 @@ if(WIN32)
 
     add_custom_command(TARGET RemoteControl POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:RemoteControl>/platforms
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} ${EASYTIER_DLLS} ${LIBSSH_DLLS} ${QT_DLLS} ${CONPTY_DLLS} $<TARGET_FILE_DIR:RemoteControl>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EASYTIER_DLLS} ${LIBSSH_DLLS} ${QT_DLLS} ${CONPTY_DLLS} $<TARGET_FILE_DIR:RemoteControl>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qwindows.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
         # 根据需要添加其他平台插件
         # COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qdirect2d.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/

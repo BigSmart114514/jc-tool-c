@@ -14,8 +14,8 @@ bool DesktopService::init() {
     targetFps_ = Config::FPS;
     targetKfIntervalSec_ = 5; // 默认5秒
 
-    // 【修改】传入源宽高和目标宽高
-    if (!encoder_.init(capture_.getWidth(), capture_.getHeight(), targetWidth_, targetHeight_, targetFps_, Config::CRF)) {
+    if (!encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
+                        targetWidth_, targetHeight_, targetFps_, Config::VIDEO_BITRATE)) {
         std::cerr << "[Desktop] Encoder init failed" << std::endl;
         return false;
     }
@@ -55,7 +55,7 @@ void DesktopService::onMessage(const BinaryData& data) {
         case Desktop::MsgType::ClientReady: {
             std::cout << "[Desktop] ClientReady received, sending ScreenInfo and starting stream" << std::endl;
             if (transport_ && transport_->hasClient()) {
-                auto msg = MessageBuilder::ScreenInfo(capture_.getWidth(), capture_.getHeight());
+                auto msg = MessageBuilder::ScreenInfo(encoder_.encodedWidth(), encoder_.encodedHeight());
                 transport_->send(msg);
             }
             clientReady_ = true;
@@ -145,20 +145,6 @@ void DesktopService::captureLoop() {
 
         processInput();
 
-        bool hasNew = false;
-        const uint8_t* frame = capture_.capture(hasNew);
-
-        if (!frame) {
-            std::cerr << "[Desktop Server] Capture returned null" << std::endl;
-            Sleep(10);
-            continue;
-        }
-
-        if (!hasNew) {
-            Sleep(1);
-            continue;
-        }
-
         // 【动态修改2】判断本次是否应该发送关键帧
         bool kfRequested = keyframeRequested_.exchange(false);
         // 根据客户端指定的帧率和秒数计算关键帧间隔
@@ -168,24 +154,42 @@ void DesktopService::captureLoop() {
         if (configChanged_ && isTimeForKeyframe) {
             std::cout << "[Desktop] Applying new config and forcing keyframe..." << std::endl;
             encoder_.cleanup();
-            // 【修改】重置编码器时，传入源截图宽高和新计算出的目标宽高
-            encoder_.init(capture_.getWidth(), capture_.getHeight(), targetWidth_, targetHeight_, targetFps_, Config::CRF);
+            if (!encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
+                               targetWidth_, targetHeight_, targetFps_, Config::VIDEO_BITRATE)) {
+                std::cerr << "[Desktop] Encoder init failed during config change" << std::endl;
+                configChanged_ = false;
+                return;
+            }
             configChanged_ = false;
 
             // 极为关键的一步：告诉客户端分辨率变了，让它的解码器也立即重新初始化！
             if (transport_ && transport_->hasClient()) {
-                auto msg = MessageBuilder::ScreenInfo(targetWidth_, targetHeight_);
+                auto msg = MessageBuilder::ScreenInfo(
+                    encoder_.encodedWidth(), encoder_.encodedHeight());
                 transport_->send(msg);
             }
             pts = 0; // 重置时间戳
         }
 
-        if (encoder_.encode(frame, pts, encoded, isTimeForKeyframe)) {
+        bool encodeOk = false;
+
+        ID3D11Texture2D* tex = nullptr;
+        if (capture_.captureTexture(&tex)) {
+            encodeOk = encoder_.encodeFromTexture(tex, pts, encoded, isTimeForKeyframe);
+            if (!encodeOk && pts % 30 == 0)
+                std::cerr << "[Desktop] GPU encode failed, dropping frame" << std::endl;
+        }
+
+        if (encodeOk) {
             if (!encoded.empty() && transport_ && transport_->hasClient()) {
                 auto msg = MessageBuilder::VideoFrame(encoded.data(), encoded.size(), isTimeForKeyframe);
                 if (!transport_->send(msg)) {
                     clientReady_ = false;
                 }
+                if (pts % 30 == 0)
+                    std::cout << "[Desktop] Sent frame pts=" << pts
+                              << " size=" << encoded.size()
+                              << " kf=" << (isTimeForKeyframe ? 1 : 0) << std::endl;
             }
         }
 
@@ -210,9 +214,11 @@ void DesktopService::processInput() {
             // so that SetCursorPos / mouse_event land on the correct pixel.
             int physX = ev.x, physY = ev.y;
             int capW = capture_.getWidth(), capH = capture_.getHeight();
-            if (targetWidth_ > 0 && targetHeight_ > 0 && capW > 0 && capH > 0) {
-                physX = ev.x * capW / targetWidth_;
-                physY = ev.y * capH / targetHeight_;
+            int encW = encoder_.encodedWidth();
+            int encH = encoder_.encodedHeight();
+            if (encW > 0 && encH > 0 && capW > 0 && capH > 0) {
+                physX = ev.x * capW / encW;
+                physY = ev.y * capH / encH;
             }
             SetCursorPos(physX, physY);
             switch (ev.key) {

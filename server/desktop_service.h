@@ -5,7 +5,7 @@
 #include "../common/protocol.h"
 #include "../common/transport.h"
 #include "screen_capture.h"
-#include "hevc_encoder.h"
+#include "media_encoder.h"
 #include <queue>
 #include <thread>
 #include <atomic>
@@ -34,7 +34,7 @@ private:
     void processInput();
 
     ScreenCapture capture_;
-    HEVCEncoder encoder_;
+    MediaEncoder encoder_;
     IServerTransport* transport_ = nullptr;
 
     std::queue<Desktop::InputEvent> inputQueue_;

@@ -23,7 +23,7 @@ namespace Config {
     constexpr int DEFAULT_DESKTOP_PORT = 12345;
     constexpr int DEFAULT_FILE_PORT = 12346;
     constexpr int BUFFER_SIZE = 65536;
-    constexpr int CRF = 28;
+    constexpr int VIDEO_BITRATE = 10000000;
     constexpr int FPS = 30;
     constexpr int KEYFRAME_INTERVAL = 120;
 }
