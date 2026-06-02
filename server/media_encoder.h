@@ -23,13 +23,13 @@ public:
     bool encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>& output, bool keyframe = false);
 
     bool initialized() const { return initialized_; }
-    bool hasGPUPath() const { return hasComputeShader_; }
+    bool hasGPUPath() const { return hasGPUPath_; }
     int encodedWidth() const { return width_; }
     int encodedHeight() const { return height_; }
 
 private:
     bool initEncoder();
-    bool initComputeShader();
+    bool initVideoProcessor();
     bool processOutput(std::vector<uint8_t>& output);
     bool createInputSample(const uint8_t* nv12Data, int64_t pts, bool keyframe);
     bool flushEncoder(std::vector<uint8_t>& output);
@@ -37,16 +37,13 @@ private:
     ID3D11Device* d3dDevice_ = nullptr;
     ID3D11DeviceContext* d3dContext_ = nullptr;
 
-    ID3D11ComputeShader* cs_ = nullptr;
-    ID3D11Buffer* csConstants_ = nullptr;
-    ID3D11ShaderResourceView* inputSRV_ = nullptr;
-    ID3D11UnorderedAccessView* yUAV_ = nullptr;
-    ID3D11UnorderedAccessView* uvUAV_ = nullptr;
-    ID3D11Texture2D* yTexture_ = nullptr;
-    ID3D11Texture2D* uvTexture_ = nullptr;
-    ID3D11Texture2D* yStaging_ = nullptr;
-    ID3D11Texture2D* uvStaging_ = nullptr;
-    ID3D11Texture2D* cachedInputTex_ = nullptr;
+    ID3D11VideoDevice* videoDevice_ = nullptr;
+    ID3D11VideoContext* videoContext_ = nullptr;
+    ID3D11VideoProcessorEnumerator* vpEnum_ = nullptr;
+    ID3D11VideoProcessor* videoProcessor_ = nullptr;
+    ID3D11Texture2D* nv12Texture_ = nullptr;
+    ID3D11Texture2D* nv12Staging_ = nullptr;
+    ID3D11VideoProcessorOutputView* vpOutputView_ = nullptr;
 
     IMFTransform* encoder_ = nullptr;
     IMFMediaType* inputType_ = nullptr;
@@ -62,7 +59,7 @@ private:
     int bitrate_ = 3000000;
 
     bool initialized_ = false;
-    bool hasComputeShader_ = false;
+    bool hasGPUPath_ = false;
     std::mutex mtx_;
 };
 

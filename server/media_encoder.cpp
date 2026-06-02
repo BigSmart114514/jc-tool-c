@@ -11,88 +11,12 @@
 #include <strmif.h>
 #include <propvarutil.h>
 #include <vector>
-#include <d3dcompiler.h>
-
 #pragma comment(lib, "mfplat")
 #pragma comment(lib, "mfuuid")
-#pragma comment(lib, "d3dcompiler")
 
 // {6CA50344-051A-4DED-9779-A43305165E35}
 static const GUID CLSID_H264EncoderMFT =
     {0x6CA50344, 0x051A, 0x4DED, {0x97, 0x79, 0xA4, 0x33, 0x05, 0x16, 0x5E, 0x35}};
-
-static const char* g_csHLSL = R"(
-Texture2D<float4> g_input : register(t0);
-RWTexture2D<uint> g_yOut : register(u0);
-RWTexture2D<uint2> g_uvOut : register(u1);
-
-cbuffer Constants : register(b0) {
-    uint g_srcW, g_srcH, g_dstW, g_dstH;
-};
-
-[numthreads(16, 16, 1)]
-void main(uint3 dtid : SV_DispatchThreadID) {
-    uint dx = dtid.x, dy = dtid.y;
-    if (dx >= g_dstW || dy >= g_dstH)
-        return;
-
-    float sx = ((float)dx + 0.5f) * (float)g_srcW / (float)g_dstW;
-    float sy = ((float)dy + 0.5f) * (float)g_srcH / (float)g_dstH;
-
-    uint ix = (uint)max(sx - 0.5f, 0.0f);
-    uint iy = (uint)max(sy - 0.5f, 0.0f);
-    float fx = sx - ((float)ix + 0.5f);
-    float fy = sy - ((float)iy + 0.5f);
-
-    uint ix1 = min(ix + 1, g_srcW - 1);
-    uint iy1 = min(iy + 1, g_srcH - 1);
-
-    float4 c00 = g_input[uint2(ix, iy)];
-    float4 c10 = g_input[uint2(ix1, iy)];
-    float4 c01 = g_input[uint2(ix, iy1)];
-    float4 c11 = g_input[uint2(ix1, iy1)];
-
-    float4 c = lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
-
-    float Yf = 0.299f * c.x + 0.587f * c.y + 0.114f * c.z;
-    Yf = Yf * (219.0f / 255.0f) + (16.0f / 255.0f);
-    uint Y = (uint)round(Yf * 255.0f);
-    Y = min(max(Y, 16u), 235u);
-    g_yOut[uint2(dx, dy)] = Y;
-
-    if ((dx & 1) == 0 && (dy & 1) == 0) {
-        float uv_sx = ((float)dx + 0.5f) * (float)g_srcW / (float)g_dstW;
-        float uv_sy = ((float)dy + 0.5f) * (float)g_srcH / (float)g_dstH;
-
-        uint uix = (uint)max(uv_sx - 0.5f, 0.0f);
-        uint uiy = (uint)max(uv_sy - 0.5f, 0.0f);
-        uix = min(uix, g_srcW - 1);
-        uiy = min(uiy, g_srcH - 1);
-        uint uix1 = min(uix + 1, g_srcW - 1);
-        uint uiy1 = min(uiy + 1, g_srcH - 1);
-
-        float4 uv00 = g_input[uint2(uix, uiy)];
-        float4 uv10 = g_input[uint2(uix1, uiy)];
-        float4 uv01 = g_input[uint2(uix, uiy1)];
-        float4 uv11 = g_input[uint2(uix1, uiy1)];
-
-        float3 avg = (uv00.xyz + uv10.xyz + uv01.xyz + uv11.xyz) * 0.25f;
-
-        float Uf = -0.169f * avg.r - 0.331f * avg.g + 0.500f * avg.b;
-        float Vf = 0.500f * avg.r - 0.419f * avg.g - 0.081f * avg.b;
-
-        Uf = Uf * (224.0f / 255.0f) + (128.0f / 255.0f);
-        Vf = Vf * (224.0f / 255.0f) + (128.0f / 255.0f);
-
-        uint U = (uint)round(Uf * 255.0f);
-        uint V = (uint)round(Vf * 255.0f);
-        U = min(max(U, 16u), 240u);
-        V = min(max(V, 16u), 240u);
-
-        g_uvOut[uint2(dx >> 1, dy >> 1)] = uint2(U, V);
-    }
-}
-)";
 
 static void bgraToNv12(const uint8_t* bgra, int sw, int sh,
                         uint8_t* yPlane, uint8_t* uvPlane,
@@ -184,8 +108,8 @@ bool MediaEncoder::init(ID3D11Device* device, int srcW, int srcH, int dstW, int 
         d3dDevice_->AddRef();
         d3dDevice_->GetImmediateContext(&d3dContext_);
 
-        if (!initComputeShader()) {
-            std::cerr << "[MediaEncoder] Compute shader init failed, using CPU path" << std::endl;
+        if (!initVideoProcessor()) {
+            std::cerr << "[MediaEncoder] VideoProcessor init failed, using CPU path" << std::endl;
         }
     }
 
@@ -198,114 +122,107 @@ bool MediaEncoder::init(ID3D11Device* device, int srcW, int srcH, int dstW, int 
     initialized_ = true;
     std::cout << "[MediaEncoder] H.264 encoder initialized: "
               << width_ << "x" << height_ << " @ " << fps_ << "fps"
-              << (hasComputeShader_ ? " +GPU(CS)" : " +CPU")
+              << (hasGPUPath_ ? " +GPU(VP)" : " +CPU")
               << std::endl;
     return true;
 }
 
-bool MediaEncoder::initComputeShader() {
-    ID3DBlob* shaderBlob = nullptr;
-    ID3DBlob* errorBlob = nullptr;
+bool MediaEncoder::initVideoProcessor() {
+    HRESULT hr;
 
-    HRESULT hr = D3DCompile(g_csHLSL, strlen(g_csHLSL), nullptr, nullptr, nullptr,
-                            "main", "cs_5_0", 0, 0, &shaderBlob, &errorBlob);
+    ID3D11VideoDevice* videoDev = nullptr;
+    hr = d3dDevice_->QueryInterface(IID_PPV_ARGS(&videoDev));
+    if (FAILED(hr)) return false;
+
+    ID3D11VideoContext* videoCtx = nullptr;
+    hr = d3dContext_->QueryInterface(IID_PPV_ARGS(&videoCtx));
+    if (FAILED(hr)) { videoDev->Release(); return false; }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc = {};
+    vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    vpDesc.InputWidth = srcWidth_;
+    vpDesc.InputHeight = srcHeight_;
+    vpDesc.OutputWidth = alignedW_;
+    vpDesc.OutputHeight = alignedH_;
+    vpDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+
+    ID3D11VideoProcessorEnumerator* vpEnum = nullptr;
+    hr = videoDev->CreateVideoProcessorEnumerator(&vpDesc, &vpEnum);
     if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] D3DCompile failed: 0x" << std::hex << hr << std::dec << std::endl;
-        if (errorBlob) {
-            std::cerr << "  Errors: " << (const char*)errorBlob->GetBufferPointer() << std::endl;
-            errorBlob->Release();
-        }
+        videoDev->Release(); videoCtx->Release();
         return false;
     }
 
-    hr = d3dDevice_->CreateComputeShader(shaderBlob->GetBufferPointer(),
-                                         shaderBlob->GetBufferSize(), nullptr, &cs_);
-    shaderBlob->Release();
-    if (errorBlob) errorBlob->Release();
-    if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateComputeShader failed: 0x" << std::hex << hr << std::dec << std::endl;
+    UINT fmtSupported = FALSE;
+    vpEnum->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &fmtSupported);
+    if (!fmtSupported) {
+        vpEnum->Release(); videoDev->Release(); videoCtx->Release();
+        return false;
+    }
+    vpEnum->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &fmtSupported);
+    if (!fmtSupported) {
+        vpEnum->Release(); videoDev->Release(); videoCtx->Release();
         return false;
     }
 
-    D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = sizeof(UINT) * 4;
-    cbDesc.Usage = D3D11_USAGE_DEFAULT;
-    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    hr = d3dDevice_->CreateBuffer(&cbDesc, nullptr, &csConstants_);
+    ID3D11VideoProcessor* vp = nullptr;
+    hr = videoDev->CreateVideoProcessor(vpEnum, 0, &vp);
     if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateBuffer (cb) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        vpEnum->Release(); videoDev->Release(); videoCtx->Release();
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC yDesc = {};
-    yDesc.Width = alignedW_;
-    yDesc.Height = alignedH_;
-    yDesc.MipLevels = 1;
-    yDesc.ArraySize = 1;
-    yDesc.Format = DXGI_FORMAT_R8_UINT;
-    yDesc.SampleDesc.Count = 1;
-    yDesc.Usage = D3D11_USAGE_DEFAULT;
-    yDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    hr = d3dDevice_->CreateTexture2D(&yDesc, nullptr, &yTexture_);
+    D3D11_TEXTURE2D_DESC nv12Desc = {};
+    nv12Desc.Width = alignedW_;
+    nv12Desc.Height = alignedH_;
+    nv12Desc.Format = DXGI_FORMAT_NV12;
+    nv12Desc.MipLevels = 1;
+    nv12Desc.ArraySize = 1;
+    nv12Desc.SampleDesc.Count = 1;
+    nv12Desc.Usage = D3D11_USAGE_DEFAULT;
+    nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D* nv12Tex = nullptr;
+    hr = d3dDevice_->CreateTexture2D(&nv12Desc, nullptr, &nv12Tex);
     if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateTexture2D (Y) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        vp->Release(); vpEnum->Release(); videoDev->Release(); videoCtx->Release();
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC uvDesc = {};
-    uvDesc.Width = alignedW_ / 2;
-    uvDesc.Height = alignedH_ / 2;
-    uvDesc.MipLevels = 1;
-    uvDesc.ArraySize = 1;
-    uvDesc.Format = DXGI_FORMAT_R8G8_UINT;
-    uvDesc.SampleDesc.Count = 1;
-    uvDesc.Usage = D3D11_USAGE_DEFAULT;
-    uvDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    hr = d3dDevice_->CreateTexture2D(&uvDesc, nullptr, &uvTexture_);
+    D3D11_TEXTURE2D_DESC stagingDesc = nv12Desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.BindFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    hr = d3dDevice_->CreateTexture2D(&stagingDesc, nullptr, &staging);
     if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateTexture2D (UV) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        nv12Tex->Release(); vp->Release(); vpEnum->Release();
+        videoDev->Release(); videoCtx->Release();
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC yStagingDesc = yDesc;
-    yStagingDesc.Usage = D3D11_USAGE_STAGING;
-    yStagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    yStagingDesc.BindFlags = 0;
-    hr = d3dDevice_->CreateTexture2D(&yStagingDesc, nullptr, &yStaging_);
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
+    ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    ovDesc.Texture2D.MipSlice = 0;
+    ID3D11VideoProcessorOutputView* outputView = nullptr;
+    hr = videoDev->CreateVideoProcessorOutputView(nv12Tex, vpEnum, &ovDesc, &outputView);
     if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateTexture2D (Y staging) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        staging->Release(); nv12Tex->Release(); vp->Release(); vpEnum->Release();
+        videoDev->Release(); videoCtx->Release();
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC uvStagingDesc = uvDesc;
-    uvStagingDesc.Usage = D3D11_USAGE_STAGING;
-    uvStagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    uvStagingDesc.BindFlags = 0;
-    hr = d3dDevice_->CreateTexture2D(&uvStagingDesc, nullptr, &uvStaging_);
-    if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateTexture2D (UV staging) failed: 0x" << std::hex << hr << std::dec << std::endl;
-        return false;
-    }
+    videoDevice_ = videoDev;
+    videoContext_ = videoCtx;
+    vpEnum_ = vpEnum;
+    videoProcessor_ = vp;
+    nv12Texture_ = nv12Tex;
+    nv12Staging_ = staging;
+    vpOutputView_ = outputView;
 
-    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-    uavDesc.Format = DXGI_FORMAT_R8_UINT;
-    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-    uavDesc.Texture2D.MipSlice = 0;
-    hr = d3dDevice_->CreateUnorderedAccessView(yTexture_, &uavDesc, &yUAV_);
-    if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateUAV (Y) failed: 0x" << std::hex << hr << std::dec << std::endl;
-        return false;
-    }
-
-    uavDesc.Format = DXGI_FORMAT_R8G8_UINT;
-    hr = d3dDevice_->CreateUnorderedAccessView(uvTexture_, &uavDesc, &uvUAV_);
-    if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] CreateUAV (UV) failed: 0x" << std::hex << hr << std::dec << std::endl;
-        return false;
-    }
-
-    hasComputeShader_ = true;
-    std::cout << "[MediaEncoder] Compute shader ready (" << alignedW_ << "x" << alignedH_ << ")" << std::endl;
+    hasGPUPath_ = true;
+    std::cout << "[MediaEncoder] VideoProcessor ready: "
+              << srcWidth_ << "x" << srcHeight_ << " -> "
+              << alignedW_ << "x" << alignedH_ << std::endl;
     return true;
 }
 
@@ -313,91 +230,59 @@ bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
                                       std::vector<uint8_t>& output, bool keyframe) {
     std::lock_guard<std::mutex> lock(mtx_);
     output.clear();
-    if (!initialized_ || !hasComputeShader_) return false;
+    if (!initialized_ || !hasGPUPath_) return false;
 
     HRESULT hr;
 
-    if (bgraTex != cachedInputTex_) {
-        if (inputSRV_) { inputSRV_->Release(); inputSRV_ = nullptr; }
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        hr = d3dDevice_->CreateShaderResourceView(bgraTex, &srvDesc, &inputSRV_);
-        if (FAILED(hr)) {
-            std::cerr << "[MediaEncoder] CreateSRV failed: 0x" << std::hex << hr << std::dec << std::endl;
-            return false;
-        }
-        cachedInputTex_ = bgraTex;
-    }
-
-    UINT csData[] = { (UINT)srcWidth_, (UINT)srcHeight_,
-                      (UINT)alignedW_, (UINT)alignedH_ };
-    d3dContext_->UpdateSubresource(csConstants_, 0, nullptr, csData, 0, 0);
-
-    d3dContext_->CSSetShader(cs_, nullptr, 0);
-    d3dContext_->CSSetConstantBuffers(0, 1, &csConstants_);
-    d3dContext_->CSSetShaderResources(0, 1, &inputSRV_);
-
-    ID3D11UnorderedAccessView* uavs[2] = { yUAV_, uvUAV_ };
-    UINT uavCounts[2] = { 0, 0 };
-    d3dContext_->CSSetUnorderedAccessViews(0, 2, uavs, uavCounts);
-
-    UINT gx = (alignedW_ + 15) / 16;
-    UINT gy = (alignedH_ + 15) / 16;
-    d3dContext_->Dispatch(gx, gy, 1);
-
-    ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
-    d3dContext_->CSSetShaderResources(0, 1, nullSRV);
-    ID3D11UnorderedAccessView* nullUAV[2] = { nullptr, nullptr };
-    UINT nullCount[2] = { 0, 0 };
-    d3dContext_->CSSetUnorderedAccessViews(0, 2, nullUAV, nullCount);
-    d3dContext_->CSSetShader(nullptr, nullptr, 0);
-
-    d3dContext_->CopyResource(yStaging_, yTexture_);
-    d3dContext_->CopyResource(uvStaging_, uvTexture_);
-
-    D3D11_MAPPED_SUBRESOURCE mappedY = {}, mappedUV = {};
-    hr = d3dContext_->Map(yStaging_, 0, D3D11_MAP_READ, 0, &mappedY);
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
+    ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivDesc.Texture2D.MipSlice = 0;
+    ID3D11VideoProcessorInputView* inputView = nullptr;
+    hr = videoDevice_->CreateVideoProcessorInputView(bgraTex, vpEnum_, &ivDesc, &inputView);
     if (FAILED(hr)) {
-        std::cerr << "[MediaEncoder] Map(Y) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        std::cerr << "[MediaEncoder] CreateInputView: 0x" << std::hex << hr << std::dec << std::endl;
         return false;
     }
-    hr = d3dContext_->Map(uvStaging_, 0, D3D11_MAP_READ, 0, &mappedUV);
+
+    D3D11_VIDEO_PROCESSOR_STREAM streamData = {};
+    streamData.Enable = TRUE;
+    streamData.pInputSurface = inputView;
+
+    hr = videoContext_->VideoProcessorBlt(videoProcessor_, vpOutputView_,
+                                           0, 1, &streamData);
+    inputView->Release();
     if (FAILED(hr)) {
-        d3dContext_->Unmap(yStaging_, 0);
-        std::cerr << "[MediaEncoder] Map(UV) failed: 0x" << std::hex << hr << std::dec << std::endl;
+        std::cerr << "[MediaEncoder] VideoProcessorBlt: 0x" << std::hex << hr << std::dec << std::endl;
         return false;
     }
+
+    d3dContext_->CopyResource(nv12Staging_, nv12Texture_);
 
     size_t ySize = size_t(alignedW_) * alignedH_;
     size_t uvSize = ySize / 2;
     std::vector<uint8_t> nv12Buf(ySize + uvSize);
 
-    if (mappedY.RowPitch == (UINT)alignedW_) {
-        memcpy(nv12Buf.data(), mappedY.pData, ySize);
-    } else {
-        for (int y = 0; y < alignedH_; y++) {
-            memcpy(nv12Buf.data() + y * alignedW_,
-                   (uint8_t*)mappedY.pData + y * mappedY.RowPitch, alignedW_);
-        }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = d3dContext_->Map(nv12Staging_, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        std::cerr << "[MediaEncoder] Map: 0x" << std::hex << hr << std::dec << std::endl;
+        return false;
     }
 
+    uint8_t* base = (uint8_t*)mapped.pData;
+    for (int y = 0; y < alignedH_; y++)
+        memcpy(nv12Buf.data() + y * alignedW_, base + y * mapped.RowPitch, alignedW_);
+
+    uint8_t* uvSrc = base + mapped.RowPitch * alignedH_;
     UINT uvRowPitch = (alignedW_ / 2) * 2;
-    if (mappedUV.RowPitch == uvRowPitch) {
-        memcpy(nv12Buf.data() + ySize, mappedUV.pData, uvSize);
-    } else {
-        for (int y = 0; y < alignedH_ / 2; y++) {
-            memcpy(nv12Buf.data() + ySize + y * uvRowPitch,
-                   (uint8_t*)mappedUV.pData + y * mappedUV.RowPitch, uvRowPitch);
-        }
-    }
+    for (int y = 0; y < alignedH_ / 2; y++)
+        memcpy(nv12Buf.data() + ySize + y * uvRowPitch,
+               uvSrc + y * mapped.RowPitch, uvRowPitch);
 
-    d3dContext_->Unmap(uvStaging_, 0);
-    d3dContext_->Unmap(yStaging_, 0);
+    d3dContext_->Unmap(nv12Staging_, 0);
 
     if (!createInputSample(nv12Buf.data(), pts, keyframe)) {
+        std::cerr << "[MediaEncoder] createInputSample failed" << std::endl;
         return false;
     }
 
@@ -667,16 +552,13 @@ void MediaEncoder::cleanup() {
     if (inputType_) { inputType_->Release(); inputType_ = nullptr; }
     if (outputType_) { outputType_->Release(); outputType_ = nullptr; }
 
-    if (cs_) { cs_->Release(); cs_ = nullptr; }
-    if (csConstants_) { csConstants_->Release(); csConstants_ = nullptr; }
-    if (inputSRV_) { inputSRV_->Release(); inputSRV_ = nullptr; }
-    if (yUAV_) { yUAV_->Release(); yUAV_ = nullptr; }
-    if (uvUAV_) { uvUAV_->Release(); uvUAV_ = nullptr; }
-    if (yTexture_) { yTexture_->Release(); yTexture_ = nullptr; }
-    if (uvTexture_) { uvTexture_->Release(); uvTexture_ = nullptr; }
-    if (yStaging_) { yStaging_->Release(); yStaging_ = nullptr; }
-    if (uvStaging_) { uvStaging_->Release(); uvStaging_ = nullptr; }
-    if (cachedInputTex_) { cachedInputTex_ = nullptr; }
+    if (vpOutputView_) { vpOutputView_->Release(); vpOutputView_ = nullptr; }
+    if (nv12Staging_) { nv12Staging_->Release(); nv12Staging_ = nullptr; }
+    if (nv12Texture_) { nv12Texture_->Release(); nv12Texture_ = nullptr; }
+    if (videoProcessor_) { videoProcessor_->Release(); videoProcessor_ = nullptr; }
+    if (vpEnum_) { vpEnum_->Release(); vpEnum_ = nullptr; }
+    if (videoContext_) { videoContext_->Release(); videoContext_ = nullptr; }
+    if (videoDevice_) { videoDevice_->Release(); videoDevice_ = nullptr; }
 
     if (d3dContext_) { d3dContext_->Release(); d3dContext_ = nullptr; }
     if (d3dDevice_) { d3dDevice_->Release(); d3dDevice_ = nullptr; }
@@ -684,6 +566,6 @@ void MediaEncoder::cleanup() {
     MFShutdown();
 
     srcWidth_ = srcHeight_ = width_ = height_ = 0;
-    hasComputeShader_ = false;
+    hasGPUPath_ = false;
     initialized_ = false;
 }
