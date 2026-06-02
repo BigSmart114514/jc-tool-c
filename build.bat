@@ -20,14 +20,6 @@ set CMAKE_PREFIX_PATH=%QT_DIR%
 echo Qt Path: %QT_DIR%
 echo.
 
-:: 检查 FFmpeg
-if not defined FFMPEG_DIR (
-    set FFMPEG_DIR=%~dp0..\ffmpeg
-)
-if not exist "%FFMPEG_DIR%" (
-    echo Warning: FFmpeg not found at %FFMPEG_DIR%
-    echo Please ensure FFmpeg is installed correctly
-)
 
 :: 检查 P2P
 if not defined EASYTIER_DIR (

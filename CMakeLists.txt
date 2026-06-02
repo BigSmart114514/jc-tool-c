@@ -15,7 +15,7 @@ set(EASYTIER_DIR "${CMAKE_SOURCE_DIR}/../easytier")
 if(NOT EXISTS ${EASYTIER_DIR})
     message(FATAL_ERROR "Easytier library not found at ${EASYTIER_DIR}")
 endif()
-include_directories(${EASYTIER_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR}/thirdparty/easytier/include)
 link_directories(${EASYTIER_DIR}/lib)
 
 # libssh
