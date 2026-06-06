@@ -100,6 +100,12 @@ private:
 
     std::mutex decoderMtx_;
 
+    // --- Issue 1: 线程安全退出 ---
+    void safeJoinDecodeThread();
+
+    // --- Issue 3: 初始分辨率自适应 ---
+    bool initialStreamConfigured_ = false;
+
     void checkAndAdjustStreamQuality(); // 新增：评估性能并调整逻辑
 
     void logStatistics();               // 打印函数
@@ -109,6 +115,7 @@ private:
     bool convertToImageCoords(int wx, int wy, int& ix, int& iy);
 
 protected:
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
     void paintEvent(QPaintEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;

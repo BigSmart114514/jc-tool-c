@@ -5,6 +5,8 @@
 #include <QApplication>
 #include <QScreen>
 #include <iostream>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 DesktopWindow::DesktopWindow(QWidget* parent)
     : QWidget(parent) {
@@ -45,11 +47,32 @@ DesktopWindow::DesktopWindow(QWidget* parent)
 DesktopWindow::~DesktopWindow() {
     decoding_ = false;
     queueCV_.notify_all();
-    if (decodeThread_.joinable()) {
-        decodeThread_.detach();
-    }
+    transport_ = nullptr;
+    safeJoinDecodeThread();
     decoderReady_ = false;
     decoder_.cleanup();
+}
+
+void DesktopWindow::safeJoinDecodeThread() {
+    if (!decodeThread_.joinable()) return;
+    auto start = std::chrono::steady_clock::now();
+    const int TIMEOUT_MS = 3000;
+    while (decodeThread_.joinable()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed > TIMEOUT_MS) {
+            decodeThread_.detach();
+            std::cerr << "[Desktop] Decode thread join timeout (" << TIMEOUT_MS
+                      << "ms), detached" << std::endl;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        try {
+            decodeThread_.join();
+            break;
+        } catch (std::system_error&) {
+        }
+    }
 }
 
 void DesktopWindow::init(ITransport* transport) {
@@ -200,6 +223,23 @@ void DesktopWindow::decodeLoop() {
                 frameReadyTime_ = std::chrono::steady_clock::now();
             }
 
+            if (!initialStreamConfigured_) {
+                initialStreamConfigured_ = true;
+                QSize dispSize = displayedImageSize();
+                int targetW = dispSize.width();
+                if (targetW > 0 && targetW < w) {
+                    std::cout << "[Desktop] Initial config: window display width = "
+                              << targetW << ", sending StreamConfig to reduce resolution"
+                              << std::endl;
+                    if (transport_ && transport_->isConnected()) {
+                        auto msg = MessageBuilder::StreamConfigMsg(
+                            targetW, currentFps_, currentKfIntervalSec_);
+                        transport_->send(msg);
+                        pendingResizeWidth_ = targetW;
+                    }
+                }
+            }
+
             emit frameReady(); 
         } else {
             if (transport_ && transport_->isConnected()) {
@@ -256,7 +296,47 @@ bool DesktopWindow::convertToImageCoords(int wx, int wy, int& ix, int& iy) {
     return true;
 }
 
+bool DesktopWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+    MSG* msg = static_cast<MSG*>(message);
+    if (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN ||
+        msg->message == WM_KEYUP || msg->message == WM_SYSKEYUP) {
+
+        bool isSystemKey = false;
+        switch (msg->wParam) {
+            case VK_LWIN:
+            case VK_RWIN:
+            case VK_APPS:
+            case VK_SNAPSHOT:
+                isSystemKey = true;
+                break;
+            case VK_TAB:
+                if (GetAsyncKeyState(VK_MENU) & 0x8000) isSystemKey = true;
+                break;
+            case VK_F4:
+                if (GetAsyncKeyState(VK_MENU) & 0x8000) isSystemKey = true;
+                break;
+            case VK_ESCAPE:
+                if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+                    (GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+                    (GetAsyncKeyState(VK_MENU) & 0x8000)) isSystemKey = true;
+                break;
+        }
+
+        if (isSystemKey && pEnableKeyboard_ && pEnableKeyboard_->load()) {
+            bool isUp = (msg->message == WM_KEYUP || msg->message == WM_SYSKEYUP);
+            sendInput({1, 0, 0, static_cast<int32_t>(msg->wParam), isUp ? 1 : 0});
+            *result = 1;
+            return true;
+        }
+    }
+    return false;
+}
+
 void DesktopWindow::closeEvent(QCloseEvent* event) {
+    if (transport_ && transport_->isConnected()) {
+        auto msg = MessageBuilder::ClientDisconnect();
+        transport_->send(msg);
+    }
     emit closed();
     event->accept();
 }
@@ -264,17 +344,20 @@ void DesktopWindow::closeEvent(QCloseEvent* event) {
 void DesktopWindow::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_F12) {
         emit openFileManager();
+        event->accept();
         return;
     }
     if (pEnableKeyboard_ && pEnableKeyboard_->load()) {
         sendInput({1, 0, 0, static_cast<int32_t>(event->nativeVirtualKey()), 0});
     }
+    event->accept();
 }
 
 void DesktopWindow::keyReleaseEvent(QKeyEvent* event) {
     if (pEnableKeyboard_ && pEnableKeyboard_->load()) {
         sendInput({1, 0, 0, static_cast<int32_t>(event->nativeVirtualKey()), 1});
     }
+    event->accept();
 }
 
 void DesktopWindow::mousePressEvent(QMouseEvent* event) {

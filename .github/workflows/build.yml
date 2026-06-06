@@ -36,13 +36,6 @@ jobs:
         with:
           arch: x64
 
-      # ---------- FFmpeg (minimal) ----------
-      - name: Download FFmpeg
-        uses: actions/download-artifact@v4
-        with:
-          name: ffmpeg-windows
-          path: ${{ github.workspace }}/../ffmpeg-minimal
-
       # ---------- EasyTier ----------
       - name: Download EasyTier FFI artifact
         shell: pwsh

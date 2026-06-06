@@ -76,6 +76,16 @@ void DesktopService::onMessage(const BinaryData& data) {
             keyframeRequested_ = true;
             break;
         
+        case Desktop::MsgType::ClientDisconnect:
+            std::cout << "[Desktop] Client requested disconnect, stopping stream" << std::endl;
+            clientReady_ = false;
+            configChanged_ = false;
+            {
+                std::lock_guard<std::mutex> lock(inputMtx_);
+                while (!inputQueue_.empty()) inputQueue_.pop();
+            }
+            break;
+
         case Desktop::MsgType::StreamConfig: {
             if (data.size() >= 1 + sizeof(Desktop::StreamConfig)) {
                 Desktop::StreamConfig cfg;

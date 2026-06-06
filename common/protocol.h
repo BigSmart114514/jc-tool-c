@@ -42,7 +42,8 @@ namespace Desktop {
         ScreenInfo      = 0x03,
         ClientReady     = 0x04,
         KeyframeRequest = 0x05,
-        StreamConfig    = 0x06  // 新增：流配置
+        StreamConfig    = 0x06,  // 新增：流配置
+        ClientDisconnect = 0x07 // 新增：客户端断开通知
     };
 
     #pragma pack(push, 1)
@@ -200,6 +201,10 @@ namespace MessageBuilder {
 
     inline BinaryData ClientReady() {
         return { static_cast<uint8_t>(Desktop::MsgType::ClientReady) };
+    }
+
+    inline BinaryData ClientDisconnect() {
+        return { static_cast<uint8_t>(Desktop::MsgType::ClientDisconnect) };
     }
 
     // 文件管理
