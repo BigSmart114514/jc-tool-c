@@ -4,6 +4,7 @@
 #include <QDialog>
 #include <QLineEdit>
 #include <QCheckBox>
+#include <QPushButton>
 #include <string>
 
 struct ConnectionConfig {
@@ -18,12 +19,6 @@ struct ConnectionConfig {
 
     // EasyTier
     bool useEasyTier = false;
-    std::string easytierInstanceName;
-    std::string easytierNetworkName;
-    std::string easytierNetworkSecret;
-    std::string easytierIpv4;
-    int easytierListenPort = 11012;
-    std::string easytierPeerUrl;
     std::string easytierServerVip;        // 服务器的 VPN 虚拟 IP（用于 SSH/SFTP/Desktop）
 };
 
@@ -36,6 +31,7 @@ public:
 private slots:
     void onConnect();
     void onEasyTierToggled(bool checked);
+    void onManageService();
 
 private:
     void createUI();
@@ -49,13 +45,8 @@ private:
     QLineEdit* leDesktopPort_;
 
     QCheckBox* chkEasyTier_;
-    QLineEdit* leInstName_;
-    QLineEdit* leNetName_;
-    QLineEdit* leNetSecret_;
-    QLineEdit* leIpv4_;
     QLineEdit* leServerVip_;
-    QLineEdit* leListenPort_;
-    QLineEdit* lePeerUrl_;
+    QPushButton* btnManageService_;
 };
 
 #endif

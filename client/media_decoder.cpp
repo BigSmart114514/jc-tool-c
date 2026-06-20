@@ -20,17 +20,32 @@ static const GUID CLSID_H264DecoderMFT =
 void MediaDecoder::nv12ToBgra(const uint8_t* nv12, uint8_t* bgra, int w, int h, int strideY, int strideUV, int alignedH) {
     const uint8_t* yPlane = nv12;
     const uint8_t* uvPlane = nv12 + strideY * alignedH;
+    int halfW = (w + 1) / 2;
+    int halfH = (h + 1) / 2;
 
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             uint8_t Y = yPlane[y * strideY + x];
-            int uvi = (y / 2) * strideUV + (x / 2) * 2;
-            uint8_t U = uvPlane[uvi];
-            uint8_t V = uvPlane[uvi + 1];
+
+            float fx = (x & 1) * 0.5f;
+            float fy = (y & 1) * 0.5f;
+            int ux = x / 2, uy = y / 2;
+            int ux1 = std::min(ux + 1, halfW - 1);
+            int uy1 = std::min(uy + 1, halfH - 1);
+
+            int off00 = uy * strideUV + ux * 2;
+            int off10 = uy * strideUV + ux1 * 2;
+            int off01 = uy1 * strideUV + ux * 2;
+            int off11 = uy1 * strideUV + ux1 * 2;
+
+            float U = (1-fy)*((1-fx)*uvPlane[off00] + fx*uvPlane[off10])
+                    + fy*((1-fx)*uvPlane[off01] + fx*uvPlane[off11]);
+            float V = (1-fy)*((1-fx)*uvPlane[off00+1] + fx*uvPlane[off10+1])
+                    + fy*((1-fx)*uvPlane[off01+1] + fx*uvPlane[off11+1]);
 
             int C = Y - 16;
-            int D = U - 128;
-            int E = V - 128;
+            int D = (int)(U + 0.5f) - 128;
+            int E = (int)(V + 0.5f) - 128;
 
             int R = (298 * C + 409 * E + 128) >> 8;
             int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
@@ -142,7 +157,7 @@ bool MediaDecoder::initDecoder() {
     outputType_->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     MFSetAttributeSize(outputType_, MF_MT_FRAME_SIZE, alignedW_, alignedH_);
     outputType_->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    outputType_->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_SMPTE170M);
+    outputType_->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
     outputType_->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
 
     hr = decoder_->SetOutputType(0, outputType_, 0);
@@ -226,7 +241,8 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
         IMFSample* userSample = nullptr;
         MFCreateSample(&userSample);
         IMFMediaBuffer* userBuf = nullptr;
-        MFCreateMemoryBuffer(4 * 1024 * 1024, &userBuf);
+        size_t bufSize = (size_t)alignedW_ * alignedH_ * 3 / 2;
+        MFCreateMemoryBuffer((DWORD)bufSize, &userBuf);
         if (userSample && userBuf) {
             userSample->AddBuffer(userBuf);
             userBuf->Release();

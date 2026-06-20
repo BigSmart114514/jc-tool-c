@@ -86,7 +86,7 @@ bool MediaEncoder::init(ID3D11Device* device, int srcW, int srcH, int dstW, int 
 
     int encW = dstW;
     int encH = dstH;
-    const int kMaxEncWidth = 2560;
+    const int kMaxEncWidth = 3840;
     if (encW > kMaxEncWidth) {
         encH = encH * kMaxEncWidth / encW;
         encW = kMaxEncWidth;
@@ -144,7 +144,7 @@ bool MediaEncoder::initVideoProcessor() {
     vpDesc.InputHeight = srcHeight_;
     vpDesc.OutputWidth = alignedW_;
     vpDesc.OutputHeight = alignedH_;
-    vpDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+    vpDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_QUALITY;
 
     ID3D11VideoProcessorEnumerator* vpEnum = nullptr;
     hr = videoDev->CreateVideoProcessorEnumerator(&vpDesc, &vpEnum);
@@ -215,6 +215,10 @@ bool MediaEncoder::initVideoProcessor() {
     videoContext_ = videoCtx;
     vpEnum_ = vpEnum;
     videoProcessor_ = vp;
+
+    // Enable hardware filter: edge enhancement (noise reduction removed - it blurs image)
+    videoCtx->VideoProcessorSetStreamFilter(vp, 0, D3D11_VIDEO_PROCESSOR_FILTER_EDGE_ENHANCEMENT, TRUE, 15);
+
     nv12Texture_ = nv12Tex;
     nv12Staging_ = staging;
     vpOutputView_ = outputView;
@@ -323,11 +327,42 @@ bool MediaEncoder::initEncoder() {
     }
     std::cout << "[MediaEncoder] Encoder created" << std::endl;
 
+    // Log which encoder MFT is being used
+    WCHAR* friendlyName = nullptr;
+    UINT32 nameLen = 0;
+    IMFAttributes* encAttr = nullptr;
+    if (SUCCEEDED(encoder_->GetAttributes(&encAttr)) &&
+        SUCCEEDED(encAttr->GetString(MFT_FRIENDLY_NAME_Attribute, nullptr, 0, &nameLen)) &&
+        nameLen > 0) {
+        friendlyName = new WCHAR[nameLen];
+        if (SUCCEEDED(encAttr->GetString(MFT_FRIENDLY_NAME_Attribute, friendlyName, nameLen, &nameLen))) {
+            char buf[256];
+            int len = WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, buf, sizeof(buf), nullptr, nullptr);
+            if (len > 0) std::cout << "[MediaEncoder] Encoder MFT: " << buf << std::endl;
+        }
+        delete[] friendlyName;
+    }
+    if (encAttr) encAttr->Release();
+
     IMFAttributes* mftAttr = nullptr;
     if (SUCCEEDED(encoder_->GetAttributes(&mftAttr))) {
         mftAttr->SetUINT32(MF_LOW_LATENCY, TRUE);
         mftAttr->Release();
         std::cout << "[MediaEncoder] MF_LOW_LATENCY set on MFT attributes" << std::endl;
+    }
+
+    ICodecAPI* rcApi = nullptr;
+    if (SUCCEEDED(encoder_->QueryInterface(IID_PPV_ARGS(&rcApi)))) {
+        VARIANT var;
+        var.vt = VT_UI4;
+        var.ulVal = eAVEncCommonRateControlMode_Quality;
+        rcApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
+        var.ulVal = 100;
+        rcApi->SetValue(&CODECAPI_AVEncCommonQuality, &var);
+        var.ulVal = 100;
+        rcApi->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &var);
+        rcApi->Release();
+        std::cout << "[MediaEncoder] Quality mode (VBR, Q=100, QvS=100) set before SetOutputType" << std::endl;
     }
 
     IMFMediaType* outputType = nullptr;
@@ -337,9 +372,9 @@ bool MediaEncoder::initEncoder() {
     outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     outputType->SetUINT32(MF_MT_AVG_BITRATE, bitrate_);
     outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    outputType->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_SMPTE170M);
+    outputType->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
     outputType->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
-    outputType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+    outputType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
     MFSetAttributeSize(outputType, MF_MT_FRAME_SIZE, alignedW_, alignedH_);
     MFSetAttributeRatio(outputType, MF_MT_FRAME_RATE, fps_, 1);
     hr = encoder_->SetOutputType(0, outputType, 0);
@@ -376,12 +411,15 @@ bool MediaEncoder::initEncoder() {
         codecApi->SetValue(&CODECAPI_AVEncCommonRealTime, &var);
         codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &var);
         var.vt = VT_UI4;
-        var.ulVal = 100;
-        codecApi->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &var);
-        var.ulVal = 1;
+        var.ulVal = 4;
         codecApi->SetValue(&CODECAPI_AVEncVideoMaxNumRefFrame, &var);
+
+        var.vt = VT_BOOL;
+        var.boolVal = VARIANT_TRUE;
+        codecApi->SetValue(&CODECAPI_AVEncH264CABACEnable, &var);
+
         codecApi->Release();
-        std::cout << "[MediaEncoder] Low-latency mode enabled via ICodecAPI" << std::endl;
+        std::cout << "[MediaEncoder] Low-latency + CABAC enabled via ICodecAPI" << std::endl;
     } else {
         std::cout << "[MediaEncoder] ICodecAPI not supported, encoder may have latency" << std::endl;
     }

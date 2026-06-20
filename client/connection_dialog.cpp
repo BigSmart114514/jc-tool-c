@@ -1,4 +1,5 @@
 #include "connection_dialog.h"
+#include "service_manager_dialog.h"
 #include <QVBoxLayout>
 #include <QFormLayout>
 #include <QPushButton>
@@ -45,32 +46,22 @@ void ConnectionDialog::createUI() {
     mainLayout->addWidget(desktopGroup);
 
     // EasyTier group
-    QGroupBox* etGroup = new QGroupBox("EasyTier VPN (Optional)");
+    QGroupBox* etGroup = new QGroupBox("EasyTier VPN (via System Service)");
     QVBoxLayout* etLayout = new QVBoxLayout(etGroup);
 
-    chkEasyTier_ = new QCheckBox("Use EasyTier virtual network");
+    chkEasyTier_ = new QCheckBox("Route traffic through EasyTier VPN");
     connect(chkEasyTier_, &QCheckBox::toggled, this, &ConnectionDialog::onEasyTierToggled);
     etLayout->addWidget(chkEasyTier_);
 
     QFormLayout* etForm = new QFormLayout();
-    leInstName_ = new QLineEdit("jc-client");
-    leNetName_ = new QLineEdit("jc-tool-vpn");
-    leNetSecret_ = new QLineEdit();
-    leNetSecret_->setPlaceholderText("Enter network key");
-    leIpv4_ = new QLineEdit();
-    leIpv4_->setPlaceholderText("Leave empty for auto-assign");
-    leListenPort_ = new QLineEdit("11012");
-    lePeerUrl_ = new QLineEdit("tcp://225284.xyz:11010");
     leServerVip_ = new QLineEdit();
     leServerVip_->setPlaceholderText("Server's VPN virtual IP (e.g. 10.144.0.1)");
-
-    etForm->addRow("Instance name:", leInstName_);
-    etForm->addRow("Network name:", leNetName_);
-    etForm->addRow("Network key:", leNetSecret_);
-    etForm->addRow("My Virtual IP:", leIpv4_);
     etForm->addRow("Server Virtual IP:", leServerVip_);
-    etForm->addRow("Listen port:", leListenPort_);
-    etForm->addRow("Peer URL:", lePeerUrl_);
+
+    btnManageService_ = new QPushButton("Manage EasyTier Service...");
+    connect(btnManageService_, &QPushButton::clicked, this, &ConnectionDialog::onManageService);
+    etForm->addRow("", btnManageService_);
+
     etLayout->addLayout(etForm);
 
     onEasyTierToggled(false);
@@ -89,13 +80,13 @@ void ConnectionDialog::createUI() {
 }
 
 void ConnectionDialog::onEasyTierToggled(bool checked) {
-    leInstName_->setEnabled(checked);
-    leNetName_->setEnabled(checked);
-    leNetSecret_->setEnabled(checked);
-    leIpv4_->setEnabled(checked);
     leServerVip_->setEnabled(checked);
-    leListenPort_->setEnabled(checked);
-    lePeerUrl_->setEnabled(checked);
+    btnManageService_->setEnabled(checked);
+}
+
+void ConnectionDialog::onManageService() {
+    ServiceManagerDialog dlg(this);
+    dlg.exec();
 }
 
 void ConnectionDialog::onConnect() {
@@ -120,13 +111,7 @@ void ConnectionDialog::onConnect() {
     config_.desktopPort = leDesktopPort_->text().toInt();
 
     config_.useEasyTier = chkEasyTier_->isChecked();
-    config_.easytierInstanceName = leInstName_->text().toStdString();
-    config_.easytierNetworkName = leNetName_->text().toStdString();
-    config_.easytierNetworkSecret = leNetSecret_->text().toStdString();
-    config_.easytierIpv4 = leIpv4_->text().toStdString();
     config_.easytierServerVip = leServerVip_->text().toStdString();
-    config_.easytierListenPort = leListenPort_->text().toInt();
-    config_.easytierPeerUrl = lePeerUrl_->text().toStdString();
 
     accept();
 }

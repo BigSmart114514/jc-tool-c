@@ -12,11 +12,12 @@
 
 #include "../common/protocol.h"
 #include "../common/transport_tcp.h"
-#include "../common/easytier_manager.h"
+#include "../common/easytier_control.h"
 #include "../common/ssh_session.h"
 
 #include "../client/control_panel.h"
 #include "../client/connection_dialog.h"
+#include "../client/service_manager_dialog.h"
 #include "../server/desktop_service.h"
 #include "../server/file_service.h"
 #include "../server/ssh_server.h"
@@ -34,40 +35,9 @@ int runClient() {
     std::string targetHost = cfg.host;
     int desktopPort = cfg.desktopPort;
 
-    std::unique_ptr<EasytierManager> easytierMgr;
-    std::string modeText = "SSH+SFTP";
-    std::string connectInfo;
-
-    // EasyTier setup
-    if (cfg.useEasyTier) {
-        modeText = "EasyTier + SSH+SFTP";
-        std::string toml = EasytierManager::MakeConfig(
-            cfg.easytierInstanceName,
-            cfg.easytierNetworkName,
-            cfg.easytierNetworkSecret,
-            cfg.easytierIpv4,
-            cfg.easytierListenPort,
-            cfg.easytierPeerUrl
-        );
-
-        easytierMgr = std::make_unique<EasytierManager>(toml);
-        if (!easytierMgr->start()) {
-            QMessageBox::critical(nullptr, "EasyTier Error", "Could not start EasyTier network.");
-            return 1;
-        }
-
-        // 如果用户提供了服务器的 VPN 虚拟 IP，则用它将所有流量走 EasyTier
-        if (!cfg.easytierServerVip.empty()) {
-            targetHost = cfg.easytierServerVip;
-        }
-
-        QMessageBox::information(nullptr, "EasyTier Connected",
-            "Your virtual IP: " + QString::fromStdString(easytierMgr->getVirtualIp()));
-
-        connectInfo = "SSH: " + targetHost + ":" + std::to_string(cfg.sshPort)
-                     + " | VPN: " + easytierMgr->getVirtualIp();
-    } else {
-        connectInfo = cfg.host + ":" + std::to_string(cfg.sshPort);
+    // 如果启用 EasyTier，使用服务提供的 VPN 虚拟 IP 作为连接目标
+    if (cfg.useEasyTier && !cfg.easytierServerVip.empty()) {
+        targetHost = cfg.easytierServerVip;
     }
 
     // Connect SSH
@@ -76,7 +46,6 @@ int runClient() {
         QMessageBox::critical(nullptr, "SSH Connection Failed",
             QString::fromStdString(sshSession->getError()));
         delete sshSession;
-        if (easytierMgr) easytierMgr->stop();
         return 1;
     }
 
@@ -96,6 +65,14 @@ int runClient() {
         desktopTransport = nullptr;
     } else {
         desktopTransportPtr = desktopTransport;
+    }
+
+    std::string connectInfo = targetHost + ":" + std::to_string(cfg.sshPort);
+    std::string modeText = "SSH+SFTP";
+    if (cfg.useEasyTier) {
+        modeText = "EasyTier + SSH+SFTP";
+        connectInfo = "SSH: " + targetHost + ":" + std::to_string(cfg.sshPort)
+                     + " | via EasyTier Service";
     }
 
     ControlPanelConfig panelConfig;
@@ -124,7 +101,6 @@ int runClient() {
         sshSession->disconnect();
         delete sshSession;
     }
-    if (easytierMgr) easytierMgr->stop();
 
     return result;
 }
@@ -134,81 +110,68 @@ int runServer() {
     timeBeginPeriod(1);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        nullptr, "Transport Mode",
-        "Use EasyTier virtual network?",
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
-    bool useEasyTier = (reply == QMessageBox::Yes);
-
-    std::unique_ptr<EasytierManager> easytierMgr;
-    std::string myVirtualIp;
     int desktopPort = Config::DEFAULT_DESKTOP_PORT;
     int filePort = Config::DEFAULT_FILE_PORT;
     int sshPort = 2223;
     std::string sshPassword;
+    std::string myVirtualIp;
+
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        nullptr, "Transport Mode",
+        "Use EasyTier virtual network?\n\nMake sure the EasyTier service is installed and running.",
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+    bool useEasyTier = (reply == QMessageBox::Yes);
 
     if (useEasyTier) {
-        QDialog dlg;
-        dlg.setWindowTitle("Server - EasyTier Setup");
-        dlg.setMinimumWidth(420);
-        QFormLayout form(&dlg);
-
-        QLineEdit* leInstName   = new QLineEdit("jc-server");
-        QLineEdit* leNetName    = new QLineEdit("jc-tool-vpn");
-        QLineEdit* leNetSecret  = new QLineEdit("your_secret_here");
-        QLineEdit* leIpv4       = new QLineEdit("");
-        QLineEdit* leListenPort = new QLineEdit("11011");
-        QLineEdit* lePeerUrl    = new QLineEdit("tcp://225284.xyz:11010");
-
-        QLineEdit* leDesktopPort = new QLineEdit(QString::number(Config::DEFAULT_DESKTOP_PORT));
-        QLineEdit* leFilePort    = new QLineEdit(QString::number(Config::DEFAULT_FILE_PORT));
-        QLineEdit* leSshPort     = new QLineEdit("2223");
-        QLineEdit* leSshPassword = new QLineEdit();
-        leSshPassword->setEchoMode(QLineEdit::Password);
-
-        form.addRow("Instance Name:", leInstName);
-        form.addRow("Network Name:", leNetName);
-        form.addRow("Network Secret:", leNetSecret);
-        form.addRow("Virtual IPv4:", leIpv4);
-        form.addRow("Listen Port:", leListenPort);
-        form.addRow("Public Peer URL:", lePeerUrl);
-        form.addRow("Desktop Service Port:", leDesktopPort);
-        form.addRow("File Service Port:", leFilePort);
-        form.addRow("SSH Server Port:", leSshPort);
-        form.addRow("SSH Password:", leSshPassword);
-
-        QPushButton* btnStart = new QPushButton("Start Server");
-        form.addRow(btnStart);
-        QObject::connect(btnStart, &QPushButton::clicked, &dlg, &QDialog::accept);
-
-        if (dlg.exec() != QDialog::Accepted) {
-            timeEndPeriod(1);
-            return 0;
+        EasyTierControlClient client;
+        if (!client.connect(3000)) {
+            QMessageBox::StandardButton openMgr = QMessageBox::question(
+                nullptr, "EasyTier Service Not Found",
+                "Cannot connect to EasyTier service.\n\n"
+                "Open Service Manager to install/start it?",
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+            if (openMgr == QMessageBox::Yes) {
+                client.disconnect();
+                ServiceManagerDialog mgrDlg;
+                mgrDlg.exec();
+                if (!client.connect(3000)) {
+                    QMessageBox::warning(nullptr, "Still Not Connected",
+                        "EasyTier service is still not available. Starting without VPN.");
+                    useEasyTier = false;
+                }
+            } else {
+                useEasyTier = false;
+            }
         }
 
-        desktopPort = leDesktopPort->text().toInt();
-        filePort    = leFilePort->text().toInt();
-        sshPort     = leSshPort->text().toInt();
-        sshPassword = leSshPassword->text().toStdString();
-
-        std::string toml = EasytierManager::MakeConfig(
-            leInstName->text().toStdString(),
-            leNetName->text().toStdString(),
-            leNetSecret->text().toStdString(),
-            leIpv4->text().toStdString(),
-            leListenPort->text().toInt(),
-            lePeerUrl->text().toStdString()
-        );
-
-        easytierMgr = std::make_unique<EasytierManager>(toml);
-        if (!easytierMgr->start()) {
-            QMessageBox::critical(nullptr, "EasyTier Error", "Could not start EasyTier network.");
-            timeEndPeriod(1);
-            return 1;
+        if (useEasyTier) {
+            std::string state, ip;
+            uint32_t uptime;
+            if (client.getStatus(state, ip, uptime) && state == "running") {
+                myVirtualIp = ip;
+            } else {
+                QMessageBox::StandardButton startBtn = QMessageBox::question(
+                    nullptr, "EasyTier Not Running",
+                    "EasyTier service is not running. Start it now?",
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+                if (startBtn == QMessageBox::Yes) {
+                    client.start();
+                    Sleep(2000); // brief wait for IP assignment
+                    client.getStatus(state, ip, uptime);
+                    myVirtualIp = ip;
+                }
+                if (myVirtualIp.empty()) {
+                    QMessageBox::warning(nullptr, "No VPN IP",
+                        "Could not get a virtual IP. Starting without VPN.");
+                    useEasyTier = false;
+                }
+            }
+            client.disconnect();
         }
-        myVirtualIp = easytierMgr->getVirtualIp();
-    } else {
-        myVirtualIp = "Direct TCP (not using EasyTier)";
+    }
+
+    if (!useEasyTier) {
+        myVirtualIp = "Direct TCP";
         bool ok;
         QString pwd = QInputDialog::getText(nullptr, "SSH Server Password",
             "Set password for SSH access:", QLineEdit::Password, "", &ok);
@@ -255,7 +218,7 @@ int runServer() {
     QVBoxLayout vLayout(&statusWin);
 
     if (useEasyTier) {
-        vLayout.addWidget(new QLabel(QString("Virtual IP: %1").arg(myVirtualIp.c_str())));
+        vLayout.addWidget(new QLabel(QString("Virtual IP: %1 (EasyTier Service)").arg(myVirtualIp.c_str())));
     } else {
         vLayout.addWidget(new QLabel("Mode: Direct TCP (no VPN)"));
     }
@@ -273,14 +236,11 @@ int runServer() {
     QObject::connect(btnStop, &QPushButton::clicked, [&]() {
         std::cout << "[Server] Stop requested..." << std::endl;
         statusWin.hide();
-        // Stop service loops immediately (non-blocking for threads that block
-        // on I/O — those threads are detached and will exit on their own).
         sshServer.stop();
         desktopService.stop();
         fileService.stop();
         desktopTCP->stop();
         fileTCP->stop();
-        if (easytierMgr) easytierMgr->stop();
         qApp->quit();
     });
     statusWin.show();

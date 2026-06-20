@@ -51,6 +51,7 @@ set(APP_SOURCES
     client/sftp_window.cpp
     client/ssh_terminal.cpp
     client/connection_dialog.cpp
+    client/service_manager_dialog.cpp
     client/media_decoder.cpp
     server/desktop_service.cpp
     server/file_service.cpp
@@ -58,7 +59,7 @@ set(APP_SOURCES
     server/screen_capture.cpp
     server/ssh_server.cpp
     common/transport_tcp.cpp
-    common/easytier_manager.cpp
+    common/easytier_control.cpp
     common/ssh_session.cpp
 )
 
@@ -68,13 +69,14 @@ set(APP_HEADERS
     client/sftp_window.h
     client/ssh_terminal.h
     client/connection_dialog.h
+    client/service_manager_dialog.h
     client/media_decoder.h
     server/desktop_service.h
     server/file_service.h
     server/media_encoder.h
     server/screen_capture.h
     server/ssh_server.h
-    common/easytier_manager.h
+    common/easytier_control.h
     common/ssh_session.h
 )
 
@@ -99,7 +101,30 @@ set_target_properties(RemoteControl PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/Debug
 )
 
+# ======================= EasyTierService (常驻 SYSTEM 服务) =======================
+# 独立的 Windows Service 程序，以 SYSTEM 权限运行 EasyTier，通过 Named Pipe 与 RemoteControl 通讯
+add_executable(EasyTierService
+    service/service_main.cpp
+    service/easytier_service.cpp
+    common/easytier_control.cpp
+    common/easytier_manager.cpp
+)
+target_include_directories(EasyTierService PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/thirdparty/easytier/include
+)
+target_link_libraries(EasyTierService
+    ws2_32
+    crypt32
+    easytier_ffi
+)
+set_target_properties(EasyTierService PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/Debug
+)
+
 # 复制 DLL
+
 if(WIN32)
     # 可靠地获取 Qt bin 目录
     find_program(QT_QMAKE_EXECUTABLE qmake HINTS ${Qt6_DIR} ENV Qt6_DIR REQUIRED)
@@ -132,5 +157,11 @@ if(WIN32)
         # 根据需要添加其他平台插件
         # COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qdirect2d.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
         COMMENT "Copying runtime DLLs, Qt platform plugin, and ConPTY binaries..."
+    )
+
+    # EasyTierService 也需要 easytier DLL
+    add_custom_command(TARGET EasyTierService POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EASYTIER_DLLS} $<TARGET_FILE_DIR:EasyTierService>
+        COMMENT "Copying EasyTier DLLs for EasyTierService..."
     )
 endif()

@@ -1,5 +1,6 @@
 #include "desktop_service.h"
 #include <iostream>
+#include <algorithm>
 
 DesktopService::DesktopService() {}
 DesktopService::~DesktopService() { stop(); }
@@ -14,8 +15,9 @@ bool DesktopService::init() {
     targetFps_ = Config::FPS;
     targetKfIntervalSec_ = 5; // 默认5秒
 
+    int bitrate = std::max(10000000, targetWidth_ * targetHeight_ * 4);
     if (!encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
-                        targetWidth_, targetHeight_, targetFps_, Config::VIDEO_BITRATE)) {
+                        targetWidth_, targetHeight_, targetFps_, bitrate)) {
         std::cerr << "[Desktop] Encoder init failed" << std::endl;
         return false;
     }
@@ -164,8 +166,9 @@ void DesktopService::captureLoop() {
         if (configChanged_ && isTimeForKeyframe) {
             std::cout << "[Desktop] Applying new config and forcing keyframe..." << std::endl;
             encoder_.cleanup();
+            int configBitrate = std::max(10000000, targetWidth_ * targetHeight_ * 4);
             if (!encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
-                               targetWidth_, targetHeight_, targetFps_, Config::VIDEO_BITRATE)) {
+                               targetWidth_, targetHeight_, targetFps_, configBitrate)) {
                 std::cerr << "[Desktop] Encoder init failed during config change" << std::endl;
                 configChanged_ = false;
                 return;
