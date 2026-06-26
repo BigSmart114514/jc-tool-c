@@ -107,7 +107,6 @@ add_executable(EasyTierService
     service/service_main.cpp
     service/easytier_service.cpp
     common/easytier_control.cpp
-    common/easytier_manager.cpp
 )
 target_include_directories(EasyTierService PRIVATE
     ${CMAKE_SOURCE_DIR}

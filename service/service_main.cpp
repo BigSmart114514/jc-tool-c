@@ -7,6 +7,7 @@
 static EasyTierService g_service;
 static SERVICE_STATUS_HANDLE g_statusHandle = NULL;
 static std::thread g_pipeThread;
+std::atomic<bool> stopRequested_{false};
 
 static void WINAPI ServiceMain(DWORD argc, LPWSTR* argv);
 static DWORD WINAPI ServiceCtrlHandler(DWORD ctrl, DWORD type, LPVOID data, LPVOID ctx);
@@ -43,7 +44,7 @@ int wmain(int argc, wchar_t* argv[]) {
             if (line == "restart") g_service.restartEasyTier();
             if (line == "status")
                 printf("  running=%d  ip=%s\n",
-                    g_service.isRunning(), g_service.getVirtualIp().c_str());
+                    g_service.isActive(), g_service.getVirtualIp().c_str());
         }
         SignalShutdown();
         if (g_pipeThread.joinable()) g_pipeThread.join();
@@ -94,7 +95,7 @@ static DWORD WINAPI ServiceCtrlHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
 }
 
 static void SignalShutdown() {
-    g_service.requestStop();
+    stopRequested_ = true;
     for (int i = 0; i < 15; ++i) {
         HANDLE hPipe = CreateFileW(EASYTIER_PIPE_NAME,
             GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
@@ -117,14 +118,14 @@ static void SignalShutdown() {
 }
 
 static void PipeServerLoop() {
-    while (!g_service.isStopRequested()) {
+    while (!stopRequested_) {
         HANDLE hPipe = CreateNamedPipeW(EASYTIER_PIPE_NAME,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, NULL);
         if (hPipe == INVALID_HANDLE_VALUE) { Sleep(100); continue; }
 
-        if (g_service.isStopRequested()) {
+        if (stopRequested_) {
             CloseHandle(hPipe);
             break;
         }
@@ -140,7 +141,7 @@ static void PipeServerLoop() {
 }
 
 static void HandleClient(HANDLE hPipe) {
-    while (!g_service.isStopRequested()) {
+    while (!stopRequested_) {
         EasyTierPipeMsg hdr;
         DWORD read;
         if (!ReadFile(hPipe, &hdr, sizeof(hdr), &read, NULL) || read != sizeof(hdr))
@@ -197,7 +198,7 @@ static std::string HandleCommand(EasyTierCmd cmd, const std::string& json) {
     }
     case CMD_STATUS:
         return okResp(
-            std::string("\"state\":\"") + (g_service.isRunning() ? "running" : "stopped")
+            std::string("\"state\":\"") + (g_service.isActive() ? "running" : "stopped")
             + "\",\"ip\":\"" + JsonEscape(g_service.getVirtualIp()) + "\",\"uptime\":0");
 
     case CMD_GET_CONFIG: {
@@ -225,7 +226,7 @@ static std::string HandleCommand(EasyTierCmd cmd, const std::string& json) {
         return okResp("\"ip\":\"" + JsonEscape(g_service.getVirtualIp()) + "\"");
     }
     case CMD_SHUTDOWN:
-        g_service.requestStop();
+        stopRequested_ = true;
         return okResp({});
 
     default:
