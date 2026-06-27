@@ -24,6 +24,7 @@ public:
     
     int getWidth() const { return capture_.getWidth(); }
     int getHeight() const { return capture_.getHeight(); }
+    const int ConfigWaitSeconds = 5;
 
 private:
     void onClientConnected();
@@ -32,6 +33,7 @@ private:
     
     void captureLoop();
     void processInput();
+    void configChangeLoop();
 
     ScreenCapture capture_;
     MediaEncoder encoder_;
@@ -41,10 +43,12 @@ private:
     std::mutex inputMtx_;
 
     std::thread captureThread_;
+    std::thread configChangeLoopThread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> clientReady_{false};
     std::atomic<bool> keyframeRequested_{false};
     std::condition_variable clientCV_;
+    std::condition_variable configChangeCV_;
     std::mutex clientMtx_;
     // --- 新增：动态流控配置目标值 ---
     static constexpr int MINWIDTH = 270;
@@ -52,7 +56,9 @@ private:
     int targetHeight_ = 0;
     int targetFps_ = 0;
     int targetKfIntervalSec_ = 0;
-    std::atomic<bool> configChanged_{false}; // 标记是否需要重新初始化编码器
+    std::atomic<bool> configChanged_{false};
+    std::atomic<bool> reinitEncoder_{false}; // 标记是否需要重新初始化编码器
+    std::mutex ConfigChangeLoopMtx_;
 };
 
 #endif // DESKTOP_SERVICE_H

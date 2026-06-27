@@ -82,6 +82,7 @@ void DesktopService::onMessage(const BinaryData& data) {
             std::cout << "[Desktop] Client requested disconnect, stopping stream" << std::endl;
             clientReady_ = false;
             configChanged_ = false;
+            reinitEncoder_ = false;
             {
                 std::lock_guard<std::mutex> lock(inputMtx_);
                 while (!inputQueue_.empty()) inputQueue_.pop();
@@ -109,10 +110,11 @@ void DesktopService::onMessage(const BinaryData& data) {
                 targetKfIntervalSec_ = cfg.keyframeIntervalSec > 0 ? cfg.keyframeIntervalSec : 5;
                 
                 configChanged_ = true;
+                configChangeCV_.notify_all();
                 
                 std::cout << "[Desktop] Client specified Stream Config: " 
                           << targetWidth_ << "x" << targetHeight_ 
-                          << " @ " << targetFps_ << "fps. Will apply on next keyframe." << std::endl;
+                          << " @ " << targetFps_ << "fps." << std::endl;
             }
             break;
         }
@@ -124,13 +126,16 @@ void DesktopService::onMessage(const BinaryData& data) {
 void DesktopService::start() {
     running_ = true;
     captureThread_ = std::thread(&DesktopService::captureLoop, this);
+    configChangeLoopThread_ = std::thread(&DesktopService::configChangeLoop, this);
 }
 
 void DesktopService::stop() {
     running_ = false;
     clientReady_ = false;
     clientCV_.notify_all();
-    if (captureThread_.joinable()) captureThread_.detach();
+    configChangeCV_.notify_all();
+    if (captureThread_.joinable()) captureThread_.join();
+    if (configChangeLoopThread_.joinable()) configChangeLoopThread_.join();
 }
 
 void DesktopService::captureLoop() {
@@ -163,17 +168,17 @@ void DesktopService::captureLoop() {
         bool isTimeForKeyframe = (pts % (targetFps_ * targetKfIntervalSec_) == 0) || kfRequested;
         
         // 【动态修改3】如果有新的配置请求，并且当下马上要发关键帧，此时再重置编码器！
-        if (configChanged_ && isTimeForKeyframe) {
+        if (reinitEncoder_ && isTimeForKeyframe) {
             std::cout << "[Desktop] Applying new config and forcing keyframe..." << std::endl;
             encoder_.cleanup();
             int configBitrate = std::max(10000000, targetWidth_ * targetHeight_ * 4);
             if (!encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
                                targetWidth_, targetHeight_, targetFps_, configBitrate)) {
                 std::cerr << "[Desktop] Encoder init failed during config change" << std::endl;
-                configChanged_ = false;
+                reinitEncoder_ = false;
                 return;
             }
-            configChanged_ = false;
+            reinitEncoder_ = false;
 
             // 极为关键的一步：告诉客户端分辨率变了，让它的解码器也立即重新初始化！
             if (transport_ && transport_->hasClient()) {
@@ -249,6 +254,32 @@ void DesktopService::processInput() {
             input.ki.wVk = static_cast<WORD>(ev.key);
             input.ki.dwFlags = ev.flags ? KEYEVENTF_KEYUP : 0;
             SendInput(1, &input, sizeof(INPUT));
+        }
+    }
+}
+
+void DesktopService::configChangeLoop() {
+    std::unique_lock<std::mutex> lock(ConfigChangeLoopMtx_);
+    while (running_)
+    {
+        // 等待configChange
+        while (running_ && !configChanged_) {
+            configChangeCV_.wait(lock, [&]() {
+                return !running_ || configChanged_;
+            });
+        }
+        if (!running_) break;
+        configChanged_ = false;
+        // 两秒超时
+        configChangeCV_.wait_for(lock, std::chrono::seconds(ConfigWaitSeconds), [&]() {
+            return !running_ || configChanged_;
+        });
+        if (!running_) break;
+        if (configChanged_) continue;
+        else 
+        {
+            std::cout << "[Desktop] " << "About to reinit Encoder"<< std::endl;
+            reinitEncoder_ = true;
         }
     }
 }
