@@ -1,3 +1,14 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+
 #include "easytier_service.h"
 #include "../common/easytier_control.h"
 #include <windows.h>
@@ -225,6 +236,23 @@ static std::string HandleCommand(EasyTierCmd cmd, const std::string& json) {
         if (!ok) return errResp("configure failed");
         return okResp("\"ip\":\"" + JsonEscape(g_service.getVirtualIp()) + "\"");
     }
+    case CMD_SSH_START: {
+        int port = ExtractJsonInt(json, "port");
+        if (port <= 0) port = 2222;
+        std::string password = ExtractJsonString(json, "password");
+        bool ok = g_service.startSshServer(port, password);
+        if (!ok) return errResp("ssh start failed");
+        return okResp("\"port\":" + std::to_string(port));
+    }
+    case CMD_SSH_STOP:
+        g_service.stopSshServer();
+        return okResp({});
+
+    case CMD_SSH_STATUS:
+        return okResp(
+            std::string("\"running\":") + (g_service.isSshRunning() ? "true" : "false")
+            + ",\"port\":" + std::to_string(g_service.getSshPort()));
+
     case CMD_SHUTDOWN:
         stopRequested_ = true;
         return okResp({});

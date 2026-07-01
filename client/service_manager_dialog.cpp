@@ -50,11 +50,11 @@ void ServiceManagerDialog::createUI() {
 
     main->addWidget(statusGroup);
 
-    // Control buttons
+    // EasyTier control buttons
     auto* ctrlLayout = new QHBoxLayout();
-    btnStart_   = new QPushButton("Start");
-    btnStop_    = new QPushButton("Stop");
-    btnRestart_ = new QPushButton("Restart");
+    btnStart_   = new QPushButton("Start EasyTier");
+    btnStop_    = new QPushButton("Stop EasyTier");
+    btnRestart_ = new QPushButton("Restart EasyTier");
     ctrlLayout->addWidget(btnStart_);
     ctrlLayout->addWidget(btnStop_);
     ctrlLayout->addWidget(btnRestart_);
@@ -64,8 +64,37 @@ void ServiceManagerDialog::createUI() {
     connect(btnStop_,    &QPushButton::clicked, this, &ServiceManagerDialog::onStop);
     connect(btnRestart_, &QPushButton::clicked, this, &ServiceManagerDialog::onRestart);
 
-    // Config section
-    auto* configGroup = new QGroupBox("Configuration");
+    // SSH section
+    auto* sshGroup = new QGroupBox("SSH Server");
+    auto* sshLayout = new QVBoxLayout(sshGroup);
+
+    lblSshStatus_ = new QLabel("SSH: Unknown");
+    lblSshStatus_->setStyleSheet("font-weight: bold;");
+    sshLayout->addWidget(lblSshStatus_);
+
+    auto* sshCtrl = new QHBoxLayout();
+    btnSshStart_ = new QPushButton("Start SSH");
+    btnSshStop_  = new QPushButton("Stop SSH");
+    sshCtrl->addWidget(btnSshStart_);
+    sshCtrl->addWidget(btnSshStop_);
+    sshLayout->addLayout(sshCtrl);
+
+    auto* sshForm = new QFormLayout();
+    leSshPort_ = new QLineEdit("2222");
+    leSshPassword_ = new QLineEdit();
+    leSshPassword_->setEchoMode(QLineEdit::Password);
+    leSshPassword_->setPlaceholderText("Set SSH password");
+    sshForm->addRow("SSH Port:", leSshPort_);
+    sshForm->addRow("Password:", leSshPassword_);
+    sshLayout->addLayout(sshForm);
+
+    connect(btnSshStart_, &QPushButton::clicked, this, &ServiceManagerDialog::onSshStart);
+    connect(btnSshStop_,  &QPushButton::clicked, this, &ServiceManagerDialog::onSshStop);
+
+    main->addWidget(sshGroup);
+
+    // EasyTier Config section
+    auto* configGroup = new QGroupBox("EasyTier Configuration");
     auto* configForm = new QFormLayout(configGroup);
 
     leInstName_   = new QLineEdit("jc-client");
@@ -123,6 +152,8 @@ void ServiceManagerDialog::loadConfigFromService() {
             leListenPort_->setText(QString::number(cfg.listenPort));
             lePeerUrl_->setText(QString::fromStdString(cfg.peerUrl));
             chkAutoStart_->setChecked(cfg.autoStart);
+            leSshPort_->setText(QString::number(cfg.sshPort));
+            leSshPassword_->setText(QString::fromStdString(cfg.sshPassword));
             return;
         }
     }
@@ -199,6 +230,7 @@ void ServiceManagerDialog::refreshStatus() {
             btnRestart_->setEnabled(false);
         }
         lblIp_->setText("IP: " + QString::fromStdString(ip.empty() ? "--" : ip));
+        refreshSshStatus();
         return; // 保持连接，等待下次定时器复用
     }
 
@@ -208,6 +240,8 @@ void ServiceManagerDialog::refreshStatus() {
 
 void ServiceManagerDialog::setButtonsEnabled(bool enabled) {
     btnApply_->setEnabled(enabled);
+    btnSshStart_->setEnabled(enabled);
+    btnSshStop_->setEnabled(enabled);
 }
 
 void ServiceManagerDialog::onInstallService() {
@@ -312,6 +346,57 @@ void ServiceManagerDialog::onRestart() {
         refreshStatus();
 }
 
+void ServiceManagerDialog::refreshSshStatus() {
+    if (!client_.isConnected()) {
+        lblSshStatus_->setText("SSH: Not available (service disconnected)");
+        btnSshStart_->setEnabled(false);
+        btnSshStop_->setEnabled(false);
+        return;
+    }
+    bool running = false;
+    int port = 0;
+    if (client_.sshStatus(running, port)) {
+        if (running) {
+            lblSshStatus_->setText(QString("SSH: Running on port %1").arg(port));
+            btnSshStart_->setEnabled(false);
+            btnSshStop_->setEnabled(true);
+        } else {
+            lblSshStatus_->setText("SSH: Stopped");
+            btnSshStart_->setEnabled(true);
+            btnSshStop_->setEnabled(false);
+        }
+    } else {
+        lblSshStatus_->setText("SSH: Status unknown");
+        btnSshStart_->setEnabled(true);
+        btnSshStop_->setEnabled(true);
+    }
+}
+
+void ServiceManagerDialog::onSshStart() {
+    if (!client_.isConnected()) {
+        QMessageBox::warning(this, "Error", "Service not connected.");
+        return;
+    }
+    int port = leSshPort_->text().toInt();
+    if (port <= 0) port = 2222;
+    std::string password = leSshPassword_->text().toStdString();
+    if (password.empty()) {
+        QMessageBox::warning(this, "Error", "Please set SSH password first.");
+        return;
+    }
+    if (client_.sshStart(port, password)) {
+        refreshSshStatus();
+    } else {
+        QMessageBox::critical(this, "Error", "Failed to start SSH server.");
+    }
+}
+
+void ServiceManagerDialog::onSshStop() {
+    if (client_.sshStop()) {
+        refreshSshStatus();
+    }
+}
+
 void ServiceManagerDialog::onApplyConfig() {
     EasyTierConfig cfg;
     cfg.instanceName  = leInstName_->text().toStdString();
@@ -321,6 +406,10 @@ void ServiceManagerDialog::onApplyConfig() {
     cfg.listenPort    = leListenPort_->text().toInt();
     cfg.peerUrl       = lePeerUrl_->text().toStdString();
     cfg.autoStart     = chkAutoStart_->isChecked();
+    cfg.sshEnabled    = !leSshPassword_->text().isEmpty();
+    cfg.sshPort       = leSshPort_->text().toInt();
+    if (cfg.sshPort <= 0) cfg.sshPort = 2222;
+    cfg.sshPassword   = leSshPassword_->text().toStdString();
 
     setButtonsEnabled(false);
 

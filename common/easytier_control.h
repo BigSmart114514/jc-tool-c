@@ -17,6 +17,9 @@ enum EasyTierCmd : uint32_t {
     CMD_GET_CONFIG = 5,
     CMD_CONFIGURE  = 6,
     CMD_SHUTDOWN   = 7,
+    CMD_SSH_START  = 10,
+    CMD_SSH_STOP   = 11,
+    CMD_SSH_STATUS = 12,
 };
 
 #pragma pack(push, 1)
@@ -37,10 +40,19 @@ struct EasyTierConfig {
     int listenPort = 11012;
     std::string peerUrl = "tcp://225284.xyz:11010";
     bool autoStart = false;
+    // SSH server config
+    bool sshEnabled = false;
+    int sshPort = 2222;
+    std::string sshPassword;
 };
 
 std::string EncryptSecret(const std::string& plaintext);
 std::string DecryptSecret(const std::string& encryptedBase64);
+
+// JSON extraction helpers (used by service_main.cpp as well)
+std::string ExtractJsonString(const std::string& json, const char* key);
+int ExtractJsonInt(const std::string& json, const char* key);
+bool ExtractJsonBool(const std::string& json, const char* key);
 
 const wchar_t* GetEasyTierDataDir();
 const wchar_t* GetEasyTierConfigPath();
@@ -71,6 +83,9 @@ public:
     bool getConfig(EasyTierConfig& config);
     bool configure(const EasyTierConfig& config, bool restartNow);
     bool shutdown();
+    bool sshStart(int port, const std::string& password);
+    bool sshStop();
+    bool sshStatus(bool& running, int& port);
 
 private:
     bool sendRaw(const void* data, uint32_t len);

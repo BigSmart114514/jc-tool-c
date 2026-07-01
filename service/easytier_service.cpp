@@ -1,4 +1,16 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+
 #include "easytier_service.h"
+#include "logging.h"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -10,22 +22,6 @@ extern "C" {
 #include <easytier.h>
 }
 
-
-static void WriteLog(const std::string& msg) {
-    HANDLE hFile = CreateFileW(L"C:\\ProgramData\\EasyTier\\service.log",
-        FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char buf[64];
-    sprintf_s(buf, "[%04d-%02d-%02d %02d:%02d:%02d] ",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    std::string line = buf + msg + "\r\n";
-    DWORD written;
-    WriteFile(hFile, line.data(), (DWORD)line.size(), &written, NULL);
-    CloseHandle(hFile);
-}
 
 static std::string addrToIp(uint32_t addr) {
     struct in_addr in;
@@ -144,15 +140,22 @@ EasyTierService::~EasyTierService() {
 }
 
 bool EasyTierService::init() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!LoadConfigFromFile(config_)) {
-        WriteLog("No config file, using defaults");
-    } else {
-        config_.networkSecret = DecryptSecret(config_.networkSecret);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!LoadConfigFromFile(config_)) {
+            WriteLog("No config file, using defaults");
+        } else {
+            config_.networkSecret = DecryptSecret(config_.networkSecret);
+            config_.sshPassword = DecryptSecret(config_.sshPassword);
+        }
+        WriteLog("Config: instance=" + config_.instanceName
+                 + " network=" + config_.networkName
+                 + " autoStart=" + (config_.autoStart ? "yes" : "no"));
     }
-    WriteLog("Config: instance=" + config_.instanceName
-             + " network=" + config_.networkName
-             + " autoStart=" + (config_.autoStart ? "yes" : "no"));
+    // Auto-start SSH server if enabled (outside lock)
+    if (config_.sshEnabled && !config_.sshPassword.empty()) {
+        startSshServer(config_.sshPort, config_.sshPassword);
+    }
     return true;
 }
 
@@ -271,6 +274,7 @@ std::string EasyTierService::ExtractVpnPortalCfg(const std::string& json) {
 
 void EasyTierService::stopEasyTier() {
     std::lock_guard<std::mutex> lock(mutex_);
+    stopSshServer();
     if (running_) {
         running_ = false;
         active_ = false;
@@ -295,6 +299,7 @@ EasyTierConfig EasyTierService::getConfig() const {
 bool EasyTierService::saveConfigToDisk(const EasyTierConfig& cfg) {
     EasyTierConfig toSave = cfg;
     toSave.networkSecret = EncryptSecret(cfg.networkSecret);
+    toSave.sshPassword = EncryptSecret(cfg.sshPassword);
     bool ok = SaveConfigToFile(toSave);
     WriteLog(ok ? "Config saved" : "Config SAVE FAILED");
     return ok;
@@ -306,6 +311,12 @@ bool EasyTierService::configureAndRestart(const EasyTierConfig& newConfig, bool 
         config_ = newConfig;
     }
     if (!saveConfigToDisk(newConfig)) return false;
+    // Apply SSH config changes
+    if (newConfig.sshEnabled && !newConfig.sshPassword.empty()) {
+        startSshServer(newConfig.sshPort, newConfig.sshPassword);
+    } else {
+        stopSshServer();
+    }
     if (restartNow) return restartEasyTier();
     return true;
 }
@@ -325,6 +336,32 @@ void EasyTierService::monitorLoop() {
             attemptReconnect();
         }
     }
+}
+
+bool EasyTierService::startSshServer(int port, const std::string& password) {
+    if (sshRunning_) {
+        WriteLog("SSH server already running");
+        return true;
+    }
+    if (password.empty()) {
+        WriteLog("SSH server password is empty, abort start");
+        return false;
+    }
+    if (!sshServer_.start(port, password)) {
+        WriteLog("SSH server failed to start on port " + std::to_string(port));
+        return false;
+    }
+    sshPort_ = port;
+    sshRunning_ = true;
+    WriteLog("SSH server started on port " + std::to_string(port));
+    return true;
+}
+
+void EasyTierService::stopSshServer() {
+    if (!sshRunning_) return;
+    sshServer_.stop();
+    sshRunning_ = false;
+    WriteLog("SSH server stopped");
 }
 
 bool EasyTierService::attemptReconnect() {

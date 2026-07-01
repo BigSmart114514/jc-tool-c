@@ -7,6 +7,7 @@
 #include <atomic>
 #include <map>
 #include "../common/easytier_control.h"
+#include "ssh_server.h"
 
 class EasytierManager;
 
@@ -23,6 +24,11 @@ public:
     std::string getVirtualIp() const { return virtualIp_; }
     bool isActive() const { return active_.load(); }
     bool configureAndRestart(const EasyTierConfig& newConfig, bool restartNow);
+    // SSH server management
+    bool startSshServer(int port, const std::string& password);
+    void stopSshServer();
+    bool isSshRunning() const { return sshRunning_.load(); }
+    int getSshPort() const { return sshPort_; }
 private:
     void monitorLoop();
     bool saveConfigToDisk(const EasyTierConfig& cfg);
@@ -42,12 +48,17 @@ private:
     std::string tomlConfig_;
     std::string instanceName_;
     std::string virtualIp_;
-    
+
     mutable std::mutex mutex_;
     EasyTierConfig config_;
     std::atomic<bool> active_{ false };
     std::atomic<bool> running_{ false };
     std::thread monitorThread_;
+
+    // SSH server
+    SshServer sshServer_;
+    std::atomic<bool> sshRunning_{ false };
+    int sshPort_ = 2222;
 };
 
 #endif

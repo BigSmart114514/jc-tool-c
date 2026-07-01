@@ -23,23 +23,18 @@ private slots:
     void onStop();
     void onRestart();
     void onApplyConfig();
+    void onSshStart();
+    void onSshStop();
 
 private:
     void createUI();
     void loadConfigFromService();
     void setButtonsEnabled(bool enabled);
+    void refreshSshStatus();
 
     QLabel* lblStatusIcon_;
     QLabel* lblStatusText_;
     QLabel* lblIp_;
-
-    QLineEdit* leInstName_;
-    QLineEdit* leNetName_;
-    QLineEdit* leNetSecret_;
-    QLineEdit* leIpv4_;
-    QLineEdit* leListenPort_;
-    QLineEdit* lePeerUrl_;
-    QCheckBox* chkAutoStart_;
 
     QPushButton* btnInstall_;
     QPushButton* btnUninstall_;
@@ -47,6 +42,22 @@ private:
     QPushButton* btnStop_;
     QPushButton* btnRestart_;
     QPushButton* btnApply_;
+
+    // SSH section
+    QLabel* lblSshStatus_;
+    QPushButton* btnSshStart_;
+    QPushButton* btnSshStop_;
+    QLineEdit* leSshPort_;
+    QLineEdit* leSshPassword_;
+
+    // EasyTier config section
+    QLineEdit* leInstName_;
+    QLineEdit* leNetName_;
+    QLineEdit* leNetSecret_;
+    QLineEdit* leIpv4_;
+    QLineEdit* leListenPort_;
+    QLineEdit* lePeerUrl_;
+    QCheckBox* chkAutoStart_;
 
     QTimer* timer_;
     EasyTierControlClient client_;

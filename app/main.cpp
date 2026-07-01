@@ -19,8 +19,6 @@
 #include "../client/connection_dialog.h"
 #include "../client/service_manager_dialog.h"
 #include "../server/desktop_service.h"
-#include "../server/file_service.h"
-#include "../server/ssh_server.h"
 
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
@@ -111,8 +109,7 @@ int runServer() {
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
     int desktopPort = Config::DEFAULT_DESKTOP_PORT;
-    int filePort = Config::DEFAULT_FILE_PORT;
-    int sshPort = 2223;
+    int sshPort = 2222;
     std::string sshPassword;
     std::string myVirtualIp;
 
@@ -172,19 +169,27 @@ int runServer() {
 
     if (!useEasyTier) {
         myVirtualIp = "Direct TCP";
-        bool ok;
-        QString pwd = QInputDialog::getText(nullptr, "SSH Server Password",
-            "Set password for SSH access:", QLineEdit::Password, "", &ok);
-        if (!ok || pwd.isEmpty()) {
-            timeEndPeriod(1);
-            return 0;
+        // 通过 EasyTierService 启动 SSH（即使没有 VPN，SSH 也在服务中管理）
+        EasyTierControlClient svcClient;
+        if (svcClient.connect(3000)) {
+            bool ok;
+            QString pwd = QInputDialog::getText(nullptr, "SSH Server Password",
+                "Set password for SSH access:", QLineEdit::Password, "", &ok);
+            if (!ok || pwd.isEmpty()) {
+                timeEndPeriod(1);
+                return 0;
+            }
+            sshPassword = pwd.toStdString();
+            svcClient.sshStart(sshPort, sshPassword);
+        } else {
+            QMessageBox::warning(nullptr, "Service Not Available",
+                "EasyTierService is not running. SSH server will not be available.\n"
+                "Install and start the service, or restart after configuring.");
         }
-        sshPassword = pwd.toStdString();
     }
 
-    // 初始化桌面和文件服务
+    // 初始化桌面服务
     DesktopService desktopService;
-    FileService fileService;
     if (!desktopService.init()) {
         QMessageBox::critical(nullptr, "Error", "Desktop service init failed!");
         timeEndPeriod(1);
@@ -192,25 +197,14 @@ int runServer() {
     }
 
     auto desktopTCP = std::make_unique<TCPServerTransport>(desktopPort);
-    auto fileTCP    = std::make_unique<TCPServerTransport>(filePort);
-
-    if (!desktopTCP->start() || !fileTCP->start()) {
+    if (!desktopTCP->start()) {
         QMessageBox::critical(nullptr, "TCP Error", "Failed to start TCP transport.");
         timeEndPeriod(1);
         return 1;
     }
 
     desktopService.setTransport(desktopTCP.get());
-    fileService.setTransport(fileTCP.get());
     desktopService.start();
-    fileService.start();
-
-    // Start embedded SSH server
-    SshServer sshServer;
-    if (!sshServer.start(sshPort, sshPassword)) {
-        QMessageBox::critical(nullptr, "SSH Error", "Failed to start SSH server on port "
-            + QString::number(sshPort));
-    }
 
     QDialog statusWin;
     statusWin.setWindowTitle("Server Running");
@@ -224,9 +218,8 @@ int runServer() {
     }
 
     vLayout.addWidget(new QLabel(QString("Desktop Port: %1").arg(desktopPort)));
-    vLayout.addWidget(new QLabel(QString("File Port: %1").arg(filePort)));
-    vLayout.addWidget(new QLabel(QString("SSH Port: %1").arg(sshPort)));
-    vLayout.addWidget(new QLabel("SSH Auth: Password"));
+    vLayout.addWidget(new QLabel(QString("SSH Port: %1 (via Service)").arg(sshPort)));
+    vLayout.addWidget(new QLabel("SSH Auth: Password (configured in Service)"));
     vLayout.addWidget(new QLabel(QString("Resolution: %1x%2")
         .arg(desktopService.getWidth()).arg(desktopService.getHeight())));
     vLayout.addStretch();
@@ -236,11 +229,8 @@ int runServer() {
     QObject::connect(btnStop, &QPushButton::clicked, [&]() {
         std::cout << "[Server] Stop requested..." << std::endl;
         statusWin.hide();
-        sshServer.stop();
         desktopService.stop();
-        fileService.stop();
         desktopTCP->stop();
-        fileTCP->stop();
         qApp->quit();
     });
     statusWin.show();

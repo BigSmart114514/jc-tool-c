@@ -54,10 +54,8 @@ set(APP_SOURCES
     client/service_manager_dialog.cpp
     client/media_decoder.cpp
     server/desktop_service.cpp
-    server/file_service.cpp
     server/media_encoder.cpp
     server/screen_capture.cpp
-    server/ssh_server.cpp
     common/transport_tcp.cpp
     common/easytier_control.cpp
     common/ssh_session.cpp
@@ -72,10 +70,9 @@ set(APP_HEADERS
     client/service_manager_dialog.h
     client/media_decoder.h
     server/desktop_service.h
-    server/file_service.h
     server/media_encoder.h
     server/screen_capture.h
-    server/ssh_server.h
+    service/ssh_server.h
     common/easytier_control.h
     common/ssh_session.h
 )
@@ -91,7 +88,7 @@ target_link_libraries(RemoteControl
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network
     qtermwidget
     ${COMMON_LIBS}
-    gdi32 user32 winmm d3d11 dxgi d3dcompiler wtsapi32
+    gdi32 user32 winmm d3d11 dxgi d3dcompiler wtsapi32 userenv
     ssh
 )
 
@@ -102,20 +99,27 @@ set_target_properties(RemoteControl PROPERTIES
 )
 
 # ======================= EasyTierService (常驻 SYSTEM 服务) =======================
-# 独立的 Windows Service 程序，以 SYSTEM 权限运行 EasyTier，通过 Named Pipe 与 RemoteControl 通讯
+# 独立的 Windows Service 程序，以 SYSTEM 权限运行 EasyTier + SSH Server
+# 通过 Named Pipe 与 RemoteControl 通讯
 add_executable(EasyTierService
     service/service_main.cpp
     service/easytier_service.cpp
+    service/logging.cpp
     common/easytier_control.cpp
+    service/ssh_server.cpp
 )
 target_include_directories(EasyTierService PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/thirdparty/easytier/include
+    ${LIBSSH_DIR}/include
 )
 target_link_libraries(EasyTierService
     ws2_32
     crypt32
     easytier_ffi
+    userenv
+    wtsapi32
+    ssh
 )
 set_target_properties(EasyTierService PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release

@@ -21,7 +21,6 @@
 // ==================== 配置 ====================
 namespace Config {
     constexpr int DEFAULT_DESKTOP_PORT = 12345;
-    constexpr int DEFAULT_FILE_PORT = 12346;
     constexpr int BUFFER_SIZE = 65536;
     constexpr int VIDEO_BITRATE = 10000000;
     constexpr int FPS = 30;
@@ -30,8 +29,7 @@ namespace Config {
 
 // ==================== 服务类型 ====================
 enum class ServiceType : uint8_t {
-    Desktop = 1,
-    FileManager = 2
+    Desktop = 1
 };
 
 // ==================== 远程桌面消息 ====================
@@ -68,61 +66,7 @@ namespace Desktop {
     #pragma pack(pop)
 }
 
-// ==================== 文件管理消息 (已废弃 - 由 libssh SFTP 替代) ====================
-// 保留仅为兼容 server 模式的旧 file_service
-// 新 client 代码使用 common/ssh_session.h 中的 SshSession + SFTP API
-namespace FileManager {
-    enum class MsgType : uint8_t {
-        ListDrives      = 0x10,
-        ListDir         = 0x11,
-        DownloadReq     = 0x12,
-        DownloadData    = 0x13,
-        UploadReq       = 0x14,
-        UploadData      = 0x15,
-        Delete          = 0x16,
-        CreateDir       = 0x17,
-        Response        = 0x1F
-    };
 
-    enum class FileType : uint8_t {
-        File      = 0,
-        Directory = 1,
-        Drive     = 2
-    };
-
-    enum class Status : uint8_t {
-        OK            = 0,
-        Error         = 1,
-        NotFound      = 2,
-        AccessDenied  = 3,
-        Transferring  = 4,
-        Complete      = 5
-    };
-
-    #pragma pack(push, 1)
-    struct FileEntry {
-        wchar_t name[260];
-        uint8_t type;
-        uint8_t reserved[3];
-        uint64_t size;
-        uint64_t modifyTime;
-    };
-
-    struct ListHeader {
-        uint8_t status;
-        uint8_t reserved[3];
-        uint32_t count;
-    };
-
-    struct TransferHeader {
-        uint8_t status;
-        uint8_t reserved[3];
-        uint32_t chunkSize;
-        uint64_t totalSize;
-        uint64_t offset;
-    };
-    #pragma pack(pop)
-}
 
 // ==================== 二进制数据 ====================
 using BinaryData = std::vector<uint8_t>;
@@ -207,35 +151,7 @@ namespace MessageBuilder {
         return { static_cast<uint8_t>(Desktop::MsgType::ClientDisconnect) };
     }
 
-    // 文件管理
-    inline BinaryData FileListRequest(const std::wstring& path) {
-        BinaryData msg;
-        auto type = path.empty() ? FileManager::MsgType::ListDrives : FileManager::MsgType::ListDir;
-        msg.push_back(static_cast<uint8_t>(type));
-        
-        uint32_t len = static_cast<uint32_t>(path.length() * sizeof(wchar_t));
-        msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&len),
-                   reinterpret_cast<uint8_t*>(&len) + sizeof(len));
-        
-        if (len > 0) {
-            auto* ptr = reinterpret_cast<const uint8_t*>(path.c_str());
-            msg.insert(msg.end(), ptr, ptr + len);
-        }
-        return msg;
-    }
 
-    inline BinaryData DownloadRequest(const std::wstring& path) {
-        BinaryData msg;
-        msg.push_back(static_cast<uint8_t>(FileManager::MsgType::DownloadReq));
-        
-        uint32_t len = static_cast<uint32_t>(path.length() * sizeof(wchar_t));
-        msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&len),
-                   reinterpret_cast<uint8_t*>(&len) + sizeof(len));
-        
-        auto* ptr = reinterpret_cast<const uint8_t*>(path.c_str());
-        msg.insert(msg.end(), ptr, ptr + len);
-        return msg;
-    }
 }
 
 #endif // PROTOCOL_H

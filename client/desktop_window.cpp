@@ -343,7 +343,7 @@ void DesktopWindow::closeEvent(QCloseEvent* event) {
 
 void DesktopWindow::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_F12) {
-        emit openFileManager();
+        // F12 reserved (file manager removed, use SFTP instead)
         event->accept();
         return;
     }

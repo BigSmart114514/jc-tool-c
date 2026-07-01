@@ -77,7 +77,7 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
-static std::string ExtractJsonString(const std::string& json, const char* key) {
+std::string ExtractJsonString(const std::string& json, const char* key) {
     std::string search = std::string("\"") + key + "\":\"";
     auto pos = json.find(search);
     if (pos == std::string::npos) return "";
@@ -97,7 +97,7 @@ static std::string ExtractJsonString(const std::string& json, const char* key) {
     return result;
 }
 
-static int ExtractJsonInt(const std::string& json, const char* key) {
+int ExtractJsonInt(const std::string& json, const char* key) {
     std::string search = std::string("\"") + key + "\":";
     auto pos = json.find(search);
     if (pos == std::string::npos) return 0;
@@ -113,7 +113,7 @@ static int ExtractJsonInt(const std::string& json, const char* key) {
     return val * sign;
 }
 
-static bool ExtractJsonBool(const std::string& json, const char* key) {
+bool ExtractJsonBool(const std::string& json, const char* key) {
     std::string search = std::string("\"") + key + "\":";
     auto pos = json.find(search);
     if (pos == std::string::npos) return false;
@@ -131,7 +131,10 @@ std::string ConfigToJson(const EasyTierConfig& config) {
        << "  \"ipv4\":\"" << JsonEscape(config.ipv4) << "\",\n"
        << "  \"listenPort\":" << config.listenPort << ",\n"
        << "  \"peerUrl\":\"" << JsonEscape(config.peerUrl) << "\",\n"
-       << "  \"autoStart\":" << (config.autoStart ? "true" : "false") << "\n"
+       << "  \"autoStart\":" << (config.autoStart ? "true" : "false") << ",\n"
+       << "  \"sshEnabled\":" << (config.sshEnabled ? "true" : "false") << ",\n"
+       << "  \"sshPort\":" << config.sshPort << ",\n"
+       << "  \"sshPassword\":\"" << JsonEscape(config.sshPassword) << "\"\n"
        << "}";
     return ss.str();
 }
@@ -145,6 +148,9 @@ bool JsonToConfig(const std::string& json, EasyTierConfig& config) {
     config.listenPort    = ExtractJsonInt(json, "listenPort");
     config.peerUrl       = ExtractJsonString(json, "peerUrl");
     config.autoStart     = ExtractJsonBool(json, "autoStart");
+    config.sshEnabled    = ExtractJsonBool(json, "sshEnabled");
+    config.sshPort       = ExtractJsonInt(json, "sshPort");
+    config.sshPassword   = ExtractJsonString(json, "sshPassword");
     return true;
 }
 
@@ -310,4 +316,24 @@ bool EasyTierControlClient::configure(const EasyTierConfig& config, bool restart
 bool EasyTierControlClient::shutdown() {
     std::string resp;
     return sendRequest(CMD_SHUTDOWN, "{}", resp);
+}
+
+bool EasyTierControlClient::sshStart(int port, const std::string& password) {
+    std::string req = "{\"port\":" + std::to_string(port)
+        + ",\"password\":\"" + JsonEscape(password) + "\"}";
+    std::string resp;
+    return sendRequest(CMD_SSH_START, req, resp);
+}
+
+bool EasyTierControlClient::sshStop() {
+    std::string resp;
+    return sendRequest(CMD_SSH_STOP, "{}", resp);
+}
+
+bool EasyTierControlClient::sshStatus(bool& running, int& port) {
+    std::string resp;
+    if (!sendRequest(CMD_SSH_STATUS, "{}", resp)) return false;
+    running = ExtractJsonBool(resp, "running");
+    port = ExtractJsonInt(resp, "port");
+    return true;
 }

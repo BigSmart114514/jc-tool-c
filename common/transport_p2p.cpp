@@ -24,7 +24,7 @@ bool P2PClientTransport::connect(const std::string& signalingUrl,
     service_ = service;
     useRelay_ = useRelay;
 
-    std::string localId = (service == ServiceType::Desktop) ? "desktop_" : "file_";
+    std::string localId = (service == ServiceType::Desktop) ? "desktop_" : "svc_";
     localId += std::to_string(GetTickCount());
 
     p2p::ClientConfig config;
@@ -169,7 +169,7 @@ bool P2PServerTransport::start(const std::string& signalingUrl, const std::strin
     
     std::string localId = peerId;
     if (localId.empty()) {
-        localId = (service_ == ServiceType::Desktop) ? "desktop_server_" : "file_server_";
+        localId = (service_ == ServiceType::Desktop) ? "desktop_server_" : "svc_server_";
         localId += std::to_string(GetTickCount());
     }
     peerId_ = localId;

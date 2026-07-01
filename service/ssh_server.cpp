@@ -4,15 +4,24 @@
 
 #include "ssh_server.h"
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <libssh/sftp.h>
 #include <libssh/callbacks.h>
 #include <iostream>
 #include <vector>
+#include <map>
+#include <set>
+#include <cwctype>
 #include <cstring>
 #include <cstdlib>
 #include <windows.h>
 #include <winioctl.h>
 #include <intrin.h>
+#include <userenv.h>
+#include <wtsapi32.h>
+#include "logging.h"
+
+#pragma comment(lib, "userenv.lib")
 
 // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE for pre-Win10 SDK compatibility
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
@@ -278,15 +287,26 @@ bool SshServer::start(int port, const std::string& password) {
 void SshServer::stop() {
     running_ = false;
 
-    // Free bind closes the listening socket, causing ssh_bind_accept()
-    // in the accept thread to return with an error so the thread exits.
+    // Connect dummy socket to unblock ssh_bind_accept() so the accept thread can exit
+    if (port_ > 0) {
+        SOCKET tmp = socket(AF_INET, SOCK_STREAM, 0);
+        if (tmp != INVALID_SOCKET) {
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((u_short)port_);
+            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+            connect(tmp, (sockaddr*)&addr, sizeof(addr));
+            closesocket(tmp);
+        }
+    }
+
+    if (acceptThread_.joinable())
+        acceptThread_.join();
+
     if (sshbind_) {
         ssh_bind_free(sshbind_);
         sshbind_ = nullptr;
     }
-
-    if (acceptThread_.joinable())
-        acceptThread_.detach();
 }
 
 void SshServer::acceptLoop() {
@@ -313,10 +333,12 @@ void SshServer::acceptLoop() {
 void SshServer::handleSession(ssh_session session) {
     // Key exchange
     if (ssh_handle_key_exchange(session) != SSH_OK) {
-        std::cerr << "[SSH Server] Key exchange failed" << std::endl;
+        WriteLog("[SSH Server] Key exchange failed");
         ssh_free(session);
         return;
     }
+
+    WriteLog("[SSH Server] Session authenticated");
 
     bool authenticated = false;
     ssh_channel currentChannel = nullptr;
@@ -348,7 +370,7 @@ void SshServer::handleSession(ssh_session session) {
             if (ssh_message_subtype(msg) == SSH_CHANNEL_SESSION) {
                 currentChannel = ssh_message_channel_request_open_reply_accept(msg);
                 if (!currentChannel) {
-                    std::cerr << "[SSH Server] Failed to accept channel" << std::endl;
+                    WriteLog("[SSH Server] Failed to accept channel");
                 }
             } else {
                 ssh_message_reply_default(msg);
@@ -367,13 +389,13 @@ void SshServer::handleSession(ssh_session session) {
             }
             else if (ssh_message_subtype(msg) == SSH_CHANNEL_REQUEST_SHELL) {
                 ssh_message_channel_request_reply_success(msg);
-                std::cout << "[SSH Server] Shell request received, launching handler..." << std::endl;
+                WriteLog("[SSH Server] Shell request received, launching handler...");
                 try {
                     handleShellChannel(session, currentChannel, ptyCols, ptyRows);
                 } catch (const std::exception& e) {
-                    std::cerr << "[SSH Server] Shell exception: " << e.what() << std::endl;
+                    WriteLog(std::string("[SSH Server] Shell exception: ") + e.what());
                 } catch (...) {
-                    std::cerr << "[SSH Server] Shell unknown exception" << std::endl;
+                    WriteLog("[SSH Server] Shell unknown exception");
                 }
                 currentChannel = nullptr;
                 ssh_disconnect(session);
@@ -384,13 +406,13 @@ void SshServer::handleSession(ssh_session session) {
                 const char* sub = ssh_message_channel_request_subsystem(msg);
                 if (sub && strcmp(sub, "sftp") == 0) {
                     ssh_message_channel_request_reply_success(msg);
-                    std::cerr << "[SSH Server] SFTP request received" << std::endl;
+                    WriteLog("[SSH Server] SFTP request received");
                     try {
                         handleSftpChannel(session, currentChannel);
                     } catch (const std::exception& e) {
-                        std::cerr << "[SSH Server] SFTP exception: " << e.what() << std::endl;
+                        WriteLog(std::string("[SSH Server] SFTP exception: ") + e.what());
                     } catch (...) {
-                        std::cerr << "[SSH Server] SFTP unknown exception" << std::endl;
+                        WriteLog("[SSH Server] SFTP unknown exception");
                     }
                     currentChannel = nullptr;
                     ssh_disconnect(session);
@@ -1039,6 +1061,42 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
     sftp_server_free(sftp);
 }
 
+// ==================== Environment block merging ====================
+
+static std::map<std::wstring, std::wstring> parseEnvBlock(const wchar_t* block) {
+    std::map<std::wstring, std::wstring> result;
+    if (!block) return result;
+    const wchar_t* p = block;
+    while (*p) {
+        const wchar_t* eq = wcschr(p, L'=');
+        if (eq && eq > p) {
+            std::wstring key(p, eq - p);
+            std::wstring value(eq + 1);
+            for (auto& ch : key) ch = towupper(ch);
+            result[std::move(key)] = std::move(value);
+        }
+        p += wcslen(p) + 1;
+    }
+    return result;
+}
+
+
+static std::vector<std::wstring> splitPath(const std::wstring& path) {
+    std::vector<std::wstring> entries;
+    size_t start = 0;
+    while (start < path.size()) {
+        size_t end = path.find(L';', start);
+        if (end == std::wstring::npos) end = path.size();
+        std::wstring entry = path.substr(start, end - start);
+        while (!entry.empty() && entry.back() == L'\\')
+            entry.pop_back();
+        if (!entry.empty())
+            entries.push_back(std::move(entry));
+        start = end + 1;
+    }
+    return entries;
+}
+
 // ==================== Shell Handler ====================
 
 void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
@@ -1061,14 +1119,37 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
     auto pResizePC = (HRESULT(WINAPI*)(HPCON, COORD))nullptr;
     std::vector<char> buf(65536);
     std::vector<char> rbuf(65536);
+    std::map<std::wstring, std::wstring> userEnvMap;
+
+    // Parse user environment into a map for later application to child process
+    DWORD sessionId = WTSGetActiveConsoleSessionId();
+    WriteLog(std::string("[SSH Shell] sessionId=") + std::to_string(sessionId));
+    if (sessionId != 0xFFFFFFFF) {
+        HANDLE hUserToken = NULL;
+        if (WTSQueryUserToken(sessionId, &hUserToken)) {
+            void* userEnv = NULL;
+            if (CreateEnvironmentBlock(&userEnv, hUserToken, FALSE)) {
+                userEnvMap = parseEnvBlock((const wchar_t*)userEnv);
+                WriteLog(std::string("[SSH Shell] user env parsed: ") + std::to_string(userEnvMap.size()) + " vars");
+                DestroyEnvironmentBlock(userEnv);
+            } else {
+                WriteLog("[SSH Shell] CreateEnvironmentBlock failed");
+            }
+            CloseHandle(hUserToken);
+        } else {
+            WriteLog("[SSH Shell] WTSQueryUserToken failed");
+        }
+    } else {
+        WriteLog("[SSH Shell] no active console session");
+    }
 
     // Create pipes
     if (!CreatePipe(&hPtyOutRd, &hPtyOutWr, &sa, 65536)) {
-        std::cout << "[SSH Shell] CreatePipe output failed" << std::endl;
+        WriteLog("[SSH Shell] CreatePipe output failed");
         goto cleanup;
     }
     if (!CreatePipe(&hPtyInRd, &hPtyInWr, &sa, 65536)) {
-        std::cout << "[SSH Shell] CreatePipe input failed" << std::endl;
+        WriteLog("[SSH Shell] CreatePipe input failed");
         goto cleanup;
     }
 
@@ -1081,10 +1162,18 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
         GetProcAddress(hDll, "ClosePseudoConsole");
     pResizePC = (HRESULT(WINAPI*)(HPCON, COORD))
         GetProcAddress(hDll, "ResizePseudoConsole");
-    std::cout << "[SSH Shell] ConPTY from: " << (hConPty ? "conpty.dll" : "kernel32.dll") << std::endl;
+    {
+        std::string log = "[SSH Shell] ConPTY from: ";
+        log += (hConPty ? "conpty.dll" : "kernel32.dll");
+        WriteLog(log);
+    }
 
     if (pCreatePC && pClosePC && cols > 0 && rows > 0) {
         HRESULT hr = pCreatePC({(SHORT)cols, (SHORT)rows}, hPtyInRd, hPtyOutWr, 0, &hPC);
+        {
+            char hex[16]; sprintf_s(hex, "%08lx", (long)hr);
+            WriteLog(std::string("[SSH Shell] CreatePseudoConsole hr=0x") + hex);
+        }
         if (SUCCEEDED(hr)) {
             usingConPty = true;
 
@@ -1099,14 +1188,64 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
             }
             si.lpAttributeList = attrList;
 
-            // bInheritHandles=FALSE: ConPTY manages child via attribute list, not pipe inheritance
-            if (!CreateProcessW(nullptr, shellCmd, nullptr, nullptr, FALSE,
-                                EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP,
-                                nullptr, nullptr, &si.StartupInfo, &pi)) {
-                std::cout << "[SSH Shell] CreateProcess: " << GetLastError() << std::endl;
-                if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
-                pClosePC(hPC); hPC = nullptr;
-                goto cleanup;
+            // Apply user env to current process so child inherits it
+            {
+                struct EnvEntry { std::wstring key; std::wstring value; bool existed; };
+                std::vector<EnvEntry> envBackup;
+                for (const auto& [key, val] : userEnvMap) {
+                    wchar_t buf[32767];
+                    DWORD ret = GetEnvironmentVariableW(key.c_str(), buf, 32767);
+                    bool existed = (ret > 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND);
+                    envBackup.push_back({key, existed ? std::wstring(buf) : L"", existed});
+                    if (key == L"PATH") {
+                        std::wstring curPath = (ret > 0) ? buf : L"";
+                        auto sysPath = splitPath(curPath);
+                        auto userPath = splitPath(val);
+                        std::set<std::wstring> pathSet;
+                        for (auto& e : sysPath) {
+                            std::wstring u = e;
+                            for (auto& ch : u) ch = towupper(ch);
+                            pathSet.insert(std::move(u));
+                        }
+                        std::wstring merged;
+                        for (size_t i = 0; i < sysPath.size(); ++i) {
+                            if (i > 0) merged += L';';
+                            merged += sysPath[i];
+                        }
+                        for (auto& entry : userPath) {
+                            std::wstring u = entry;
+                            for (auto& ch : u) ch = towupper(ch);
+                            if (pathSet.find(u) == pathSet.end()) {
+                                if (!merged.empty()) merged += L';';
+                                merged += entry;
+                                pathSet.insert(std::move(u));
+                            }
+                        }
+                        SetEnvironmentVariableW(L"PATH", merged.c_str());
+                    } else {
+                        SetEnvironmentVariableW(key.c_str(), val.c_str());
+                    }
+                }
+                WriteLog(std::string("[SSH Shell] Applied ") + std::to_string(userEnvMap.size()) + " user env vars");
+
+                // bInheritHandles=FALSE: ConPTY manages child via attribute list, not pipe inheritance
+                if (!CreateProcessW(nullptr, shellCmd, nullptr, nullptr, FALSE,
+                                    EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP,
+                                    nullptr, nullptr, &si.StartupInfo, &pi)) {
+                    DWORD gle = GetLastError();
+                    WriteLog(std::string("[SSH Shell] CreateProcessW failed gle=") + std::to_string(gle));
+                    for (const auto& e : envBackup) {
+                        SetEnvironmentVariableW(e.key.c_str(), e.existed ? e.value.c_str() : nullptr);
+                    }
+                    if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
+                    pClosePC(hPC); hPC = nullptr;
+                    goto cleanup;
+                }
+                WriteLog("[SSH Shell] CreateProcessW succeeded");
+                for (const auto& e : envBackup) {
+                    SetEnvironmentVariableW(e.key.c_str(), e.existed ? e.value.c_str() : nullptr);
+                }
+                WriteLog("[SSH Shell] Restored original env");
             }
             if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
             CloseHandle(hPtyInRd); hPtyInRd = INVALID_HANDLE_VALUE;
@@ -1116,7 +1255,7 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
 
     // ─── ConPTY is required; no plain pipe fallback ─────────────────────
     if (!usingConPty) {
-        std::cout << "[SSH Shell] ConPTY unavailable or failed" << std::endl;
+        WriteLog("[SSH Shell] ConPTY unavailable or failed");
         goto cleanup;
     }
 
@@ -1133,7 +1272,7 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
     // Make session non-blocking so we can poll for window-change messages
     ssh_set_blocking(session, 0);
 
-    std::cout << "[SSH Shell] Successfully entered I/O loop!" << std::endl;
+    WriteLog("[SSH Shell] Successfully entered I/O loop!");
 
     while (shellRunning && running_) {
         // ───【轮询：窗口大小变化】───
@@ -1145,7 +1284,7 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
                 int newRows = ssh_message_channel_request_pty_height(msg);
                 if (pResizePC) {
                     pResizePC(hPC, {(SHORT)newCols, (SHORT)newRows});
-                    std::cout << "[SSH Shell] Resized to " << newCols << "x" << newRows << std::endl;
+                    WriteLog(std::string("[SSH Shell] Resized to ") + std::to_string(newCols) + "x" + std::to_string(newRows));
                 }
                 ssh_message_channel_request_reply_success(msg);
             } else {
@@ -1158,7 +1297,7 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
         if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
             DWORD exitCode = 0;
             GetExitCodeProcess(pi.hProcess, &exitCode);
-            std::cout << "[SSH Shell] Shell process genuinely exited. Exit code: " << exitCode << std::endl;
+            WriteLog(std::string("[SSH Shell] Shell exited. code=") + std::to_string(exitCode));
             break; // 这是唯一合法的退出理由！
         }
 
@@ -1173,12 +1312,12 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
                     Sleep(10);
                     continue; // 丢弃当前写入，等待管道恢复
                 } else {
-                    std::cout << "[SSH Shell] WriteFile fatal err=" << err << std::endl;
+                    WriteLog(std::string("[SSH Shell] WriteFile fatal err=") + std::to_string(err));
                     break;
                 }
             }
         } else if (rc == SSH_ERROR) {
-            std::cout << "[SSH Shell] SSH client disconnected." << std::endl;
+            WriteLog("[SSH Shell] SSH client disconnected.");
             break; // 客户端主动断开
         }
 
@@ -1191,7 +1330,7 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
                 Sleep(10);
                 continue; // 忽略报错，等待管道恢复并吐出新的提示符
             } else {
-                std::cout << "[SSH Shell] PeekNamedPipe fatal err=" << err << std::endl;
+                WriteLog(std::string("[SSH Shell] PeekNamedPipe fatal err=") + std::to_string(err));
                 break;
             }
         }
@@ -1201,22 +1340,23 @@ void SshServer::handleShellChannel(ssh_session session, ssh_channel channel,
             DWORD read = 0;
             if (ReadFile(hPtyOutRd, rbuf.data(), (DWORD)min(rbuf.size(), (size_t)n), &read, nullptr) && read > 0) {
                 if (ssh_channel_write(channel, rbuf.data(), (int)read) != (int)read) {
-                    std::cout << "[SSH Shell] SSH channel write failed." << std::endl;
+                    WriteLog("[SSH Shell] SSH channel write failed.");
                     break;
                 }
             }
         }
 
         if (ssh_channel_is_eof(channel)) {
+            WriteLog("[SSH Shell] Channel EOF");
             break;
         }
         
         Sleep(10); // 降低 CPU 占用
     }
-    std::cout << "[SSH Shell] Exiting I/O loop normally." << std::endl;
+    WriteLog("[SSH Shell] Exiting I/O loop normally.");
 
 cleanup:
-    std::cout << "[SSH Shell] Entering cleanup block. LastError = " << GetLastError() << std::endl;
+    WriteLog(std::string("[SSH Shell] Entering cleanup. LastError=") + std::to_string(GetLastError()));
     shellRunning = false;
     if (hPC && pClosePC) pClosePC(hPC);
     if (pi.hProcess) { TerminateProcess(pi.hProcess, 0); CloseHandle(pi.hProcess); }

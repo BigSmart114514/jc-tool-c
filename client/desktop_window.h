@@ -43,7 +43,6 @@ public:
 signals:
     void frameReady();
     void closed();
-    void openFileManager();
 
 private slots:
     void updateDisplay();
