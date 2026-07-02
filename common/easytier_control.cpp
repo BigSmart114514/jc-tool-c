@@ -184,12 +184,14 @@ bool LoadConfigFromFile(EasyTierConfig& config) {
 }
 
 EasyTierControlClient::EasyTierControlClient()
-    : hPipe_(INVALID_HANDLE_VALUE), seq_(0) {}
+    : hPipe_(INVALID_HANDLE_VALUE), seq_(0),
+      state_(ConnectionState::Disconnected) {}
 
 EasyTierControlClient::~EasyTierControlClient() { disconnect(); }
 
 bool EasyTierControlClient::connect(DWORD timeoutMs) {
     if (hPipe_ != INVALID_HANDLE_VALUE) return true;
+    state_ = ConnectionState::Connecting;
     DWORD start = GetTickCount();
     while (GetTickCount() - start < timeoutMs) {
         hPipe_ = CreateFileW(EASYTIER_PIPE_NAME,
@@ -202,12 +204,19 @@ bool EasyTierControlClient::connect(DWORD timeoutMs) {
             Sleep(200);
             continue;
         } else {
+            state_ = ConnectionState::Error;
+            lastError_ = "CreateFile failed: " + std::to_string(err);
             return false;
         }
     }
-    if (hPipe_ == INVALID_HANDLE_VALUE) return false;
+    if (hPipe_ == INVALID_HANDLE_VALUE) {
+        state_ = ConnectionState::Error;
+        lastError_ = "pipe connect timeout (" + std::to_string(timeoutMs) + "ms)";
+        return false;
+    }
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(hPipe_, &mode, NULL, NULL);
+    state_ = ConnectionState::Connected;
     return true;
 }
 
@@ -216,6 +225,8 @@ void EasyTierControlClient::disconnect() {
         CloseHandle(hPipe_);
         hPipe_ = INVALID_HANDLE_VALUE;
     }
+    state_ = ConnectionState::Disconnected;
+    lastError_.clear();
 }
 
 bool EasyTierControlClient::sendRaw(const void* data, uint32_t len) {
@@ -231,6 +242,10 @@ bool EasyTierControlClient::recvRaw(void* data, uint32_t len) {
 bool EasyTierControlClient::sendRequest(EasyTierCmd cmd,
     const std::string& requestJson, std::string& responseJson)
 {
+    if (state_ != ConnectionState::Connected || hPipe_ == INVALID_HANDLE_VALUE) {
+        lastError_ = "sendRequest: not connected";
+        return false;
+    }
     auto tryOnce = [&]() -> bool {
         if (hPipe_ == INVALID_HANDLE_VALUE) return false;
         EasyTierPipeMsg hdr;
@@ -260,7 +275,11 @@ bool EasyTierControlClient::sendRequest(EasyTierCmd cmd,
 
     // 服务端已在处理完上一个请求后断开了管道，重连一次再试
     disconnect();
-    if (!connect(EASYTIER_PIPE_TIMEOUT)) return false;
+    if (!connect(EASYTIER_PIPE_TIMEOUT)) {
+        state_ = ConnectionState::Error;
+        lastError_ = "sendRequest: reconnect failed";
+        return false;
+    }
     return tryOnce();
 }
 

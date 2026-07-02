@@ -7,6 +7,7 @@
 #include <QCheckBox>
 #include <QPushButton>
 #include <QTimer>
+#include <functional>
 #include "../common/easytier_control.h"
 
 class ServiceManagerDialog : public QDialog {
@@ -28,6 +29,8 @@ private slots:
 
 private:
     void createUI();
+    void runAsync(std::function<void()> fn);
+    bool waitForPipe(EasyTierControlClient& cli, int maxAttempts = 20, int pauseMs = 300);
     void loadConfigFromService();
     void setButtonsEnabled(bool enabled);
     void refreshSshStatus();

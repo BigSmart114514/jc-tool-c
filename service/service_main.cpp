@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <thread>
 #include <iostream>
+#include "logging.h"
 
 static EasyTierService g_service;
 static SERVICE_STATUS_HANDLE g_statusHandle = NULL;
@@ -107,64 +108,79 @@ static DWORD WINAPI ServiceCtrlHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
 
 static void SignalShutdown() {
     stopRequested_ = true;
-    for (int i = 0; i < 15; ++i) {
-        HANDLE hPipe = CreateFileW(EASYTIER_PIPE_NAME,
-            GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-        if (hPipe != INVALID_HANDLE_VALUE) {
-            DWORD mode = PIPE_READMODE_MESSAGE;
-            SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
-            EasyTierPipeMsg hdr;
-            hdr.magic = EASYTIER_MSG_MAGIC;
-            hdr.type = 0;
-            hdr.cmd = CMD_SHUTDOWN;
-            hdr.seq = 0;
-            hdr.dataLen = 0;
-            DWORD written;
-            WriteFile(hPipe, &hdr, sizeof(hdr), &written, NULL);
-            CloseHandle(hPipe);
-            return;
+}
+
+static bool PeekWait(HANDLE hPipe, DWORD minBytes, int intervalMs) {
+    while (!stopRequested_) {
+        DWORD bytesAvail = 0;
+        if (PeekNamedPipe(hPipe, NULL, 0, NULL, &bytesAvail, NULL)) {
+            if (bytesAvail >= minBytes) return true;
+        } else {
+            DWORD err = GetLastError();
+            if (err == ERROR_BROKEN_PIPE) return false;
         }
-        Sleep(200);
+        Sleep(intervalMs);
     }
+    return false;
 }
 
 static void PipeServerLoop() {
     while (!stopRequested_) {
         HANDLE hPipe = CreateNamedPipeW(EASYTIER_PIPE_NAME,
             PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT,
             PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, NULL);
         if (hPipe == INVALID_HANDLE_VALUE) { Sleep(100); continue; }
 
-        if (stopRequested_) {
-            CloseHandle(hPipe);
-            break;
+        if (stopRequested_) { CloseHandle(hPipe); break; }
+
+        // Poll ConnectNamedPipe in non-blocking mode
+        while (!stopRequested_) {
+            if (ConnectNamedPipe(hPipe, NULL)) break;
+            DWORD err = GetLastError();
+            if (err == ERROR_PIPE_CONNECTED) break;
+            if (err == ERROR_NO_DATA) {
+                DisconnectNamedPipe(hPipe);
+                continue;
+            }
+            if (err != ERROR_PIPE_LISTENING) break;
+            Sleep(100);
         }
+        if (stopRequested_) { CloseHandle(hPipe); break; }
 
-        BOOL connected = ConnectNamedPipe(hPipe, NULL)
-            ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (!connected) { CloseHandle(hPipe); continue; }
-
-        HandleClient(hPipe);
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
+        // Handle client in separate thread, immediately accept next connection
+        std::thread([hPipe]() {
+            HandleClient(hPipe);
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+        }).detach();
     }
 }
 
 static void HandleClient(HANDLE hPipe) {
     while (!stopRequested_) {
+        if (!PeekWait(hPipe, sizeof(EasyTierPipeMsg), 100))
+            break;
+
         EasyTierPipeMsg hdr;
         DWORD read;
         if (!ReadFile(hPipe, &hdr, sizeof(hdr), &read, NULL) || read != sizeof(hdr))
             break;
-        if (hdr.magic != EASYTIER_MSG_MAGIC || hdr.type != 0) break;
+        if (hdr.magic != EASYTIER_MSG_MAGIC || hdr.type != 0)
+            break;
+
+        if (stopRequested_) break;
 
         std::string req;
         if (hdr.dataLen > 0) {
+            if (!PeekWait(hPipe, hdr.dataLen, 100))
+                break;
             req.resize(hdr.dataLen);
             if (!ReadFile(hPipe, &req[0], hdr.dataLen, &read, NULL) || read != hdr.dataLen)
                 break;
         }
+
+        if (stopRequested_) break;
 
         std::string resp = HandleCommand((EasyTierCmd)hdr.cmd, req);
 

@@ -9,17 +9,23 @@
 #include <QHBoxLayout>
 #include <QGroupBox>
 #include <QStatusBar>
-#include <QMessageBox>
+#include <QPointer>
+#include <QMutex>
 #include <atomic>
-#include <mutex>
 #include <memory>
 #include "../common/protocol.h"
 #include "../common/transport.h"
-#include "desktop_window.h"
 
 class SshSession;
 class SftpWindow;
 class SshTerminalWindow;
+class DesktopWindow;
+
+struct InputControlState {
+    std::atomic<bool> mouseMove{true};
+    std::atomic<bool> mouseClick{true};
+    std::atomic<bool> keyboard{true};
+};
 
 struct ControlPanelConfig {
     SshSession* sshSession = nullptr;
@@ -73,18 +79,13 @@ private:
     QCheckBox* chkKeyboard_;
 
     ControlPanelConfig config_;
-    DesktopWindow* desktopWindow_ = nullptr;
-    SftpWindow* sftpWindow_ = nullptr;
-    SshTerminalWindow* sshTerminalWindow_ = nullptr;
-    std::mutex windowMtx_;
 
-    bool desktopOpen_ = false;
-    bool sftpOpen_ = false;
-    bool sshTerminalOpen_ = false;
+    QPointer<DesktopWindow> desktopWindow_;
+    QPointer<SftpWindow> sftpWindow_;
+    QPointer<SshTerminalWindow> sshTerminalWindow_;
+    QMutex windowMtx_;
 
-    std::atomic<bool> enableMouseMove_{true};
-    std::atomic<bool> enableMouseClick_{true};
-    std::atomic<bool> enableKeyboard_{true};
+    InputControlState inputState_;
 };
 
-#endif // CONTROL_PANEL_H
+#endif

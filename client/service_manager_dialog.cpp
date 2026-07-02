@@ -6,6 +6,8 @@
 #include <QMessageBox>
 #include <QFrame>
 #include <QApplication>
+#include <QPointer>
+#include <thread>
 
 #include <windows.h>
 #include <winsvc.h>
@@ -20,11 +22,25 @@ ServiceManagerDialog::ServiceManagerDialog(QWidget* parent)
     connect(timer_, &QTimer::timeout, this, &ServiceManagerDialog::refreshStatus);
     timer_->start(3000);
 
-    refreshStatus();
+    QTimer::singleShot(0, this, &ServiceManagerDialog::refreshStatus);
 }
 
 ServiceManagerDialog::~ServiceManagerDialog() {
     client_.disconnect();
+}
+
+void ServiceManagerDialog::runAsync(std::function<void()> fn) {
+    std::thread([fn = std::move(fn)]() {
+        fn();
+    }).detach();
+}
+
+bool ServiceManagerDialog::waitForPipe(EasyTierControlClient& cli, int maxAttempts, int pauseMs) {
+    for (int i = 0; i < maxAttempts; ++i) {
+        if (cli.connect(200)) return true;
+        Sleep(pauseMs);
+    }
+    return false;
 }
 
 void ServiceManagerDialog::createUI() {
@@ -197,10 +213,10 @@ static bool StartServiceViaScm() {
 }
 
 void ServiceManagerDialog::refreshStatus() {
-    // 如果尚未连接，尝试连一次（1000ms 超时）
-    if (!client_.isConnected() && !client_.connect(1000)) {
+    if (!client_.isConnected() && !client_.connect(300)) {
         bool installed = IsServiceInstalledScm();
-        lblStatusIcon_->setStyleSheet("font-size: 24px; color: #888;");
+        lblStatusIcon_->setStyleSheet(QString("font-size: 24px; color: %1;")
+            .arg(installed ? "#888" : "#f0ad4e"));
         lblStatusText_->setText(installed
             ? "Service Not Running" : "Service Not Installed");
         lblIp_->setText(installed
@@ -212,7 +228,6 @@ void ServiceManagerDialog::refreshStatus() {
         return;
     }
 
-    // 已连接 → 发送 STATUS 命令
     std::string state, ip;
     uint32_t uptime;
     if (client_.getStatus(state, ip, uptime)) {
@@ -231,10 +246,9 @@ void ServiceManagerDialog::refreshStatus() {
         }
         lblIp_->setText("IP: " + QString::fromStdString(ip.empty() ? "--" : ip));
         refreshSshStatus();
-        return; // 保持连接，等待下次定时器复用
+        return;
     }
 
-    // 连接已断开（服务端关闭了管道），下个 tick 重新连
     client_.disconnect();
 }
 
@@ -307,43 +321,76 @@ void ServiceManagerDialog::onUninstallService() {
 }
 
 void ServiceManagerDialog::onStart() {
-    if (!client_.isConnected()) {
-        // 服务进程未运行 → 尝试通过 SCM 启动
+    btnStart_->setEnabled(false);
+    btnStart_->setText("Starting...");
+    QPointer<ServiceManagerDialog> guard = this;
+    std::thread([guard]() {
+        if (!guard) return;
+        EasyTierControlClient cli;
         bool scmOk = StartServiceViaScm();
+        bool ok = false;
         if (scmOk) {
-            QApplication::setOverrideCursor(Qt::WaitCursor);
-            for (int i = 0; i < 10; ++i) {
-                if (client_.connect(500)) break;
-                Sleep(500);
+            if (guard->waitForPipe(cli, 15, 300)) {
+                ok = cli.start();
             }
-            QApplication::restoreOverrideCursor();
         }
-    }
-
-    if (client_.isConnected() && client_.start()) {
-        refreshStatus();
-    } else if (IsServiceInstalledScm()) {
-        QMessageBox::warning(this, "Error",
-            "EasyTier service is installed but not responding.\n"
-            "Try: sc.exe start EasyTier\n"
-            "Then retry.");
-    } else {
-        QMessageBox::warning(this, "Error",
-            "EasyTier service is not installed.\n"
-            "Click 'Install Service' first.");
-    }
+        QMetaObject::invokeMethod(guard.data(), [guard, ok]() {
+            if (!guard) return;
+            guard->btnStart_->setEnabled(true);
+            guard->btnStart_->setText("Start EasyTier");
+            if (ok) {
+                guard->refreshStatus();
+            } else if (IsServiceInstalledScm()) {
+                QMessageBox::warning((QWidget*)guard, "Error",
+                    "EasyTier service is installed but not responding.\n"
+                    "Try: sc.exe start EasyTier\n"
+                    "Then retry.");
+            } else {
+                QMessageBox::warning((QWidget*)guard, "Error",
+                    "EasyTier service is not installed.\n"
+                    "Click 'Install Service' first.");
+            }
+        });
+    }).detach();
 }
 
 void ServiceManagerDialog::onStop() {
-    if (client_.stop()) {
-        lblIp_->setText("IP: --");
-        refreshStatus();
-    }
+    btnStop_->setEnabled(false);
+    QPointer<ServiceManagerDialog> guard = this;
+    std::thread([guard]() {
+        if (!guard) return;
+        EasyTierControlClient cli;
+        bool ok = false;
+        if (guard->waitForPipe(cli, 10, 300)) {
+            ok = cli.stop();
+        }
+        QMetaObject::invokeMethod(guard.data(), [guard, ok]() {
+            if (!guard) return;
+            guard->btnStop_->setEnabled(true);
+            if (ok) {
+                guard->lblIp_->setText("IP: --");
+                guard->refreshStatus();
+            }
+        });
+    }).detach();
 }
 
 void ServiceManagerDialog::onRestart() {
-    if (client_.restart())
-        refreshStatus();
+    btnRestart_->setEnabled(false);
+    QPointer<ServiceManagerDialog> guard = this;
+    std::thread([guard]() {
+        if (!guard) return;
+        EasyTierControlClient cli;
+        bool ok = false;
+        if (guard->waitForPipe(cli, 10, 300)) {
+            ok = cli.restart();
+        }
+        QMetaObject::invokeMethod(guard.data(), [guard, ok]() {
+            if (!guard) return;
+            guard->btnRestart_->setEnabled(true);
+            if (ok) guard->refreshStatus();
+        });
+    }).detach();
 }
 
 void ServiceManagerDialog::refreshSshStatus() {
@@ -373,10 +420,6 @@ void ServiceManagerDialog::refreshSshStatus() {
 }
 
 void ServiceManagerDialog::onSshStart() {
-    if (!client_.isConnected()) {
-        QMessageBox::warning(this, "Error", "Service not connected.");
-        return;
-    }
     int port = leSshPort_->text().toInt();
     if (port <= 0) port = 2222;
     std::string password = leSshPassword_->text().toStdString();
@@ -384,17 +427,43 @@ void ServiceManagerDialog::onSshStart() {
         QMessageBox::warning(this, "Error", "Please set SSH password first.");
         return;
     }
-    if (client_.sshStart(port, password)) {
-        refreshSshStatus();
-    } else {
-        QMessageBox::critical(this, "Error", "Failed to start SSH server.");
-    }
+    btnSshStart_->setEnabled(false);
+    QPointer<ServiceManagerDialog> guard = this;
+    std::thread([guard, port, password]() {
+        if (!guard) return;
+        EasyTierControlClient cli;
+        bool ok = false;
+        if (guard->waitForPipe(cli, 10, 300)) {
+            ok = cli.sshStart(port, password);
+        }
+        QMetaObject::invokeMethod(guard.data(), [guard, ok]() {
+            if (!guard) return;
+            guard->btnSshStart_->setEnabled(true);
+            if (ok) {
+                guard->refreshSshStatus();
+            } else {
+                QMessageBox::critical((QWidget*)guard, "Error", "Failed to start SSH server.");
+            }
+        });
+    }).detach();
 }
 
 void ServiceManagerDialog::onSshStop() {
-    if (client_.sshStop()) {
-        refreshSshStatus();
-    }
+    btnSshStop_->setEnabled(false);
+    QPointer<ServiceManagerDialog> guard = this;
+    std::thread([guard]() {
+        if (!guard) return;
+        EasyTierControlClient cli;
+        bool ok = false;
+        if (guard->waitForPipe(cli, 5, 300)) {
+            ok = cli.sshStop();
+        }
+        QMetaObject::invokeMethod(guard.data(), [guard, ok]() {
+            if (!guard) return;
+            guard->btnSshStop_->setEnabled(true);
+            if (ok) guard->refreshSshStatus();
+        });
+    }).detach();
 }
 
 void ServiceManagerDialog::onApplyConfig() {
@@ -412,22 +481,28 @@ void ServiceManagerDialog::onApplyConfig() {
     cfg.sshPassword   = leSshPassword_->text().toStdString();
 
     setButtonsEnabled(false);
+    btnApply_->setText("Applying...");
 
-    if (!client_.isConnected() && !client_.connect(3000)) {
-        QMessageBox::warning(this, "Not Connected",
-            "Cannot connect to EasyTier service.\nIf the service is installed but stopped, start it first.");
-        setButtonsEnabled(true);
-        return;
-    }
-
-    if (!client_.configure(cfg, true)) {
-        QMessageBox::critical(this, "Error", "Failed to apply configuration.");
-        setButtonsEnabled(true);
-        return;
-    }
-
-    QMessageBox::information(this, "Success",
-        "Configuration applied and EasyTier restarted.");
-    refreshStatus();
-    setButtonsEnabled(true);
+    QPointer<ServiceManagerDialog> guard = this;
+    std::thread([guard, cfg]() {
+        if (!guard) return;
+        EasyTierControlClient cli;
+        bool ok = false;
+        if (guard->waitForPipe(cli, 10, 300)) {
+            ok = cli.configure(cfg, true);
+        }
+        QMetaObject::invokeMethod(guard.data(), [guard, ok, cfg]() {
+            if (!guard) return;
+            guard->setButtonsEnabled(true);
+            guard->btnApply_->setText("Apply & Restart");
+            if (ok) {
+                QMessageBox::information((QWidget*)guard, "Success",
+                    "Configuration applied and EasyTier restarted.");
+                guard->refreshStatus();
+            } else {
+                QMessageBox::critical((QWidget*)guard, "Error",
+                    "Failed to apply configuration.");
+            }
+        });
+    }).detach();
 }

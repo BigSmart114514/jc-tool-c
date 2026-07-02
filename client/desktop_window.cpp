@@ -1,4 +1,5 @@
 #include "desktop_window.h"
+#include "control_panel.h"
 #include <QVBoxLayout>
 #include <QCloseEvent>
 #include <QPainter>
@@ -48,12 +49,12 @@ DesktopWindow::~DesktopWindow() {
     decoding_ = false;
     queueCV_.notify_all();
     transport_ = nullptr;
-    safeJoinDecodeThread();
+    joinDecodeThread();
     decoderReady_ = false;
     decoder_.cleanup();
 }
 
-void DesktopWindow::safeJoinDecodeThread() {
+void DesktopWindow::joinDecodeThread() {
     if (!decodeThread_.joinable()) return;
     auto start = std::chrono::steady_clock::now();
     const int TIMEOUT_MS = 3000;
@@ -75,8 +76,9 @@ void DesktopWindow::safeJoinDecodeThread() {
     }
 }
 
-void DesktopWindow::init(ITransport* transport) {
+void DesktopWindow::init(ITransport* transport, InputControlState* inputState) {
     transport_ = transport;
+    inputState_ = inputState;
 }
 
 void DesktopWindow::requestStream() {
@@ -322,7 +324,7 @@ bool DesktopWindow::nativeEvent(const QByteArray& eventType, void* message, qint
                 break;
         }
 
-        if (isSystemKey && pEnableKeyboard_ && pEnableKeyboard_->load()) {
+        if (isSystemKey && inputState_ && inputState_->keyboard.load()) {
             bool isUp = (msg->message == WM_KEYUP || msg->message == WM_SYSKEYUP);
             sendInput({1, 0, 0, static_cast<int32_t>(msg->wParam), isUp ? 1 : 0});
             *result = 1;
@@ -347,21 +349,21 @@ void DesktopWindow::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
-    if (pEnableKeyboard_ && pEnableKeyboard_->load()) {
+    if (inputState_ && inputState_->keyboard.load()) {
         sendInput({1, 0, 0, static_cast<int32_t>(event->nativeVirtualKey()), 0});
     }
     event->accept();
 }
 
 void DesktopWindow::keyReleaseEvent(QKeyEvent* event) {
-    if (pEnableKeyboard_ && pEnableKeyboard_->load()) {
+    if (inputState_ && inputState_->keyboard.load()) {
         sendInput({1, 0, 0, static_cast<int32_t>(event->nativeVirtualKey()), 1});
     }
     event->accept();
 }
 
 void DesktopWindow::mousePressEvent(QMouseEvent* event) {
-    if (!pEnableMouseClick_ || !pEnableMouseClick_->load()) return;
+    if (!inputState_ || !inputState_->mouseClick.load()) return;
     int x, y;
     if (!convertToImageCoords(event->pos().x(), event->pos().y(), x, y)) return;
 
@@ -374,7 +376,7 @@ void DesktopWindow::mousePressEvent(QMouseEvent* event) {
 }
 
 void DesktopWindow::mouseReleaseEvent(QMouseEvent* event) {
-    if (!pEnableMouseClick_ || !pEnableMouseClick_->load()) return;
+    if (!inputState_ || !inputState_->mouseClick.load()) return;
     int x, y;
     if (!convertToImageCoords(event->pos().x(), event->pos().y(), x, y)) return;
 
@@ -387,7 +389,7 @@ void DesktopWindow::mouseReleaseEvent(QMouseEvent* event) {
 }
 
 void DesktopWindow::mouseMoveEvent(QMouseEvent* event) {
-    if (!pEnableMouseMove_ || !pEnableMouseMove_->load()) return;
+    if (!inputState_ || !inputState_->mouseMove.load()) return;
     int x, y;
     if (convertToImageCoords(event->pos().x(), event->pos().y(), x, y)) {
         sendInput({0, x, y, 0, 0});
@@ -395,7 +397,7 @@ void DesktopWindow::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void DesktopWindow::wheelEvent(QWheelEvent* event) {
-    if (!pEnableMouseClick_ || !pEnableMouseClick_->load()) return;
+    if (!inputState_ || !inputState_->mouseClick.load()) return;
     int x, y;
     if (convertToImageCoords(event->position().x(), event->position().y(), x, y)) {
         int delta = event->angleDelta().y();

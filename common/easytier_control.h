@@ -64,6 +64,13 @@ std::string ConfigToJson(const EasyTierConfig& config);
 bool JsonToConfig(const std::string& json, EasyTierConfig& config);
 std::string JsonEscape(const std::string& s);
 
+enum class ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error
+};
+
 class EasyTierControlClient {
 public:
     EasyTierControlClient();
@@ -72,6 +79,8 @@ public:
     bool connect(DWORD timeoutMs = EASYTIER_PIPE_TIMEOUT);
     void disconnect();
     bool isConnected() const { return hPipe_ != INVALID_HANDLE_VALUE; }
+    ConnectionState state() const { return state_; }
+    std::string lastError() const { return lastError_; }
 
     bool sendRequest(EasyTierCmd cmd, const std::string& requestJson,
                      std::string& responseJson);
@@ -92,6 +101,8 @@ private:
     bool recvRaw(void* data, uint32_t len);
     HANDLE hPipe_;
     uint32_t seq_;
+    ConnectionState state_ = ConnectionState::Disconnected;
+    std::string lastError_;
 };
 
 #endif

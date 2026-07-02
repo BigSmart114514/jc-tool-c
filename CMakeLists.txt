@@ -46,12 +46,16 @@ set(COMMON_LIBS
 # 收集所有的源文件 (包含Client和Server的所有功能)
 set(APP_SOURCES
     app/main.cpp
+    app/client_application.cpp
+    app/server_application.cpp
     client/control_panel.cpp
     client/desktop_window.cpp
     client/sftp_window.cpp
     client/ssh_terminal.cpp
     client/connection_dialog.cpp
     client/service_manager_dialog.cpp
+    client/server_settings_dialog.cpp
+    client/server_status_dialog.cpp
     client/media_decoder.cpp
     server/desktop_service.cpp
     server/media_encoder.cpp
@@ -62,12 +66,16 @@ set(APP_SOURCES
 )
 
 set(APP_HEADERS
+    app/client_application.h
+    app/server_application.h
     client/control_panel.h
     client/desktop_window.h
     client/sftp_window.h
     client/ssh_terminal.h
     client/connection_dialog.h
     client/service_manager_dialog.h
+    client/server_settings_dialog.h
+    client/server_status_dialog.h
     client/media_decoder.h
     server/desktop_service.h
     server/media_encoder.h
