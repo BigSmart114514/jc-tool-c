@@ -6,6 +6,8 @@
 #include "../common/transport.h"
 #include "screen_capture.h"
 #include "media_encoder.h"
+#include "audio_capture.h"
+#include "audio_encoder.h"
 #include <queue>
 #include <thread>
 #include <atomic>
@@ -34,19 +36,27 @@ private:
     void captureLoop();
     void processInput();
     void configChangeLoop();
+    void audioLoop();
+    bool initAudio();
+    void enableAudio();
+    void disableAudio();
 
     ScreenCapture capture_;
     MediaEncoder encoder_;
+    AudioCapture audioCapture_;
+    AudioEncoder audioEncoder_;
     IServerTransport* transport_ = nullptr;
 
     std::queue<Desktop::InputEvent> inputQueue_;
     std::mutex inputMtx_;
 
     std::thread captureThread_;
+    std::thread audioThread_;
     std::thread configChangeLoopThread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> clientReady_{false};
     std::atomic<bool> keyframeRequested_{false};
+    std::atomic<bool> audioEnabled_{false};
     std::condition_variable clientCV_;
     std::condition_variable configChangeCV_;
     std::mutex clientMtx_;

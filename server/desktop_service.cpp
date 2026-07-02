@@ -5,15 +5,13 @@
 DesktopService::DesktopService() {}
 DesktopService::~DesktopService() { stop(); }
 
-// 在 init 中赋予初始服务端默认设置：
 bool DesktopService::init() {
     if (!capture_.init()) { return false; }
     
-    // 初始使用服务端配置
     targetWidth_ = capture_.getWidth();
     targetHeight_ = capture_.getHeight();
     targetFps_ = Config::FPS;
-    targetKfIntervalSec_ = 5; // 默认5秒
+    targetKfIntervalSec_ = 5;
 
     int bitrate = std::max(10000000, targetWidth_ * targetHeight_ * 4);
     if (!encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
@@ -21,6 +19,34 @@ bool DesktopService::init() {
         std::cerr << "[Desktop] Encoder init failed" << std::endl;
         return false;
     }
+
+    return true;
+}
+
+bool DesktopService::initAudio() {
+    if (audioCapture_.initialized()) return true;
+
+    if (!audioCapture_.init()) {
+        std::cerr << "[Desktop] Audio capture init failed" << std::endl;
+        return false;
+    }
+    if (!audioEncoder_.init(audioCapture_.sampleRate(), audioCapture_.channels(), 64000)) {
+        std::cerr << "[Desktop] Audio encoder init failed" << std::endl;
+        audioCapture_.cleanup();
+        return false;
+    }
+
+    audioCapture_.setDataCallback([this](const uint8_t* pcm, int samples) {
+        if (!clientReady_ || !transport_ || !transport_->hasClient()) return;
+        std::vector<uint8_t> aacFrame;
+        if (audioEncoder_.encode(pcm, samples, aacFrame) && !aacFrame.empty()) {
+            auto msg = MessageBuilder::AudioData(aacFrame.data(), aacFrame.size());
+            transport_->send(msg);
+        }
+    });
+
+    std::cout << "[Desktop] Audio initialized (" << audioCapture_.sampleRate()
+              << "Hz " << audioCapture_.channels() << "ch)" << std::endl;
     return true;
 }
 
@@ -83,11 +109,21 @@ void DesktopService::onMessage(const BinaryData& data) {
             clientReady_ = false;
             configChanged_ = false;
             reinitEncoder_ = false;
+            disableAudio();
             {
                 std::lock_guard<std::mutex> lock(inputMtx_);
                 while (!inputQueue_.empty()) inputQueue_.pop();
             }
             break;
+
+        case Desktop::MsgType::AudioEnable: {
+            bool enable = (data.size() > 1 && data[1] != 0);
+            if (enable != audioEnabled_) {
+                if (enable) enableAudio();
+                else disableAudio();
+            }
+            break;
+        }
 
         case Desktop::MsgType::StreamConfig: {
             if (data.size() >= 1 + sizeof(Desktop::StreamConfig)) {
@@ -123,6 +159,29 @@ void DesktopService::onMessage(const BinaryData& data) {
     }
 }
 
+void DesktopService::enableAudio() {
+    if (audioEnabled_) return;
+    if (!audioCapture_.initialized() && !initAudio()) return;
+    audioCapture_.start();
+    audioEnabled_ = true;
+    std::cout << "[Desktop] Audio enabled" << std::endl;
+
+    if (transport_ && transport_->hasClient()) {
+        auto& asc = audioEncoder_.audioSpecificConfig();
+        auto msg = MessageBuilder::AudioConfig(
+            audioCapture_.sampleRate(), audioCapture_.channels(),
+            asc.data(), (int)asc.size());
+        transport_->send(msg);
+    }
+}
+
+void DesktopService::disableAudio() {
+    if (!audioEnabled_) return;
+    audioCapture_.stop();
+    audioEnabled_ = false;
+    std::cout << "[Desktop] Audio disabled" << std::endl;
+}
+
 void DesktopService::start() {
     running_ = true;
     captureThread_ = std::thread(&DesktopService::captureLoop, this);
@@ -132,6 +191,7 @@ void DesktopService::start() {
 void DesktopService::stop() {
     running_ = false;
     clientReady_ = false;
+    disableAudio();
     clientCV_.notify_all();
     configChangeCV_.notify_all();
     if (captureThread_.joinable()) captureThread_.join();

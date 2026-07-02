@@ -57,9 +57,13 @@ set(APP_SOURCES
     client/server_settings_dialog.cpp
     client/server_status_dialog.cpp
     client/media_decoder.cpp
+    client/audio_decoder.cpp
+    client/audio_player.cpp
     server/desktop_service.cpp
     server/media_encoder.cpp
     server/screen_capture.cpp
+    server/audio_capture.cpp
+    server/audio_encoder.cpp
     common/transport_tcp.cpp
     common/easytier_control.cpp
     common/ssh_session.cpp
@@ -77,9 +81,13 @@ set(APP_HEADERS
     client/server_settings_dialog.h
     client/server_status_dialog.h
     client/media_decoder.h
+    client/audio_decoder.h
+    client/audio_player.h
     server/desktop_service.h
     server/media_encoder.h
     server/screen_capture.h
+    server/audio_capture.h
+    server/audio_encoder.h
     service/ssh_server.h
     common/easytier_control.h
     common/ssh_session.h
@@ -96,7 +104,7 @@ target_link_libraries(RemoteControl
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network
     qtermwidget
     ${COMMON_LIBS}
-    gdi32 user32 winmm d3d11 dxgi d3dcompiler wtsapi32 userenv
+    gdi32 user32 winmm d3d11 dxgi d3dcompiler wtsapi32 userenv ole32 mmdevapi avrt
     ssh
 )
 

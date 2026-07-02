@@ -60,11 +60,13 @@ private slots:
     void onMouseMoveToggled(bool checked);
     void onMouseClickToggled(bool checked);
     void onKeyboardToggled(bool checked);
+    void onAudioToggled(bool checked);
 
 private:
     void createUI();
     void updateStatus(const QString& text);
     bool ensureDesktopConnected();
+    void sendAudioEnable(bool enabled);
 
     QLabel* lblMode_;
     QLabel* lblInfo_;
@@ -77,6 +79,7 @@ private:
     QCheckBox* chkMouseMove_;
     QCheckBox* chkMouseClick_;
     QCheckBox* chkKeyboard_;
+    QCheckBox* chkAudio_;
 
     ControlPanelConfig config_;
 

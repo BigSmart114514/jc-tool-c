@@ -14,6 +14,8 @@
 #include "../common/transport.h"
 #include "../common/protocol.h"
 #include "media_decoder.h"
+#include "audio_decoder.h"
+#include "audio_player.h"
 
 struct InputControlState;
 
@@ -56,6 +58,15 @@ private:
     ITransport* transport_ = nullptr;
     InputControlState* inputState_ = nullptr;
 
+    std::thread audioDecodeThread_;
+    std::atomic<bool> audioDecoding_{false};
+    std::mutex audioQueueMtx_;
+    std::condition_variable audioQueueCV_;
+    std::queue<BinaryData> audioQueue_;
+    AudioDecoder audioDecoder_;
+    AudioPlayer audioPlayer_;
+    bool audioReady_ = false;
+
     const int MAX_FPS = 30;
     const double FPS_UP_RATIO = 1.5;
     const double FPS_DOWN_RATIO = 0.7;
@@ -78,12 +89,15 @@ private:
     std::mutex decoderMtx_;
 
     void joinDecodeThread();
+    void joinAudioDecodeThread();
     bool initialStreamConfigured_ = false;
 
     void checkAndAdjustStreamQuality();
     void logStatistics();
     void decodeLoop();
+    void audioDecodeLoop();
     void handleScreenInfo(const BinaryData& data);
+    void handleAudioConfig(const BinaryData& data);
     void sendInput(const Desktop::InputEvent& ev);
     bool convertToImageCoords(int wx, int wy, int& ix, int& iy);
 

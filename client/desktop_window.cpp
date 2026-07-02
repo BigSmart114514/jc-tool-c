@@ -36,6 +36,9 @@ DesktopWindow::DesktopWindow(QWidget* parent)
     decoding_ = true;
     decodeThread_ = std::thread(&DesktopWindow::decodeLoop, this);
 
+    audioDecoding_ = true;
+    audioDecodeThread_ = std::thread(&DesktopWindow::audioDecodeLoop, this);
+
     // 初始化缩放定时器
     resizeTimer_.setSingleShot(true);
     connect(&resizeTimer_, &QTimer::timeout, this, &DesktopWindow::onResizeCooldown);
@@ -48,10 +51,16 @@ DesktopWindow::DesktopWindow(QWidget* parent)
 DesktopWindow::~DesktopWindow() {
     decoding_ = false;
     queueCV_.notify_all();
+    audioDecoding_ = false;
+    audioQueueCV_.notify_all();
     transport_ = nullptr;
     joinDecodeThread();
+    joinAudioDecodeThread();
     decoderReady_ = false;
     decoder_.cleanup();
+    audioReady_ = false;
+    audioDecoder_.cleanup();
+    audioPlayer_.cleanup();
 }
 
 void DesktopWindow::joinDecodeThread() {
@@ -70,6 +79,27 @@ void DesktopWindow::joinDecodeThread() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         try {
             decodeThread_.join();
+            break;
+        } catch (std::system_error&) {
+        }
+    }
+}
+
+void DesktopWindow::joinAudioDecodeThread() {
+    if (!audioDecodeThread_.joinable()) return;
+    auto start = std::chrono::steady_clock::now();
+    const int TIMEOUT_MS = 3000;
+    while (audioDecodeThread_.joinable()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed > TIMEOUT_MS) {
+            audioDecodeThread_.detach();
+            std::cerr << "[Desktop] Audio decode thread join timeout, detached" << std::endl;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        try {
+            audioDecodeThread_.join();
             break;
         } catch (std::system_error&) {
         }
@@ -103,17 +133,14 @@ void DesktopWindow::handleMessage(const BinaryData& data) {
         case Desktop::MsgType::VideoFrame:
             if (data.size() > 2) {
                 std::lock_guard<std::mutex> lock(queueMtx_);
-                //totalFramesReceived_++;
 
                 if (videoQueue_.size() > 3) {
                     int dropCount = videoQueue_.size();
-                    //droppedFrames_ += dropCount;
-                    intervalFramesDropped_ += dropCount; // 记录区间内丢帧
+                    intervalFramesDropped_ += dropCount;
 
                     std::queue<BinaryData> empty;
                     std::swap(videoQueue_, empty);
 
-                    // --- 新增：发生严重丢帧，立刻要求服务端发送关键帧 ---
                     if (transport_ && transport_->isConnected()) {
                         auto msg = MessageBuilder::KeyframeRequest();
                         transport_->send(msg);
@@ -122,13 +149,36 @@ void DesktopWindow::handleMessage(const BinaryData& data) {
                 
                 videoQueue_.push(data);
                 queueCV_.notify_one();
-
-                // 每隔 5 秒（或 150 帧）自动打印一次统计
-                // if (totalFramesReceived_ % 150 == 0) {
-                //     logStatistics();
-                // }
             }
             break;
+
+        case Desktop::MsgType::AudioConfig:
+            handleAudioConfig(data);
+            break;
+
+        case Desktop::MsgType::AudioData:
+            if (data.size() > 1) {
+                std::lock_guard<std::mutex> lock(audioQueueMtx_);
+                audioQueue_.push(data);
+                audioQueueCV_.notify_one();
+            }
+            break;
+
+        case Desktop::MsgType::AudioEnable: {
+            bool enable = (data.size() > 1 && data[1] != 0);
+            if (!enable) {
+                {
+                    std::lock_guard<std::mutex> al(audioQueueMtx_);
+                    std::queue<BinaryData> empty;
+                    std::swap(audioQueue_, empty);
+                }
+                audioDecoder_.cleanup();
+                audioPlayer_.cleanup();
+                audioReady_ = false;
+            }
+            break;
+        }
+
         default:
             break;
     }
@@ -164,7 +214,64 @@ void DesktopWindow::handleScreenInfo(const BinaryData& data) {
     }
 }
 
-// 独立的解码线程：消费者模式
+void DesktopWindow::handleAudioConfig(const BinaryData& data) {
+    if (data.size() < 8) return;
+
+    int32_t sampleRate;
+    memcpy(&sampleRate, data.data() + 1, sizeof(sampleRate));
+    uint8_t channels = data[5];
+    uint8_t ascLen = data[6];
+    const uint8_t* asc = data.data() + 7;
+
+    if (ascLen + 7 > (int)data.size()) return;
+
+    std::cout << "[Desktop] AudioConfig: " << sampleRate << "Hz "
+              << (int)channels << "ch, ASC size=" << (int)ascLen << std::endl;
+
+    audioDecoder_.cleanup();
+    audioPlayer_.cleanup();
+
+    if (!audioDecoder_.init(sampleRate, channels, asc, ascLen)) {
+        std::cerr << "[Desktop] Audio decoder init failed" << std::endl;
+        return;
+    }
+
+    if (!audioPlayer_.init(sampleRate, channels)) {
+        std::cerr << "[Desktop] Audio player init failed" << std::endl;
+        audioDecoder_.cleanup();
+        return;
+    }
+
+    audioReady_ = true;
+    std::cout << "[Desktop] Audio ready" << std::endl;
+}
+
+void DesktopWindow::audioDecodeLoop() {
+    while (audioDecoding_) {
+        BinaryData data;
+        {
+            std::unique_lock<std::mutex> lock(audioQueueMtx_);
+            audioQueueCV_.wait(lock, [this] {
+                return !audioQueue_.empty() || !audioDecoding_;
+            });
+            if (!audioDecoding_) break;
+            data = std::move(audioQueue_.front());
+            audioQueue_.pop();
+        }
+
+        if (!audioReady_) continue;
+
+        const uint8_t* aacData = data.data() + 1;
+        int aacSize = (int)data.size() - 1;
+
+        std::vector<uint8_t> pcm;
+        if (audioDecoder_.decode(aacData, aacSize, pcm) && !pcm.empty()) {
+            audioPlayer_.play(pcm.data(), (int)pcm.size());
+        }
+    }
+}
+
+// 独立的视频解码线程：消费者模式
 void DesktopWindow::decodeLoop() {
     std::vector<uint8_t> rgbData;
     

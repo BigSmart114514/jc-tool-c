@@ -109,6 +109,11 @@ void ControlPanel::createUI() {
     connect(chkKeyboard_, &QCheckBox::toggled, this, &ControlPanel::onKeyboardToggled);
     inputLayout->addWidget(chkKeyboard_);
 
+    chkAudio_ = new QCheckBox("Enable Audio (system sound)");
+    chkAudio_->setChecked(false);
+    connect(chkAudio_, &QCheckBox::toggled, this, &ControlPanel::onAudioToggled);
+    inputLayout->addWidget(chkAudio_);
+
     mainLayout->addWidget(inputGroup);
     mainLayout->addStretch();
 
@@ -189,6 +194,10 @@ void ControlPanel::toggleDesktop() {
     btnDesktop_->setText("Close Desktop");
     updateStatus("Desktop opened");
     dw->requestStream();
+
+    if (chkAudio_->isChecked()) {
+        sendAudioEnable(true);
+    }
 }
 
 void ControlPanel::toggleSftp() {
@@ -297,6 +306,9 @@ void ControlPanel::onExternalTerminal() {
 void ControlPanel::onDesktopWindowClosed() {
     btnDesktop_->setText("Remote Desktop");
     updateStatus("Desktop closed");
+    sendAudioEnable(false);
+    QMutexLocker lock(&windowMtx_);
+    desktopWindow_.clear();
 }
 
 void ControlPanel::onSftpWindowClosed() {
@@ -337,3 +349,15 @@ void ControlPanel::onDisconnect() {
 void ControlPanel::onMouseMoveToggled(bool checked) { inputState_.mouseMove = checked; }
 void ControlPanel::onMouseClickToggled(bool checked) { inputState_.mouseClick = checked; }
 void ControlPanel::onKeyboardToggled(bool checked) { inputState_.keyboard = checked; }
+
+void ControlPanel::onAudioToggled(bool checked) {
+    sendAudioEnable(checked);
+}
+
+void ControlPanel::sendAudioEnable(bool enabled) {
+    if (config_.desktopTransport && config_.desktopTransport->isConnected()) {
+        auto msg = MessageBuilder::AudioEnableMsg(enabled);
+        config_.desktopTransport->send(msg);
+    }
+    updateStatus(enabled ? "Audio enabled" : "Audio disabled");
+}

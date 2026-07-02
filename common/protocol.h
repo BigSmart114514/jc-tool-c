@@ -40,8 +40,11 @@ namespace Desktop {
         ScreenInfo      = 0x03,
         ClientReady     = 0x04,
         KeyframeRequest = 0x05,
-        StreamConfig    = 0x06,  // 新增：流配置
-        ClientDisconnect = 0x07 // 新增：客户端断开通知
+        StreamConfig    = 0x06,  // 流配置
+        ClientDisconnect = 0x07, // 客户端断开通知
+        AudioData       = 0x08,  // 音频数据（AAC帧）
+        AudioConfig     = 0x09,  // 音频配置（AudioSpecificConfig）
+        AudioEnable     = 0x0A   // 客户端→服务器：启用/禁用音频
     };
 
     #pragma pack(push, 1)
@@ -57,11 +60,16 @@ namespace Desktop {
         int32_t width;
         int32_t height;
     };
-    // --- 新增流配置结构体 ---
     struct StreamConfig {
-        int32_t width;               // 指定的长（宽）
-        int32_t fps;                 // 指定的FPS
-        int32_t keyframeIntervalSec; // 指定的关键帧间隔（秒）
+        int32_t width;
+        int32_t fps;
+        int32_t keyframeIntervalSec;
+    };
+
+    struct AudioConfigMsg {
+        int32_t sampleRate;
+        uint8_t channels;
+        uint8_t asc[2]; // AudioSpecificConfig for AAC LC
     };
     #pragma pack(pop)
 }
@@ -151,6 +159,30 @@ namespace MessageBuilder {
         return { static_cast<uint8_t>(Desktop::MsgType::ClientDisconnect) };
     }
 
+    inline BinaryData AudioConfig(int sampleRate, int channels, const uint8_t* asc, int ascLen) {
+        BinaryData msg(1 + sizeof(int32_t) + 1 + 1 + ascLen);
+        msg[0] = static_cast<uint8_t>(Desktop::MsgType::AudioConfig);
+        int32_t sr = sampleRate;
+        memcpy(msg.data() + 1, &sr, sizeof(sr));
+        msg[5] = static_cast<uint8_t>(channels);
+        msg[6] = static_cast<uint8_t>(ascLen);
+        if (ascLen > 0) memcpy(msg.data() + 7, asc, ascLen);
+        return msg;
+    }
+
+    inline BinaryData AudioData(const uint8_t* aacData, size_t aacSize) {
+        BinaryData msg(1 + aacSize);
+        msg[0] = static_cast<uint8_t>(Desktop::MsgType::AudioData);
+        if (aacSize > 0) memcpy(msg.data() + 1, aacData, aacSize);
+        return msg;
+    }
+
+    inline BinaryData AudioEnableMsg(bool enabled) {
+        BinaryData msg(2);
+        msg[0] = static_cast<uint8_t>(Desktop::MsgType::AudioEnable);
+        msg[1] = enabled ? 1 : 0;
+        return msg;
+    }
 
 }
 
