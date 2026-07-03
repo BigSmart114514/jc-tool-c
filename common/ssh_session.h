@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
+#include "direct_desktop_protocol.h"
 
 struct SFtpEntry {
     std::string name;
@@ -68,12 +69,20 @@ public:
     void setTerminalSize(int cols, int rows);
     void pollChannel(int timeoutMs);
 
+    // Direct Desktop (custom SSH subsystem)
+    bool openDirectDesktopChannel();
+    std::vector<UserListEntry> readUserList();
+    bool sendLogin(const std::string& username, const std::string& password);
+    int readDesktopPort(); // returns port, or -1 on error
+    void closeDirectDesktopChannel();
+
 private:
     bool ensureConnected();
 
     ssh_session session_ = nullptr;
     sftp_session sftp_ = nullptr;
     ssh_channel shellChannel_ = nullptr;
+    ssh_channel ddChannel_ = nullptr;
     bool connected_ = false;
     bool sftpInitialized_ = false;
     std::string error_;

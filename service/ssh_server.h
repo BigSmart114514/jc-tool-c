@@ -24,6 +24,7 @@ private:
     void handleSftpChannel(ssh_session session, ssh_channel channel);
     void handleShellChannel(ssh_session session, ssh_channel channel,
                             int cols, int rows);
+    void handleDirectDesktopChannel(ssh_session session, ssh_channel channel);
 
     static ssh_bind createBind(int port);
     bool setupHostKey(ssh_bind bind);

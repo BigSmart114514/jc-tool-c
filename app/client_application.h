@@ -18,7 +18,7 @@ public:
     int exec();
 
 private:
-    bool setupConnections(const ConnectionConfig& cfg);
+    bool setupDirectDesktop(const ConnectionConfig& cfg);
 
     std::unique_ptr<SshSession> sshSession_;
     std::unique_ptr<TCPClientTransport> desktopTransport_;

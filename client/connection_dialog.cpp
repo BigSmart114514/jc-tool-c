@@ -33,17 +33,10 @@ void ConnectionDialog::createUI() {
     sshForm->addRow("Username:", leUsername_);
     sshForm->addRow("Password:", lePassword_);
 
-    QLabel* pwdNote = new QLabel("SSH/SFTP/Shell 共享同一密码");
+    QLabel* pwdNote = new QLabel("桌面端口通过 SSH 自动获取");
     pwdNote->setStyleSheet("color: #888; font-size: 11px;");
     sshForm->addRow("", pwdNote);
     mainLayout->addWidget(sshGroup);
-
-    // Desktop streaming group
-    QGroupBox* desktopGroup = new QGroupBox("Remote Desktop");
-    QFormLayout* desktopForm = new QFormLayout(desktopGroup);
-    leDesktopPort_ = new QLineEdit("12345");
-    desktopForm->addRow("Desktop port:", leDesktopPort_);
-    mainLayout->addWidget(desktopGroup);
 
     // EasyTier group
     QGroupBox* etGroup = new QGroupBox("EasyTier VPN (via System Service)");
@@ -107,8 +100,6 @@ void ConnectionDialog::onConnect() {
     config_.sshPort = lePort_->text().toInt();
     config_.username = leUsername_->text().toStdString();
     config_.password = lePassword_->text().toStdString();
-
-    config_.desktopPort = leDesktopPort_->text().toInt();
 
     config_.useEasyTier = chkEasyTier_->isChecked();
     config_.easytierServerVip = leServerVip_->text().toStdString();

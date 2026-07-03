@@ -19,6 +19,9 @@
 #include <intrin.h>
 #include <userenv.h>
 #include <wtsapi32.h>
+#include <sstream>
+#include "../common/direct_desktop_protocol.h"
+#include "../server/virtual_display.h"
 #include "logging.h"
 
 #pragma comment(lib, "userenv.lib")
@@ -413,6 +416,20 @@ void SshServer::handleSession(ssh_session session) {
                         WriteLog(std::string("[SSH Server] SFTP exception: ") + e.what());
                     } catch (...) {
                         WriteLog("[SSH Server] SFTP unknown exception");
+                    }
+                    currentChannel = nullptr;
+                    ssh_disconnect(session);
+                    ssh_free(session);
+                    return;
+                } else if (sub && strcmp(sub, DIRECT_DESKTOP_SUBSYSTEM) == 0) {
+                    ssh_message_channel_request_reply_success(msg);
+                    WriteLog("[SSH Server] DirectDesktop subsystem request received");
+                    try {
+                        handleDirectDesktopChannel(session, currentChannel);
+                    } catch (const std::exception& e) {
+                        WriteLog(std::string("[SSH Server] DirectDesktop exception: ") + e.what());
+                    } catch (...) {
+                        WriteLog("[SSH Server] DirectDesktop unknown exception");
                     }
                     currentChannel = nullptr;
                     ssh_disconnect(session);
@@ -1366,4 +1383,413 @@ cleanup:
     if (hPtyInWr != INVALID_HANDLE_VALUE) CloseHandle(hPtyInWr);
     if (hPtyOutRd != INVALID_HANDLE_VALUE) CloseHandle(hPtyOutRd);
     if (hPtyOutWr != INVALID_HANDLE_VALUE) CloseHandle(hPtyOutWr);
+}
+
+// ─── Helper: get path to RemoteControl.exe in same dir as EasyTierService ──
+static std::wstring GetRemoteControlPath() {
+    wchar_t path[MAX_PATH + 1] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    return std::wstring(path) + L"RemoteControl.exe";
+}
+
+// ─── Security attributes for cross-session access ─────────────────────────
+static SECURITY_ATTRIBUTES MakeAllowAllSA() {
+    static SECURITY_DESCRIPTOR sd = {};
+    static bool init = false;
+    if (!init) {
+        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
+        init = true;
+    }
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+    return sa;
+}
+
+// ─── Helper: pick a dynamic port ──────────────────────────────────────────
+static int PickDynamicPort() {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return 12346;
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = 0;
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        closesocket(s);
+        return 12346;
+    }
+    int len = sizeof(addr);
+    getsockname(s, (sockaddr*)&addr, &len);
+    int port = ntohs(addr.sin_port);
+    closesocket(s);
+    return port;
+}
+
+// ─── Port persistence helpers (per-user) ──────────────────────────────────
+static std::wstring GetPortFilePath(const std::string& username) {
+    wchar_t progData[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"PROGRAMDATA", progData, MAX_PATH))
+        wcscpy_s(progData, L"C:\\ProgramData");
+    std::wstring dir = std::wstring(progData) + L"\\EasyTier";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\dd_" + widen(username.c_str()) + L".port";
+}
+
+static void SaveRunningPort(const std::string& username, int port) {
+    std::wstring path = GetPortFilePath(username);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    std::string data = std::to_string(port);
+    DWORD written;
+    WriteFile(h, data.data(), (DWORD)data.size(), &written, nullptr);
+    CloseHandle(h);
+}
+
+static int LoadRunningPort(const std::string& username) {
+    std::wstring path = GetPortFilePath(username);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    char buf[32] = {};
+    DWORD read;
+    if (!ReadFile(h, buf, (DWORD)sizeof(buf) - 1, &read, nullptr)) { CloseHandle(h); return 0; }
+    CloseHandle(h);
+    return atoi(buf);
+}
+
+static void RemoveRunningPort(const std::string& username) {
+    DeleteFileW(GetPortFilePath(username).c_str());
+}
+
+// ─── Enumerate users with active sessions ────────────────────────────────
+static std::vector<UserListEntry> EnumerateUsers() {
+    std::vector<UserListEntry> entries;
+    std::map<std::string, bool> userMap;
+
+    WTS_SESSION_INFO* sessions = nullptr;
+    DWORD sessionCount = 0;
+    if (!WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount))
+        return entries;
+
+    for (DWORD i = 0; i < sessionCount; ++i) {
+        if (sessions[i].State == WTSIdle || sessions[i].State == WTSListen)
+            continue;
+        wchar_t* userName = nullptr;
+        DWORD userNameSize = 0;
+        if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
+                                         WTSUserName, &userName, &userNameSize)) {
+            if (userName && *userName) {
+                std::string name = narrow(userName);
+                bool active = (sessions[i].State == WTSActive);
+                auto it = userMap.find(name);
+                if (it == userMap.end())
+                    userMap[name] = active;
+                else if (active)
+                    it->second = true;
+            }
+            if (userName) WTSFreeMemory(userName);
+        }
+    }
+    WTSFreeMemory(sessions);
+
+    for (const auto& pair : userMap)
+        entries.push_back({pair.first, pair.second});
+    return entries;
+}
+
+// ─── DirectDesktop handler ────────────────────────────────────────────────
+void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel channel) {
+    WriteLog("[DirectDesktop] Handler started");
+    ssh_set_blocking(session, 0);
+
+    std::vector<char> buf(4096);
+    std::vector<uint8_t> recvBuf;
+    std::string username, password;
+    DWORD deadline;
+
+    // ── 1. Enumerate users & send list ──────────────────────────────────────
+    auto users = EnumerateUsers();
+    auto userListMsg = BuildUserList(users);
+    if (ssh_channel_write(channel, userListMsg.data(), (int)userListMsg.size()) != (int)userListMsg.size()) {
+        WriteLog("[DirectDesktop] Failed to send user list");
+        return;
+    }
+    WriteLog(std::string("[DirectDesktop] Sent ") + std::to_string(users.size()) + " users");
+
+    // ── 2. Wait for login request (60s timeout) ─────────────────────────────
+    deadline = GetTickCount() + 60000;
+    bool gotCreds = false;
+    while (running_ && GetTickCount() < deadline) {
+        int rc = ssh_channel_read_nonblocking(channel, buf.data(), (int)buf.size(), 0);
+        if (rc > 0) {
+            recvBuf.insert(recvBuf.end(), buf.data(), buf.data() + rc);
+            if (recvBuf.size() >= 3 && recvBuf[0] == DD_C2S_CREDENTIAL_RESPONSE) {
+                if (ParseCredentialResponse(recvBuf.data(), recvBuf.size(), username, password)) {
+                    gotCreds = true;
+                    break;
+                }
+            }
+        } else if (rc == SSH_ERROR) {
+            WriteLog("[DirectDesktop] SSH error reading login");
+            return;
+        }
+        ssh_message msg;
+        while ((msg = ssh_message_get(session)) != nullptr) ssh_message_free(msg);
+        if (ssh_channel_is_eof(channel)) {
+            WriteLog("[DirectDesktop] Channel EOF before login");
+            return;
+        }
+        Sleep(100);
+    }
+    if (!gotCreds) {
+        WriteLog("[DirectDesktop] Login timeout");
+        auto err = BuildError("Login exchange timeout");
+        ssh_channel_write(channel, err.data(), (int)err.size());
+        return;
+    }
+    WriteLog(std::string("[DirectDesktop] Login for user: ") + username);
+
+    // ── 3. Check if already running (per-user event) ────────────────────────
+    std::wstring runningEventName = L"Global\\DD_Running_" + widen(username.c_str());
+    HANDLE hRunningEvent = OpenEventW(SYNCHRONIZE, FALSE, runningEventName.c_str());
+    bool isReused = false;
+
+    if (hRunningEvent) {
+        int existingPort = LoadRunningPort(username);
+        if (existingPort > 0) {
+            WriteLog(std::string("[DirectDesktop] Reusing session on port ") + std::to_string(existingPort));
+            auto result = BuildLoginResult(true);
+            ssh_channel_write(channel, result.data(), (int)result.size());
+            auto info = BuildDesktopInfo(existingPort, 0, 0);
+            ssh_channel_write(channel, info.data(), (int)info.size());
+            isReused = true;
+        } else {
+            WriteLog("[DirectDesktop] Running event stale, starting fresh");
+            CloseHandle(hRunningEvent);
+            hRunningEvent = nullptr;
+        }
+    }
+
+    // ── 4. Launch new session (if not reused) ───────────────────────────────
+    HANDLE hProcess = nullptr;
+    std::wstring virtualOutput;
+
+    if (!isReused) {
+        // 4a. Authenticate & get token
+        HANDLE hLaunchToken = nullptr;
+        bool authOk = false;
+
+        // Find if user has an active session
+        WTS_SESSION_INFO* sessions = nullptr;
+        DWORD sessionCount = 0;
+        bool userHasSession = false;
+        DWORD userSessionId = 0xFFFFFFFF;
+        if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount)) {
+            for (DWORD i = 0; i < sessionCount; ++i) {
+                wchar_t* u = nullptr;
+                DWORD us = 0;
+                if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
+                                                 WTSUserName, &u, &us)) {
+                    if (u && *u && narrow(u) == username) {
+                        userSessionId = sessions[i].SessionId;
+                        if (sessions[i].State == WTSActive || sessions[i].State == WTSConnected) {
+                            userHasSession = true;
+                        }
+                    }
+                    if (u) WTSFreeMemory(u);
+                }
+            }
+            WTSFreeMemory(sessions);
+        }
+
+        if (userHasSession) {
+            // User already logged in — get their token
+            if (WTSQueryUserToken(userSessionId, &hLaunchToken)) {
+                authOk = true;
+                WriteLog("[DirectDesktop] User has active session, using WTS token");
+            }
+        } else if (!password.empty()) {
+            // User not logged in — validate password via LogonUser
+            HANDLE hLogonToken = nullptr;
+            if (LogonUserW(widen(username.c_str()).c_str(), L".", widen(password.c_str()).c_str(),
+                           LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, &hLogonToken)) {
+                // Try to assign to console session
+                DWORD csid = WTSGetActiveConsoleSessionId();
+                if (csid != 0xFFFFFFFF)
+                    SetTokenInformation(hLogonToken, TokenSessionId, &csid, sizeof(csid));
+                hLaunchToken = hLogonToken;
+                authOk = true;
+                WriteLog("[DirectDesktop] User not logged in, LogonUser OK");
+            } else {
+                DWORD gle = GetLastError();
+                WriteLog(std::string("[DirectDesktop] LogonUser failed: ") + std::to_string(gle));
+            }
+        }
+
+        if (!authOk) {
+            WriteLog("[DirectDesktop] Auth failed for " + username);
+            auto result = BuildLoginResult(false);
+            ssh_channel_write(channel, result.data(), (int)result.size());
+            return;
+        }
+
+        WriteLog("[DirectDesktop] Auth OK");
+        auto result = BuildLoginResult(true);
+        ssh_channel_write(channel, result.data(), (int)result.size());
+
+        // 4b. Enable virtual display
+        virtualOutput = EnableVirtualDisplay();
+        if (virtualOutput.empty()) {
+            WriteLog("[DirectDesktop] EnableVirtualDisplay failed");
+            auto err = BuildError("Failed to enable virtual display");
+            ssh_channel_write(channel, err.data(), (int)err.size());
+            if (hLaunchToken) CloseHandle(hLaunchToken);
+            return;
+        }
+        WriteLog("[DirectDesktop] Virtual display: " + narrow(virtualOutput));
+
+        // 4c. Pick port & create ready pipe
+        int desktopPort = PickDynamicPort();
+        DWORD pid = GetCurrentProcessId();
+        SECURITY_ATTRIBUTES sa = MakeAllowAllSA();
+
+        std::wstring pipeName = std::wstring(DIRECT_DESKTOP_READY_PIPE_PREFIX)
+                                + std::to_wstring(pid) + L"_" + std::to_wstring(desktopPort);
+        HANDLE hReadyPipe = CreateNamedPipeW(pipeName.c_str(),
+            PIPE_ACCESS_INBOUND, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            1, 4096, 4096, 30000, &sa);
+
+        // 4d. Create per-user running event
+        hRunningEvent = CreateEventW(&sa, TRUE, FALSE, runningEventName.c_str());
+
+        if (hReadyPipe == INVALID_HANDLE_VALUE || !hRunningEvent) {
+            WriteLog("[DirectDesktop] Pipe/event creation failed");
+            auto err = BuildError("Internal error");
+            ssh_channel_write(channel, err.data(), (int)err.size());
+            if (hRunningEvent) CloseHandle(hRunningEvent);
+            if (hReadyPipe != INVALID_HANDLE_VALUE) CloseHandle(hReadyPipe);
+            if (hLaunchToken) CloseHandle(hLaunchToken);
+            DisableVirtualDisplay();
+            return;
+        }
+
+        // 4e. Launch RemoteControl.exe
+        std::wstring exePath = GetRemoteControlPath();
+        std::wstringstream cmdLine;
+        cmdLine << L"\"RemoteControl.exe\" --direct-desktop --port " << desktopPort
+                << L" --ready-pipe " << pipeName
+                << L" --capture-output " << virtualOutput
+                << L" --exit-event " << runningEventName;
+
+        STARTUPINFOW si = { sizeof(si) };
+        si.lpDesktop = L"winsta0\\default";
+        PROCESS_INFORMATION pi = {};
+        BOOL created = CreateProcessAsUserW(hLaunchToken,
+            exePath.c_str(), (wchar_t*)cmdLine.str().c_str(),
+            nullptr, nullptr, FALSE,
+            CREATE_NEW_CONSOLE | CREATE_NO_WINDOW,
+            nullptr, nullptr, &si, &pi);
+        DWORD gle = created ? 0 : GetLastError();
+        CloseHandle(hLaunchToken);
+
+        if (!created) {
+            WriteLog(std::string("[DirectDesktop] CreateProcessAsUser failed: ") + std::to_string(gle));
+            auto err = BuildError("Failed to launch RemoteControl");
+            ssh_channel_write(channel, err.data(), (int)err.size());
+            CloseHandle(hRunningEvent);
+            CloseHandle(hReadyPipe);
+            DisableVirtualDisplay();
+            return;
+        }
+        CloseHandle(pi.hThread);
+        hProcess = pi.hProcess;
+
+        // 4f. Wait for ready signal
+        bool ready = false;
+        if (ConnectNamedPipe(hReadyPipe, nullptr)) {
+            char pipeBuf[64] = {};
+            DWORD read = 0;
+            if (ReadFile(hReadyPipe, pipeBuf, (DWORD)sizeof(pipeBuf) - 1, &read, nullptr) && read > 0) {
+                pipeBuf[read] = '\0';
+                int actualPort = atoi(pipeBuf);
+                if (actualPort > 0) { desktopPort = actualPort; ready = true; }
+            }
+        }
+        CloseHandle(hReadyPipe);
+
+        if (!ready) {
+            WriteLog("[DirectDesktop] Ready signal timeout");
+            SetEvent(hRunningEvent);
+            TerminateProcess(hProcess, 1);
+            CloseHandle(hProcess); hProcess = nullptr;
+            CloseHandle(hRunningEvent); hRunningEvent = nullptr;
+            RemoveRunningPort(username);
+            DisableVirtualDisplay();
+            return;
+        }
+
+        // 4g. Save port & send desktop info
+        SaveRunningPort(username, desktopPort);
+        auto info = BuildDesktopInfo(desktopPort, 0, 0);
+        ssh_channel_write(channel, info.data(), (int)info.size());
+        WriteLog(std::string("[DirectDesktop] Streaming on port ") + std::to_string(desktopPort));
+    }
+
+    // ── 5. Monitor channel (process, screen-off, EOF) ───────────────────────
+    while (running_) {
+        if (hProcess && WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+            WriteLog("[DirectDesktop] RemoteControl process exited");
+            break;  // process died → cleanup
+        }
+        if (ssh_channel_is_eof(channel)) {
+            WriteLog("[DirectDesktop] Client disconnected");
+            if (isReused) goto keep_alive;  // don't own the session
+            break;  // owner → cleanup
+        }
+
+        int rc = ssh_channel_read_nonblocking(channel, buf.data(), (int)buf.size(), 0);
+        if (rc > 0) {
+            if (buf[0] == DD_C2S_SCREEN_OFF) {
+                WriteLog("[DirectDesktop] Screen-off request via SSH (handled via TCP)");
+            } else if (buf[0] == DD_C2S_SHUTDOWN) {
+                WriteLog("[DirectDesktop] Shutdown requested via SSH");
+                break;  // explicit shutdown → cleanup
+            }
+        } else if (rc == SSH_ERROR) {
+            WriteLog("[DirectDesktop] Channel error");
+            if (isReused) goto keep_alive;
+            break;
+        }
+
+        ssh_message msg;
+        while ((msg = ssh_message_get(session)) != nullptr) ssh_message_free(msg);
+        Sleep(500);
+    }
+
+    // ── 6. Cleanup (process exit or explicit shutdown) ───────────────────────
+    WriteLog("[DirectDesktop] Cleaning up...");
+    RestorePhysicalMonitors(virtualOutput);
+    if (hRunningEvent) {
+        SetEvent(hRunningEvent);
+        if (hProcess) {
+            WaitForSingleObject(hProcess, 5000);
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        RemoveRunningPort(username);
+        CloseHandle(hRunningEvent);
+    } else if (hProcess) {
+        CloseHandle(hProcess);
+    }
+    DisableVirtualDisplay();
+    WriteLog("[DirectDesktop] Cleanup complete");
+    return;
+
+    // ── Keep-alive path (client disconnected, process stays) ─────────────────
+keep_alive:
+    WriteLog("[DirectDesktop] Session preserved for reconnection");
+    // Don't signal event, don't kill process, don't remove port, don't disable display
+    return;
 }

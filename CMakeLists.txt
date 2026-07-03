@@ -18,6 +18,18 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR}/thirdparty/easytier/include)
 link_directories(${EASYTIER_DIR}/lib)
 
+# usbmmidd_v2
+set(USBMMIDD_DIR "${CMAKE_SOURCE_DIR}/../usbmmidd_v2")
+if(NOT EXISTS ${USBMMIDD_DIR})
+    message(FATAL_ERROR "Easytier library not found at ${EASYTIER_DIR}")
+endif()
+set(USBMMIDD_FILES
+"${USBMMIDD_DIR}/deviceinstaller64.exe"
+"${USBMMIDD_DIR}/usbmmidd.cat"
+"${USBMMIDD_DIR}/usbmmIdd.inf"
+)
+
+
 # libssh
 set(LIBSSH_DIR "${CMAKE_SOURCE_DIR}/../libssh")
 if(NOT EXISTS ${LIBSSH_DIR})
@@ -47,15 +59,13 @@ set(COMMON_LIBS
 set(APP_SOURCES
     app/main.cpp
     app/client_application.cpp
-    app/server_application.cpp
     client/control_panel.cpp
     client/desktop_window.cpp
     client/sftp_window.cpp
     client/ssh_terminal.cpp
     client/connection_dialog.cpp
+    client/user_select_dialog.cpp
     client/service_manager_dialog.cpp
-    client/server_settings_dialog.cpp
-    client/server_status_dialog.cpp
     client/media_decoder.cpp
     client/audio_decoder.cpp
     client/audio_player.cpp
@@ -67,19 +77,19 @@ set(APP_SOURCES
     common/transport_tcp.cpp
     common/easytier_control.cpp
     common/ssh_session.cpp
+    server/virtual_display.cpp
+    service/logging.cpp
 )
 
 set(APP_HEADERS
     app/client_application.h
-    app/server_application.h
     client/control_panel.h
     client/desktop_window.h
     client/sftp_window.h
     client/ssh_terminal.h
     client/connection_dialog.h
+    client/user_select_dialog.h
     client/service_manager_dialog.h
-    client/server_settings_dialog.h
-    client/server_status_dialog.h
     client/media_decoder.h
     client/audio_decoder.h
     client/audio_player.h
@@ -96,7 +106,7 @@ set(APP_HEADERS
 # 创建单个可执行文件 (使用 WIN32 隐藏控制台，只显示 Qt 界面)
 #add_executable(RemoteControl WIN32 ${APP_SOURCES} ${APP_HEADERS})
 add_executable(RemoteControl ${APP_SOURCES} ${APP_HEADERS})
-set_property(TARGET RemoteControl APPEND_STRING PROPERTY LINK_FLAGS " /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
+set_property(TARGET RemoteControl APPEND_STRING PROPERTY LINK_FLAGS " /MANIFEST:EMBED /MANIFESTINPUT:\"${CMAKE_SOURCE_DIR}/app/RemoteControl.exe.manifest\"")
 
 target_include_directories(RemoteControl PRIVATE ${CMAKE_SOURCE_DIR})
 
@@ -106,6 +116,7 @@ target_link_libraries(RemoteControl
     ${COMMON_LIBS}
     gdi32 user32 winmm d3d11 dxgi d3dcompiler wtsapi32 userenv ole32 mmdevapi avrt
     ssh
+    setupapi
 )
 
 # 输出目录
@@ -123,6 +134,7 @@ add_executable(EasyTierService
     service/logging.cpp
     common/easytier_control.cpp
     service/ssh_server.cpp
+    server/virtual_display.cpp
 )
 target_include_directories(EasyTierService PRIVATE
     ${CMAKE_SOURCE_DIR}
@@ -136,6 +148,7 @@ target_link_libraries(EasyTierService
     userenv
     wtsapi32
     ssh
+    setupapi
 )
 set_target_properties(EasyTierService PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release
@@ -143,7 +156,6 @@ set_target_properties(EasyTierService PROPERTIES
 )
 
 # 复制 DLL
-
 if(WIN32)
     # 可靠地获取 Qt bin 目录
     find_program(QT_QMAKE_EXECUTABLE qmake HINTS ${Qt6_DIR} ENV Qt6_DIR REQUIRED)
@@ -171,8 +183,10 @@ if(WIN32)
 
     add_custom_command(TARGET RemoteControl POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:RemoteControl>/platforms
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EASYTIER_DLLS} ${LIBSSH_DLLS} ${QT_DLLS} ${CONPTY_DLLS} $<TARGET_FILE_DIR:RemoteControl>
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:RemoteControl>/x64
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EASYTIER_DLLS} ${LIBSSH_DLLS} ${QT_DLLS} ${CONPTY_DLLS} ${USBMMIDD_FILES} $<TARGET_FILE_DIR:RemoteControl>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qwindows.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${USBMMIDD_DIR}/x64/usbmmIdd.dll" $<TARGET_FILE_DIR:RemoteControl>/x64/
         # 根据需要添加其他平台插件
         # COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QT_BIN_DIR}/../plugins/platforms/qdirect2d.dll" $<TARGET_FILE_DIR:RemoteControl>/platforms/
         COMMENT "Copying runtime DLLs, Qt platform plugin, and ConPTY binaries..."
@@ -183,4 +197,5 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EASYTIER_DLLS} $<TARGET_FILE_DIR:EasyTierService>
         COMMENT "Copying EasyTier DLLs for EasyTierService..."
     )
+
 endif()

@@ -61,6 +61,8 @@ private slots:
     void onMouseClickToggled(bool checked);
     void onKeyboardToggled(bool checked);
     void onAudioToggled(bool checked);
+    void onScreenOff();
+    void onShutdownServer();
 
 private:
     void createUI();
@@ -73,6 +75,8 @@ private:
     QStatusBar* statusBar_;
     QPushButton* btnDesktop_;
     QPushButton* btnSftp_;
+    QPushButton* btnScreenOff_;
+    QPushButton* btnShutdown_;
     QPushButton* btnSshTerminal_;
     QPushButton* btnExternalTerminal_;
     QPushButton* btnDisconnect_;

@@ -102,6 +102,7 @@ bool SshSession::reconnect() {
 
 void SshSession::disconnect() {
     closeShell();
+    closeDirectDesktopChannel();
 
     if (sftp_) {
         sftp_free(sftp_);
@@ -722,5 +723,152 @@ void SshSession::pollChannel(int timeoutMs) {
         if (shellOnData_) {
             shellOnData_(buffer.data(), rc);
         }
+    }
+}
+
+// ─── Direct Desktop subsystem ────────────────────────────────────────────
+
+bool SshSession::openDirectDesktopChannel() {
+    if (!connected_ || !session_) return false;
+    if (ddChannel_) return true;
+
+    ddChannel_ = ssh_channel_new(session_);
+    if (!ddChannel_) {
+        error_ = "ssh_channel_new failed: " + std::string(ssh_get_error(session_));
+        return false;
+    }
+
+    int rc = ssh_channel_open_session(ddChannel_);
+    if (rc != SSH_OK) {
+        error_ = "ssh_channel_open_session failed: " + std::string(ssh_get_error(session_));
+        ssh_channel_free(ddChannel_);
+        ddChannel_ = nullptr;
+        return false;
+    }
+
+    rc = ssh_channel_request_subsystem(ddChannel_, DIRECT_DESKTOP_SUBSYSTEM);
+    if (rc != SSH_OK) {
+        error_ = "subsystem request failed: " + std::string(ssh_get_error(session_));
+        ssh_channel_close(ddChannel_);
+        ssh_channel_free(ddChannel_);
+        ddChannel_ = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+std::vector<UserListEntry> SshSession::readUserList() {
+    std::vector<UserListEntry> entries;
+    if (!ddChannel_) return entries;
+
+    std::vector<char> buf(4096);
+    DWORD deadline = GetTickCount() + 10000;
+    std::vector<uint8_t> recvBuf;
+
+    while (GetTickCount() < deadline) {
+        int rc = ssh_channel_read_nonblocking(ddChannel_, buf.data(), (int)buf.size(), 0);
+        if (rc > 0) {
+            recvBuf.insert(recvBuf.end(), buf.data(), buf.data() + rc);
+            if (!recvBuf.empty() && recvBuf[0] == DD_S2C_USER_LIST) {
+                entries = ParseUserList(recvBuf.data(), recvBuf.size());
+                return entries;
+            }
+            if (!recvBuf.empty() && recvBuf[0] == DD_S2C_ERROR) {
+                std::string errMsg(recvBuf.begin() + 1, recvBuf.end());
+                error_ = "Server error: " + errMsg;
+                return entries;
+            }
+        } else if (rc == SSH_ERROR) {
+            error_ = "SSH read error: " + std::string(ssh_get_error(session_));
+            return entries;
+        }
+        if (ssh_channel_is_eof(ddChannel_)) {
+            error_ = "Channel closed by server";
+            return entries;
+        }
+        Sleep(50);
+    }
+    error_ = "Timeout waiting for user list";
+    return entries;
+}
+
+bool SshSession::sendLogin(const std::string& username, const std::string& password) {
+    if (!ddChannel_) return false;
+
+    std::vector<uint8_t> msg;
+    msg.push_back(DD_C2S_CREDENTIAL_RESPONSE);
+    uint8_t userLen = static_cast<uint8_t>((std::min)(username.size(), size_t(255)));
+    msg.push_back(userLen);
+    if (userLen > 0) msg.insert(msg.end(), username.begin(), username.begin() + userLen);
+    uint8_t passLen = static_cast<uint8_t>((std::min)(password.size(), size_t(255)));
+    msg.push_back(passLen);
+    if (passLen > 0) msg.insert(msg.end(), password.begin(), password.begin() + passLen);
+
+    int written = ssh_channel_write(ddChannel_, msg.data(), (int)msg.size());
+    if (written != (int)msg.size()) {
+        error_ = "Failed to send login: " + std::string(ssh_get_error(session_));
+        return false;
+    }
+    return true;
+}
+
+int SshSession::readDesktopPort() {
+    if (!ddChannel_) return -1;
+
+    std::vector<char> buf(4096);
+    DWORD deadline = GetTickCount() + 10000;
+    std::vector<uint8_t> recvBuf;
+    bool gotResult = false;
+    bool success = false;
+
+    while (GetTickCount() < deadline) {
+        int rc = ssh_channel_read_nonblocking(ddChannel_, buf.data(), (int)buf.size(), 0);
+        if (rc > 0) {
+            recvBuf.insert(recvBuf.end(), buf.data(), buf.data() + rc);
+
+            while (recvBuf.size() >= 1) {
+                uint8_t type = recvBuf[0];
+                if (type == DD_S2C_LOGIN_RESULT && recvBuf.size() >= 2) {
+                    success = (recvBuf[1] == 0);
+                    gotResult = true;
+                    recvBuf.erase(recvBuf.begin(), recvBuf.begin() + 2);
+                } else if (type == DD_S2C_DESKTOP_INFO && recvBuf.size() >= 1 + sizeof(DirectDesktopInfo)) {
+                    if (success) {
+                        auto* info = reinterpret_cast<const DirectDesktopInfo*>(recvBuf.data() + 1);
+                        return info->port;
+                    }
+                    return -1;
+                } else if (type == DD_S2C_ERROR && recvBuf.size() >= 2) {
+                    std::string errMsg(recvBuf.begin() + 1, recvBuf.end());
+                    error_ = "Server error: " + errMsg;
+                    return -1;
+                } else {
+                    break;
+                }
+            }
+            if (gotResult && !success) {
+                error_ = "Login rejected by server";
+                return -1;
+            }
+        } else if (rc == SSH_ERROR) {
+            error_ = "SSH read error: " + std::string(ssh_get_error(session_));
+            return -1;
+        }
+        if (ssh_channel_is_eof(ddChannel_)) {
+            error_ = "Channel closed by server";
+            return -1;
+        }
+        Sleep(50);
+    }
+    error_ = "Timeout waiting for desktop info";
+    return -1;
+}
+
+void SshSession::closeDirectDesktopChannel() {
+    if (ddChannel_) {
+        ssh_channel_close(ddChannel_);
+        ssh_channel_free(ddChannel_);
+        ddChannel_ = nullptr;
     }
 }

@@ -14,12 +14,9 @@ struct ConnectionConfig {
     std::string username;
     std::string password;
 
-    // Desktop (separate TCP transport)
-    int desktopPort = 12345;
-
     // EasyTier
     bool useEasyTier = false;
-    std::string easytierServerVip;        // 服务器的 VPN 虚拟 IP（用于 SSH/SFTP/Desktop）
+    std::string easytierServerVip;
 };
 
 class ConnectionDialog : public QDialog {
@@ -42,7 +39,6 @@ private:
     QLineEdit* lePort_;
     QLineEdit* leUsername_;
     QLineEdit* lePassword_;
-    QLineEdit* leDesktopPort_;
 
     QCheckBox* chkEasyTier_;
     QLineEdit* leServerVip_;

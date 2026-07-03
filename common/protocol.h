@@ -44,7 +44,9 @@ namespace Desktop {
         ClientDisconnect = 0x07, // 客户端断开通知
         AudioData       = 0x08,  // 音频数据（AAC帧）
         AudioConfig     = 0x09,  // 音频配置（AudioSpecificConfig）
-        AudioEnable     = 0x0A   // 客户端→服务器：启用/禁用音频
+        AudioEnable     = 0x0A,   // 客户端→服务器：启用/禁用音频
+        ScreenOff       = 0x0B,   // 客户端→服务器：熄屏
+        Shutdown        = 0x0C    // 客户端→服务器：关闭远程服务器
     };
 
     #pragma pack(push, 1)
@@ -182,6 +184,14 @@ namespace MessageBuilder {
         msg[0] = static_cast<uint8_t>(Desktop::MsgType::AudioEnable);
         msg[1] = enabled ? 1 : 0;
         return msg;
+    }
+
+    inline BinaryData ScreenOff() {
+        return { static_cast<uint8_t>(Desktop::MsgType::ScreenOff) };
+    }
+
+    inline BinaryData ShutdownCmd() {
+        return { static_cast<uint8_t>(Desktop::MsgType::Shutdown) };
     }
 
 }

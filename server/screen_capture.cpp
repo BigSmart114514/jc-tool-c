@@ -1,5 +1,6 @@
 
 #include "screen_capture.h"
+#include <windows.h>
 #include <iostream>
 
 ScreenCapture::ScreenCapture() {}
@@ -23,10 +24,72 @@ bool ScreenCapture::initDXGI() {
                                         nullptr, 0, D3D11_SDK_VERSION, &device_, &fl, &context_);
         if (FAILED(hr)) return false;
     }
-    return initDuplication();
+
+    // If a specific output name is set, find its index
+    int outputIndex = 0;
+    if (!captureOutputName_.empty()) {
+        outputIndex = -1;
+        IDXGIDevice* dxgiDev = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev))) {
+            IDXGIAdapter* adapter = nullptr;
+            if (SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
+                for (int i = 0;; ++i) {
+                    IDXGIOutput* output = nullptr;
+                    if (FAILED(adapter->EnumOutputs(i, &output))) break;
+                    DXGI_OUTPUT_DESC desc;
+                    output->GetDesc(&desc);
+                    if (captureOutputName_ == desc.DeviceName) {
+                        outputIndex = i;
+                        output->Release();
+                        break;
+                    }
+                    output->Release();
+                }
+                adapter->Release();
+            }
+            dxgiDev->Release();
+        }
+        if (outputIndex < 0) {
+            std::cerr << "[Capture] Output device not found: ";
+            std::wcerr << captureOutputName_ << std::endl;
+            // Find the virtual display: prefer non-primary output
+            outputIndex = -1;
+            int totalOutputs = 0;
+            IDXGIAdapter* adapter2 = nullptr;
+            IDXGIDevice* dxgiDev2 = nullptr;
+            if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev2)) &&
+                SUCCEEDED(dxgiDev2->GetAdapter(&adapter2))) {
+                for (int i = 0;; ++i) {
+                    IDXGIOutput* output = nullptr;
+                    if (FAILED(adapter2->EnumOutputs(i, &output))) break;
+                    ++totalOutputs;
+                    DXGI_OUTPUT_DESC desc;
+                    output->GetDesc(&desc);
+                    MONITORINFOEXW mi = { sizeof(mi) };
+                    if (GetMonitorInfoW(desc.Monitor, &mi)) {
+                        if (!(mi.dwFlags & MONITORINFOF_PRIMARY)) {
+                            outputIndex = i;
+                            output->Release();
+                            break;
+                        }
+                    }
+                    output->Release();
+                }
+                adapter2->Release();
+            }
+            if (dxgiDev2) dxgiDev2->Release();
+            if (outputIndex < 0 && totalOutputs > 0)
+                outputIndex = totalOutputs - 1; // fallback: highest index
+            if (outputIndex < 0)
+                outputIndex = 0;
+            std::cerr << "[Capture] Using output index: " << outputIndex << std::endl;
+        }
+    }
+
+    return initDuplication(outputIndex);
 }
 
-bool ScreenCapture::initDuplication() {
+bool ScreenCapture::initDuplication(int outputIndex) {
     if (!device_) return false;
 
     IDXGIDevice* dxgiDev = nullptr;
@@ -39,7 +102,7 @@ bool ScreenCapture::initDuplication() {
     if (FAILED(hr)) return false;
 
     IDXGIOutput* output = nullptr;
-    hr = adapter->EnumOutputs(0, &output);
+    hr = adapter->EnumOutputs(outputIndex, &output);
     adapter->Release();
     if (FAILED(hr)) return false;
 
@@ -57,6 +120,8 @@ bool ScreenCapture::initDuplication() {
 
     width_ = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
     height_ = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+    desktopOriginX_ = desc.DesktopCoordinates.left;
+    desktopOriginY_ = desc.DesktopCoordinates.top;
 
     if (!stagingTexture_) {
         D3D11_TEXTURE2D_DESC td = {};

@@ -154,6 +154,15 @@ void DesktopService::onMessage(const BinaryData& data) {
             }
             break;
         }
+        case Desktop::MsgType::ScreenOff:
+            DisablePhysicalMonitors(capture_.getCaptureOutput());
+            break;
+
+        case Desktop::MsgType::Shutdown:
+            std::cout << "[Desktop] Shutdown requested via TCP" << std::endl;
+            running_ = false;
+            break;
+
         default:
             break;
     }
@@ -287,26 +296,43 @@ void DesktopService::processInput() {
         inputQueue_.pop();
 
         if (ev.type == 0) {
-            // Client sends coordinates in the encoded-image space (targetWidth_ x targetHeight_).
-            // Scale them to the physical capture space (capture_.getWidth() x capture_.getHeight())
-            // so that SetCursorPos / mouse_event land on the correct pixel.
             int physX = ev.x, physY = ev.y;
             int capW = capture_.getWidth(), capH = capture_.getHeight();
             int encW = encoder_.encodedWidth();
             int encH = encoder_.encodedHeight();
             if (encW > 0 && encH > 0 && capW > 0 && capH > 0) {
-                physX = ev.x * capW / encW;
-                physY = ev.y * capH / encH;
+                physX = ev.x * capW / encW + capture_.getOriginX();
+                physY = ev.y * capH / encH + capture_.getOriginY();
             }
-            SetCursorPos(physX, physY);
+
+            ZeroMemory(&input, sizeof(input));
+            input.type = INPUT_MOUSE;
+            int vsLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vsTop  = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vsW    = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            int vsH    = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if (vsW > 1 && vsH > 1) {
+                input.mi.dx = (DWORD)(((physX - vsLeft) * 65535) / (vsW - 1));
+                input.mi.dy = (DWORD)(((physY - vsTop) * 65535) / (vsH - 1));
+                input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+            } else {
+                input.mi.dwFlags = MOUSEEVENTF_MOVE;
+            }
+
             switch (ev.key) {
-                case 1: mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0); break;
-                case 2: mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0); break;
-                case 3: mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0); break;
-                case 4: mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0); break;
-                case 5: mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0); break;
-                case 6: mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0); break;
-                case 7: mouse_event(MOUSEEVENTF_WHEEL, 0, 0, ev.flags, 0); break;
+                case 0: break; // move only
+                case 1: input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN; break;
+                case 2: input.mi.dwFlags |= MOUSEEVENTF_LEFTUP; break;
+                case 3: input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN; break;
+                case 4: input.mi.dwFlags |= MOUSEEVENTF_RIGHTUP; break;
+                case 5: input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN; break;
+                case 6: input.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP; break;
+                case 7: input.mi.dwFlags |= MOUSEEVENTF_WHEEL; input.mi.mouseData = ev.flags; break;
+            }
+
+            UINT sent = SendInput(1, &input, sizeof(INPUT));
+            if (sent == 0) {
+                std::cerr << "[Desktop] SendInput failed: " << GetLastError() << std::endl;
             }
         } else {
             ZeroMemory(&input, sizeof(INPUT));

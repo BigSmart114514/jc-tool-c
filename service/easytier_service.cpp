@@ -11,6 +11,7 @@
 
 #include "easytier_service.h"
 #include "logging.h"
+#include "../server/virtual_display.h"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -156,6 +157,20 @@ bool EasyTierService::init() {
     if (config_.sshEnabled && !config_.sshPassword.empty()) {
         startSshServer(config_.sshPort, config_.sshPassword);
     }
+
+    // Check usbmmidd at startup (for direct desktop feature)
+    WriteLog("[Service] Checking usbmmidd...");
+    if (!IsUsbmmIdInstalled()) {
+        WriteLog("[Service] usbmmidd not installed, attempting install...");
+        if (InstallUsbmmId()) {
+            WriteLog("[Service] usbmmidd installed successfully");
+        } else {
+            WriteLog("[Service] usbmmidd install failed (may need bundled driver files in exe dir)");
+        }
+    } else {
+        WriteLog("[Service] usbmmidd is already installed");
+    }
+
     return true;
 }
 
@@ -284,6 +299,9 @@ void EasyTierService::stopEasyTier() {
         retain_network_instance(nullptr, 0);   // <-- 释放 FFI 后台实例
         WriteLog("EasyTier stopped");
     }
+    // Safety net: ensure virtual display is removed and physical monitors restored
+    RestorePhysicalMonitors(L"");  // re-enable all displays (may fail in Session 0)
+    DisableVirtualDisplay();
 }
 
 bool EasyTierService::restartEasyTier() {

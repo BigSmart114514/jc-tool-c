@@ -7,6 +7,7 @@
 #include <QFrame>
 #include <QApplication>
 #include <QMessageBox>
+#include <QTimer>
 #include <iostream>
 #include <wchar.h>
 
@@ -83,6 +84,16 @@ void ControlPanel::createUI() {
     btnSftp_->setMinimumHeight(32);
     connect(btnSftp_, &QPushButton::clicked, this, &ControlPanel::toggleSftp);
     windowLayout->addWidget(btnSftp_);
+
+    btnScreenOff_ = new QPushButton("熄灭显示器");
+    btnScreenOff_->setMinimumHeight(32);
+    connect(btnScreenOff_, &QPushButton::clicked, this, &ControlPanel::onScreenOff);
+    windowLayout->addWidget(btnScreenOff_);
+
+    btnShutdown_ = new QPushButton("关闭远程服务器");
+    btnShutdown_->setMinimumHeight(32);
+    connect(btnShutdown_, &QPushButton::clicked, this, &ControlPanel::onShutdownServer);
+    windowLayout->addWidget(btnShutdown_);
 
     mainLayout->addWidget(windowGroup);
 
@@ -326,24 +337,28 @@ void ControlPanel::onDisconnect() {
         "Disconnect and exit?", QMessageBox::Yes | QMessageBox::No);
     if (reply != QMessageBox::Yes) return;
 
-    auto safeDelete = [](auto& ptr) {
-        if (ptr) {
-            auto raw = ptr.data(); ptr.clear();
-            if (raw) { raw->close(); delete raw; }
+    btnDisconnect_->setEnabled(false);
+    updateStatus("Disconnecting...");
+    QTimer::singleShot(0, this, [this]() {
+        auto safeDelete = [](auto& ptr) {
+            if (ptr) {
+                auto raw = ptr.data(); ptr.clear();
+                if (raw) { raw->disconnect(); raw->close(); raw->deleteLater(); }
+            }
+        };
+        {
+            QMutexLocker lock(&windowMtx_);
+            safeDelete(desktopWindow_);
+            safeDelete(sftpWindow_);
+            safeDelete(sshTerminalWindow_);
         }
-    };
-    {
-        QMutexLocker lock(&windowMtx_);
-        safeDelete(desktopWindow_);
-        safeDelete(sftpWindow_);
-        safeDelete(sshTerminalWindow_);
-    }
 
-    if (config_.desktopTransport) config_.desktopTransport->disconnect();
-    if (config_.sshSession) config_.sshSession->disconnect();
+        if (config_.desktopTransport) config_.desktopTransport->disconnect();
+        if (config_.sshSession) config_.sshSession->disconnect();
 
-    close();
-    qApp->quit();
+        close();
+        qApp->quit();
+    });
 }
 
 void ControlPanel::onMouseMoveToggled(bool checked) { inputState_.mouseMove = checked; }
@@ -360,4 +375,43 @@ void ControlPanel::sendAudioEnable(bool enabled) {
         config_.desktopTransport->send(msg);
     }
     updateStatus(enabled ? "Audio enabled" : "Audio disabled");
+}
+
+void ControlPanel::onScreenOff() {
+    if (!config_.desktopTransport || !config_.desktopTransport->isConnected()) {
+        QMessageBox::warning(this, "熄屏", "未连接到远程桌面");
+        return;
+    }
+    auto msg = MessageBuilder::ScreenOff();
+    config_.desktopTransport->send(msg);
+    updateStatus("已发送熄屏指令");
+}
+
+void ControlPanel::onShutdownServer() {
+    if (!config_.desktopTransport || !config_.desktopTransport->isConnected()) {
+        QMessageBox::warning(this, "关闭服务器", "未连接到远程桌面");
+        return;
+    }
+    updateStatus("正在关闭远程服务器...");
+    btnShutdown_->setEnabled(false);
+    auto msg = MessageBuilder::ShutdownCmd();
+    config_.desktopTransport->send(msg);
+    QTimer::singleShot(0, this, [this]() {
+        auto safeDelete = [](auto& ptr) {
+            if (ptr) {
+                auto raw = ptr.data(); ptr.clear();
+                if (raw) { raw->disconnect(); raw->close(); raw->deleteLater(); }
+            }
+        };
+        {
+            QMutexLocker lock(&windowMtx_);
+            safeDelete(desktopWindow_);
+            safeDelete(sftpWindow_);
+            safeDelete(sshTerminalWindow_);
+        }
+        if (config_.desktopTransport) config_.desktopTransport->disconnect();
+        if (config_.sshSession) config_.sshSession->disconnect();
+        close();
+        qApp->quit();
+    });
 }

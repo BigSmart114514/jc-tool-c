@@ -6,6 +6,7 @@
 #include "../common/transport.h"
 #include "screen_capture.h"
 #include "media_encoder.h"
+#include "virtual_display.h"
 #include "audio_capture.h"
 #include "audio_encoder.h"
 #include <queue>
@@ -20,6 +21,7 @@ public:
 
     bool init();
     void setTransport(IServerTransport* transport);
+    void setCaptureOutput(const std::wstring& deviceName) { capture_.setCaptureOutput(deviceName); }
     
     void start();
     void stop();

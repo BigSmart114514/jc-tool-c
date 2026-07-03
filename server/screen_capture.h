@@ -5,6 +5,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <cstdint>
+#include <string>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -25,10 +26,17 @@ public:
     
     int getWidth() const { return width_; }
     int getHeight() const { return height_; }
+    int getOriginX() const { return desktopOriginX_; }
+    int getOriginY() const { return desktopOriginY_; }
+
+    // Select a specific output by DeviceName (e.g. L"\\\\.\\DISPLAY4")
+    // If not set, defaults to output 0 (primary)
+    void setCaptureOutput(const std::wstring& deviceName) { captureOutputName_ = deviceName; }
+    const std::wstring& getCaptureOutput() const { return captureOutputName_; }
 
 private:
     bool initDXGI();
-    bool initDuplication();
+    bool initDuplication(int outputIndex = 0);
     bool initGDI();
 
     void cleanupDuplicationOnly();
@@ -52,8 +60,11 @@ private:
     uint8_t* frameBuffer_ = nullptr;
     int width_ = 0;
     int height_ = 0;
+    int desktopOriginX_ = 0;
+    int desktopOriginY_ = 0;
     bool useGDI_ = false;
     bool initialized_ = false;
+    std::wstring captureOutputName_;  // blank means output 0
 };
 
 #endif // SCREEN_CAPTURE_H
