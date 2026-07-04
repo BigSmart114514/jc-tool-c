@@ -32,41 +32,167 @@ static std::string addrToIp(uint32_t addr) {
 
 bool EasyTierService::loadIpFromInstances() {
     constexpr int MAX = 64;
-    KeyValuePair pairs[MAX];
+    KeyValuePair pairs[MAX] = {};
     int count = collect_network_infos(pairs, MAX);
     if (count <= 0) return false;
 
-    // 遍历所有键，找到值里包含 "virtual_ipv4" 的那一个
+    bool found = false;
     for (int i = 0; i < count; ++i) {
         std::string value(pairs[i].value);
         if (value.find("\"virtual_ipv4\":") != std::string::npos) {
-            // 提取 virtual_ipv4 部分的 JSON
             auto pos = value.find("\"virtual_ipv4\":{");
-            if (pos == std::string::npos) continue;
-            // 找到 "addr":
-            auto addrPos = value.find("\"addr\":", pos);
-            if (addrPos == std::string::npos) continue;
-            addrPos += strlen("\"addr\":");
-            auto endPos = value.find_first_of(",}", addrPos);
-            std::string addrStr = value.substr(addrPos, endPos - addrPos);
-            uint32_t addr = std::stoul(addrStr);
-            virtualIp_ = addrToIp(addr);
-            
-            //LogInfo("Found virtual IP: " + virtualIp_ + " in key '" + pairs[i].key + "'");
-            return true;
+            if (pos != std::string::npos) {
+                auto addrPos = value.find("\"addr\":", pos);
+                if (addrPos != std::string::npos) {
+                    addrPos += strlen("\"addr\":");
+                    auto endPos = value.find_first_of(",}", addrPos);
+                    std::string addrStr = value.substr(addrPos, endPos - addrPos);
+                    uint32_t addr = std::stoul(addrStr);
+                    virtualIp_ = addrToIp(addr);
+                    found = true;
+                }
+            }
         }
+        free_string(pairs[i].key);
+        free_string(pairs[i].value);
     }
-    return false;
+    return found;
 }
 
 bool EasyTierService::fetchNetworkInfos(std::map<std::string, std::string>& outInfo) {
     constexpr int MAX = 64;
-    KeyValuePair pairs[MAX];
+    KeyValuePair pairs[MAX] = {};
     int count = collect_network_infos(pairs, MAX);
     if (count <= 0) return false;
-    for (int i = 0; i < count; ++i)
+    for (int i = 0; i < count; ++i) {
         outInfo[pairs[i].key] = pairs[i].value;
+        free_string(pairs[i].key);
+        free_string(pairs[i].value);
+    }
     return true;
+}
+
+static std::string ExtractJsonNumber(const std::string& json, const char* key) {
+    std::string search = std::string("\"") + key + "\":";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return "0";
+    pos += search.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    auto end = json.find_first_of(",}]", pos);
+    if (end == std::string::npos) return "0";
+    return json.substr(pos, end - pos);
+}
+
+std::string EasyTierService::getDevicesJson() {
+    constexpr int MAX = 64;
+    KeyValuePair pairs[MAX] = {};
+    int count = collect_network_infos(pairs, MAX);
+    if (count <= 0) return "[]";
+
+    std::string result = "[";
+    bool first = true;
+
+    for (int i = 0; i < count; ++i) {
+        std::string value(pairs[i].value);
+
+        std::string myPeerId;
+        auto myPos = value.find("\"my_node_info\":{");
+        if (myPos != std::string::npos) {
+            std::string mySection = value.substr(myPos);
+            myPeerId = ExtractJsonString(mySection, "peer_id");
+        }
+
+        auto peersPos = value.find("\"peers\":");
+        if (peersPos == std::string::npos) {
+            free_string(pairs[i].key);
+            free_string(pairs[i].value);
+            continue;
+        }
+        peersPos += strlen("\"peers\":");
+        while (peersPos < value.size() && (value[peersPos] == ' ' || value[peersPos] == '\t' ||
+               value[peersPos] == '\n' || value[peersPos] == '\r'))
+            peersPos++;
+        if (peersPos >= value.size() || value[peersPos] != '[') {
+            free_string(pairs[i].key);
+            free_string(pairs[i].value);
+            continue;
+        }
+
+        int depth = 0;
+        bool inStr = false;
+        size_t arrEnd = peersPos;
+        for (; arrEnd < value.size(); ++arrEnd) {
+            if (inStr) {
+                if (value[arrEnd] == '"' && (arrEnd == 0 || value[arrEnd - 1] != '\\'))
+                    inStr = false;
+            } else {
+                if (value[arrEnd] == '"') inStr = true;
+                else if (value[arrEnd] == '[') depth++;
+                else if (value[arrEnd] == ']') { --depth; if (depth == 0) break; }
+            }
+        }
+        if (arrEnd >= value.size()) {
+            free_string(pairs[i].key);
+            free_string(pairs[i].value);
+            continue;
+        }
+
+        std::string arrayContent = value.substr(peersPos + 1, arrEnd - peersPos - 1);
+        size_t pos = 0;
+        while (pos < arrayContent.size()) {
+            while (pos < arrayContent.size() && (arrayContent[pos] == ' ' || arrayContent[pos] == '\t' ||
+                   arrayContent[pos] == '\n' || arrayContent[pos] == '\r' || arrayContent[pos] == ','))
+                ++pos;
+            if (pos >= arrayContent.size() || arrayContent[pos] != '{') break;
+
+            depth = 0;
+            inStr = false;
+            size_t objStart = pos;
+            for (; pos < arrayContent.size(); ++pos) {
+                if (inStr) {
+                    if (arrayContent[pos] == '"' && (pos == 0 || arrayContent[pos - 1] != '\\'))
+                        inStr = false;
+                } else {
+                    if (arrayContent[pos] == '"') inStr = true;
+                    else if (arrayContent[pos] == '{') ++depth;
+                    else if (arrayContent[pos] == '}') { --depth; if (depth == 0) { ++pos; break; } }
+                }
+            }
+
+            std::string peerObj = arrayContent.substr(objStart, pos - objStart);
+            std::string peerId = ExtractJsonString(peerObj, "peer_id");
+            if (peerId.empty() || peerId == myPeerId) continue;
+
+            std::string ipv4 = ExtractJsonString(peerObj, "ipv4_addr");
+            std::string hostname = ExtractJsonString(peerObj, "hostname");
+            std::string version = ExtractJsonString(peerObj, "version");
+            std::string tunnelProto = ExtractJsonString(peerObj, "tunnel_proto");
+            std::string natType = ExtractJsonString(peerObj, "nat_type");
+            std::string latMs = ExtractJsonNumber(peerObj, "lat_ms");
+            std::string lossRate = ExtractJsonNumber(peerObj, "loss_rate");
+            std::string cost = ExtractJsonNumber(peerObj, "cost");
+
+            if (!first) result += ",";
+            first = false;
+
+            result += "{\"peer_id\":\"" + JsonEscape(peerId)
+                   + "\",\"ipv4_addr\":\"" + JsonEscape(ipv4)
+                   + "\",\"hostname\":\"" + JsonEscape(hostname)
+                   + "\",\"version\":\"" + JsonEscape(version)
+                   + "\",\"tunnel_proto\":\"" + JsonEscape(tunnelProto)
+                   + "\",\"nat_type\":\"" + JsonEscape(natType)
+                   + "\",\"lat_ms\":" + latMs
+                   + ",\"loss_rate\":" + lossRate
+                   + ",\"cost\":" + cost
+                   + "}";
+        }
+
+        free_string(pairs[i].key);
+        free_string(pairs[i].value);
+    }
+
+    result += "]";
+    return result;
 }
 
 // 生成 TOML 配置字符串

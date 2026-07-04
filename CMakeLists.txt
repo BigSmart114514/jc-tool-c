@@ -131,6 +131,7 @@ set_target_properties(RemoteControl PROPERTIES
 add_executable(EasyTierService
     service/service_main.cpp
     service/easytier_service.cpp
+    service/discovery_server.cpp
     service/logging.cpp
     common/easytier_control.cpp
     service/ssh_server.cpp

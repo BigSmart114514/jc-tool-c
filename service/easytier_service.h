@@ -29,6 +29,7 @@ public:
     void stopSshServer();
     bool isSshRunning() const { return sshRunning_.load(); }
     int getSshPort() const { return sshPort_; }
+    std::string getDevicesJson();
 private:
     void monitorLoop();
     bool saveConfigToDisk(const EasyTierConfig& cfg);

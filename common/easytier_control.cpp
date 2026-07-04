@@ -356,3 +356,7 @@ bool EasyTierControlClient::sshStatus(bool& running, int& port) {
     port = ExtractJsonInt(resp, "port");
     return true;
 }
+
+bool EasyTierControlClient::getNetworkInfos(std::string& responseJson) {
+    return sendRequest(CMD_GET_NETWORK_INFOS, "{}", responseJson);
+}

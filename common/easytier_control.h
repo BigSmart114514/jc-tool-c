@@ -20,6 +20,7 @@ enum EasyTierCmd : uint32_t {
     CMD_SSH_START  = 10,
     CMD_SSH_STOP   = 11,
     CMD_SSH_STATUS = 12,
+    CMD_GET_NETWORK_INFOS = 20,
 };
 
 #pragma pack(push, 1)
@@ -95,6 +96,7 @@ public:
     bool sshStart(int port, const std::string& password);
     bool sshStop();
     bool sshStatus(bool& running, int& port);
+    bool getNetworkInfos(std::string& responseJson);
 
 private:
     bool sendRaw(const void* data, uint32_t len);

@@ -10,6 +10,7 @@
 #include <winsock2.h>
 
 #include "easytier_service.h"
+#include "discovery_server.h"
 #include "../common/easytier_control.h"
 #include <windows.h>
 #include <thread>
@@ -17,6 +18,7 @@
 #include "logging.h"
 
 static EasyTierService g_service;
+static DiscoveryServer g_discoveryServer;
 static SERVICE_STATUS_HANDLE g_statusHandle = NULL;
 static std::thread g_pipeThread;
 std::atomic<bool> stopRequested_{false};
@@ -45,6 +47,8 @@ int wmain(int argc, wchar_t* argv[]) {
         printf("EasyTier Service (console debug mode)\n");
         printf("Pipe: %S\n\n", EASYTIER_PIPE_NAME);
         if (!g_service.init()) { printf("Init failed\n"); return 1; }
+        g_discoveryServer.setSshPort(g_service.getSshPort());
+        g_discoveryServer.start();
         if (g_service.getConfig().autoStart) g_service.startEasyTier();
         g_pipeThread = std::thread(PipeServerLoop);
         printf("Type 'q' to quit, 'start'/'stop'/'restart'/'status' to control\n\n");
@@ -60,6 +64,7 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         SignalShutdown();
         if (g_pipeThread.joinable()) g_pipeThread.join();
+        g_discoveryServer.stop();
         g_service.stopEasyTier();
         return 0;
     }
@@ -84,6 +89,9 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*) {
         return;
     }
 
+    g_discoveryServer.setSshPort(g_service.getSshPort());
+    g_discoveryServer.start();
+
     g_pipeThread = std::thread(PipeServerLoop);
 
     if (g_service.getConfig().autoStart)
@@ -93,6 +101,7 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*) {
 
     g_pipeThread.join();
 
+    g_discoveryServer.stop();
     g_service.stopEasyTier();
     ReportStatus(SERVICE_STOPPED);
 }
@@ -269,6 +278,10 @@ static std::string HandleCommand(EasyTierCmd cmd, const std::string& json) {
             std::string("\"running\":") + (g_service.isSshRunning() ? "true" : "false")
             + ",\"port\":" + std::to_string(g_service.getSshPort()));
 
+    case CMD_GET_NETWORK_INFOS: {
+        std::string json = g_service.getDevicesJson();
+        return okResp("\"devices\":" + json);
+    }
     case CMD_SHUTDOWN:
         stopRequested_ = true;
         return okResp({});
