@@ -59,6 +59,8 @@ easytier
 
 - 下载 libssh 解压以后放在 **../libssh** 下。
 
+- 下载 ![usbmmidd_v2](https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip) （虚拟显示器驱动，Direct Desktop 功能需要），解压以后放在 **../usbmmidd_v2** 下，确保 `deviceinstaller64.exe`、`usbmmidd.cat`、`usbmmIdd.inf` 和 `x64/usbmmIdd.dll` 都在该目录下。
+
 - 自己改一下的build.bat
 
-- 使用MSVC编译器 （反正我用2026的，但是github actions是用2022的，所以两个都可以）
+- 使用MSVC编译器（CMake 会自动选择已安装的 Visual Studio 生成器，2022 / 2026 都支持）

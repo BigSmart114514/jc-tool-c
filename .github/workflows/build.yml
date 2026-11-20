@@ -18,7 +18,12 @@ env:
 jobs:
   build:
     name: Build on Windows
-    runs-on: windows-latest
+    # `windows-latest` was migrated from VS 2022 to Visual Studio 2026 (VS 18)
+    # in June 2026, which broke this workflow's hardcoded "Visual Studio 17
+    # 2022" generator. The Qt kit (win64_msvc2022_64) and the libssh MSVC17
+    # package are built for the VS 2022 toolset, so GitHub recommends pinning
+    # `windows-2022` when you need to stay on VS 2022.
+    runs-on: windows-2022
 
     steps:
       - name: Checkout current project
@@ -92,6 +97,23 @@ jobs:
         run: |
           git clone --depth 1 --branch 2.4.0 https://github.com/lxqt/qtermwidget.git "${{ github.workspace }}/../qtermwidget-2.4.0"
 
+      # ---------- usbmmidd (virtual display driver) ----------
+      - name: Download usbmmidd virtual display driver
+        shell: pwsh
+        run: |
+          $url = "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip"
+          Invoke-WebRequest -Uri $url -OutFile usbmmidd_v2.zip
+          Expand-Archive -Path usbmmidd_v2.zip -DestinationPath usbmmidd-extract -Force
+          $srcDir = Join-Path "usbmmidd-extract" "usbmmidd_v2"
+          if (-not (Test-Path $srcDir)) { $srcDir = "usbmmidd-extract" }
+          $targetDir = "${{ github.workspace }}/../usbmmidd_v2"
+          New-Item -ItemType Directory -Force -Path "$targetDir/x64" | Out-Null
+          Copy-Item -Path "$srcDir/deviceinstaller*.exe" -Destination $targetDir -Force
+          Copy-Item -Path "$srcDir/usbmmidd.cat" -Destination $targetDir -Force
+          Copy-Item -Path "$srcDir/usbmmIdd.inf" -Destination $targetDir -Force
+          Copy-Item -Path "$srcDir/x64/usbmmIdd.dll" -Destination "$targetDir/x64/" -Force
+          Get-ChildItem -Recurse $targetDir
+
       # ---------- ConPTY ----------
       - name: Download ConPTY
         shell: pwsh
@@ -106,9 +128,39 @@ jobs:
       - name: Configure CMake
         shell: pwsh
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          # Do not hardcode the generator: `windows-latest` switched to Visual
+          # Studio 2026 (VS 18) in June 2026 and the old "Visual Studio 17 2022"
+          # failed with "could not find any instance of Visual Studio".
+          # Match the installed Visual Studio against the generators this CMake
+          # supports (CMake < 4.2 has no VS 18 generator).
+          $known = @(cmake --help |
+            Select-String -Pattern 'Visual Studio \d+ \d{4}' |
+            ForEach-Object { [regex]::Match($_.Line, 'Visual Studio \d+ \d{4}').Value })
+          Write-Host "CMake knows these VS generators: $($known -join ', ')"
+          if ($known.Count -eq 0) { Write-Error "This CMake reports no Visual Studio generator"; exit 1 }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe not found"; exit 1 }
+          $ver = (& $vswhere -latest -products * -property installationVersion | Select-Object -First 1)
+          if (-not $ver) { Write-Error "No Visual Studio installation found"; exit 1 }
+          $major = $ver.Split('.')[0]
+          $year = @{ '18' = '2026'; '17' = '2022'; '16' = '2019' }[$major]
+          $installed = if ($year) { "Visual Studio $major $year" } else { "Visual Studio $major" }
+          Write-Host "Installed Visual Studio: $installed (version $ver)"
+
+          if ($known -notcontains $installed) {
+            # Older CMake without the VS 18 generator: use the newest VS
+            # generator it does support rather than failing.
+            $fallback = $known[$known.Count - 1]
+            Write-Warning "CMake has no generator for '$installed'; falling back to '$fallback'"
+            $installed = $fallback
+          }
+
+          if (-not $env:QT_ROOT_DIR) { Write-Error "QT_ROOT_DIR is not set"; exit 1 }
+          Write-Host "Using Qt: $env:QT_ROOT_DIR"
+          cmake -B build -G "$installed" -A x64 `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
-            -DCMAKE_PREFIX_PATH="$env:Qt6_DIR"
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
       # ---------- 编译 ----------
       - name: Build
@@ -118,15 +170,19 @@ jobs:
       - name: Package Release folder
         shell: pwsh
         run: |
-          $releaseDir = "${{ github.workspace }}\build\${{ env.BUILD_TYPE }}"
-          if (Test-Path $releaseDir) {
-            Write-Host "Contents of Release folder:"
-            Get-ChildItem -Recurse $releaseDir
-            Compress-Archive -Path "$releaseDir\*" -DestinationPath "${{ github.workspace }}\RemoteControl-Windows.zip"
-          } else {
-            Write-Error "Release folder not found at $releaseDir"
+          # Locate the output folder instead of assuming build/Release, so this
+          # also works if the generator ever changes (e.g. Ninja -> build/).
+          $exe = Get-ChildItem -Path build -Recurse -Filter "RemoteControl.exe" |
+            Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "RemoteControl.exe not found under build/"
+            Get-ChildItem -Recurse build | Select-Object FullName
             exit 1
           }
+          $releaseDir = Split-Path -Parent $exe.FullName
+          Write-Host "Packaging: $releaseDir"
+          Get-ChildItem -Recurse $releaseDir
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath "${{ github.workspace }}\RemoteControl-Windows.zip"
 
       # ---------- 上传 artifact ----------
       - name: Upload artifact
