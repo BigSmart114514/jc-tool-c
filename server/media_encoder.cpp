@@ -11,6 +11,7 @@
 #include <strmif.h>
 #include <propvarutil.h>
 #include <vector>
+#include <utility>
 #pragma comment(lib, "mfplat")
 #pragma comment(lib, "mfuuid")
 
@@ -115,7 +116,7 @@ bool MediaEncoder::init(ID3D11Device* device, int srcW, int srcH, int dstW, int 
 
     if (!initEncoder()) {
         std::cerr << "[MediaEncoder] Encoder init failed" << std::endl;
-        cleanup();
+        cleanupLocked();
         return false;
     }
 
@@ -155,12 +156,12 @@ bool MediaEncoder::initVideoProcessor() {
 
     UINT fmtSupported = FALSE;
     vpEnum->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &fmtSupported);
-    if (!fmtSupported) {
+    if (!(fmtSupported & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
         vpEnum->Release(); videoDev->Release(); videoCtx->Release();
         return false;
     }
     vpEnum->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &fmtSupported);
-    if (!fmtSupported) {
+    if (!(fmtSupported & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
         vpEnum->Release(); videoDev->Release(); videoCtx->Release();
         return false;
     }
@@ -216,8 +217,13 @@ bool MediaEncoder::initVideoProcessor() {
     vpEnum_ = vpEnum;
     videoProcessor_ = vp;
 
-    // Enable hardware filter: edge enhancement (noise reduction removed - it blurs image)
-    videoCtx->VideoProcessorSetStreamFilter(vp, 0, D3D11_VIDEO_PROCESSOR_FILTER_EDGE_ENHANCEMENT, TRUE, 15);
+    const RECT src = { 0, 0, srcWidth_, srcHeight_ };
+    const RECT dst = { 0, 0, alignedW_, alignedH_ };
+    videoCtx->VideoProcessorSetStreamFrameFormat(vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    videoCtx->VideoProcessorSetStreamAutoProcessingMode(vp, 0, FALSE);
+    videoCtx->VideoProcessorSetStreamSourceRect(vp, 0, TRUE, &src);
+    videoCtx->VideoProcessorSetStreamDestRect(vp, 0, TRUE, &dst);
+    videoCtx->VideoProcessorSetOutputTargetRect(vp, TRUE, &dst);
 
     nv12Texture_ = nv12Tex;
     nv12Staging_ = staging;
@@ -231,7 +237,7 @@ bool MediaEncoder::initVideoProcessor() {
 }
 
 bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
-                                      std::vector<uint8_t>& output, bool keyframe) {
+                                      std::vector<Frame>& output, bool keyframe) {
     std::lock_guard<std::mutex> lock(mtx_);
     output.clear();
     if (!initialized_ || !hasGPUPath_) return false;
@@ -273,11 +279,15 @@ bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
         return false;
     }
 
-    uint8_t* base = (uint8_t*)mapped.pData;
+    if (mapped.RowPitch < static_cast<UINT>(alignedW_)) {
+        d3dContext_->Unmap(nv12Staging_, 0);
+        return false;
+    }
+    const auto* base = static_cast<const uint8_t*>(mapped.pData);
     for (int y = 0; y < alignedH_; y++)
         memcpy(nv12Buf.data() + y * alignedW_, base + y * mapped.RowPitch, alignedW_);
 
-    uint8_t* uvSrc = base + mapped.RowPitch * alignedH_;
+    const uint8_t* uvSrc = base + size_t(mapped.RowPitch) * alignedH_;
     UINT uvRowPitch = (alignedW_ / 2) * 2;
     for (int y = 0; y < alignedH_ / 2; y++)
         memcpy(nv12Buf.data() + ySize + y * uvRowPitch,
@@ -308,15 +318,7 @@ bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
         }
     }
 
-    if (!createInputSample(nv12Buf.data(), pts, keyframe)) {
-        std::cerr << "[MediaEncoder] createInputSample failed" << std::endl;
-        return false;
-    }
-
-    output.clear();
-    processOutput(output);
-
-    return true;
+    return submitFrame(nv12Buf.data(), pts, keyframe, output);
 }
 
 bool MediaEncoder::initEncoder() {
@@ -415,6 +417,7 @@ bool MediaEncoder::initEncoder() {
     inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     inputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     inputType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+    inputType->SetUINT32(MF_MT_DEFAULT_STRIDE, alignedW_);
     MFSetAttributeSize(inputType, MF_MT_FRAME_SIZE, alignedW_, alignedH_);
     MFSetAttributeRatio(inputType, MF_MT_FRAME_RATE, fps_, 1);
     hr = encoder_->SetInputType(0, inputType, 0);
@@ -455,7 +458,7 @@ bool MediaEncoder::initEncoder() {
     return true;
 }
 
-bool MediaEncoder::createInputSample(const uint8_t* nv12Data, int64_t pts, bool keyframe) {
+bool MediaEncoder::submitFrame(const uint8_t* nv12Data, int64_t pts, bool keyframe, std::vector<Frame>& output) {
     size_t bufSize = size_t(alignedW_) * alignedH_ * 3 / 2;
 
     IMFSample* sample = nullptr;
@@ -468,32 +471,36 @@ bool MediaEncoder::createInputSample(const uint8_t* nv12Data, int64_t pts, bool 
 
     BYTE* dataPtr = nullptr;
     hr = buf->Lock(&dataPtr, nullptr, nullptr);
-    if (SUCCEEDED(hr)) {
-        memcpy(dataPtr, nv12Data, bufSize);
-        buf->Unlock();
-        buf->SetCurrentLength((DWORD)bufSize);
+    if (FAILED(hr)) {
+        buf->Release();
+        sample->Release();
+        return false;
     }
-
-    sample->AddBuffer(buf);
+    memcpy(dataPtr, nv12Data, bufSize);
+    buf->Unlock();
+    hr = buf->SetCurrentLength((DWORD)bufSize);
+    if (SUCCEEDED(hr)) hr = sample->AddBuffer(buf);
     buf->Release();
+    if (FAILED(hr)) { sample->Release(); return false; }
 
     sample->SetSampleTime((LONGLONG)(pts * 10000000LL / fps_));
     sample->SetSampleDuration((LONGLONG)(10000000LL / fps_));
 
     if (keyframe) {
-        sample->SetUINT32(CODECAPI_AVEncVideoForceKeyFrame, TRUE);
+        ICodecAPI* codec = nullptr;
+        if (SUCCEEDED(encoder_->QueryInterface(IID_PPV_ARGS(&codec)))) {
+            VARIANT value = {};
+            value.vt = VT_UI4;
+            value.ulVal = 1;
+            codec->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value);
+            codec->Release();
+        }
     }
 
     hr = encoder_->ProcessInput(0, sample, 0);
 
-    if (hr == MF_E_NOTACCEPTING) {
-        std::vector<uint8_t> drainBuf;
-        int retries = 0;
-        while (hr == MF_E_NOTACCEPTING && retries < 16) {
-            processOutput(drainBuf);
-            hr = encoder_->ProcessInput(0, sample, 0);
-            retries++;
-        }
+    if (hr == MF_E_NOTACCEPTING && processOutput(output)) {
+        hr = encoder_->ProcessInput(0, sample, 0);
     }
 
     sample->Release();
@@ -503,10 +510,10 @@ bool MediaEncoder::createInputSample(const uint8_t* nv12Data, int64_t pts, bool 
         return false;
     }
 
-    return true;
+    return processOutput(output);
 }
 
-bool MediaEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>& output, bool keyframe) {
+bool MediaEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<Frame>& output, bool keyframe) {
     std::lock_guard<std::mutex> lock(mtx_);
     output.clear();
     if (!initialized_) return false;
@@ -519,39 +526,41 @@ bool MediaEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>
 
     bgraToNv12(bgra, srcWidth_, srcHeight_, yPlane, uvPlane, alignedW_, alignedH_);
 
-    if (!createInputSample(nv12Buf.data(), pts, keyframe)) {
-        return false;
-    }
-
-    processOutput(output);
-
-    return true;
+    return submitFrame(nv12Buf.data(), pts, keyframe, output);
 }
 
-bool MediaEncoder::processOutput(std::vector<uint8_t>& output) {
+bool MediaEncoder::processOutput(std::vector<Frame>& output) {
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
-    encoder_->GetOutputStreamInfo(0, &streamInfo);
+    if (FAILED(encoder_->GetOutputStreamInfo(0, &streamInfo))) return false;
     while (true) {
         MFT_OUTPUT_DATA_BUFFER outputData = {};
 
-        bool needSample = (streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0;
+        bool needSample = (streamInfo.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
+                                                 MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) == 0;
         IMFSample* userSample = nullptr;
         if (needSample) {
-            MFCreateSample(&userSample);
+            if (FAILED(MFCreateSample(&userSample))) return false;
             IMFMediaBuffer* buf = nullptr;
-            if (SUCCEEDED(MFCreateMemoryBuffer(streamInfo.cbSize, &buf))) {
-                userSample->AddBuffer(buf);
+            HRESULT hr = MFCreateAlignedMemoryBuffer(streamInfo.cbSize,
+                streamInfo.cbAlignment ? streamInfo.cbAlignment - 1 : 0, &buf);
+            if (SUCCEEDED(hr)) {
+                hr = userSample->AddBuffer(buf);
                 buf->Release();
             }
+            if (FAILED(hr)) { userSample->Release(); return false; }
             outputData.pSample = userSample;
         }
 
         DWORD status = 0;
         HRESULT hr = encoder_->ProcessOutput(0, 1, &outputData, &status);
+        if (outputData.pEvents) outputData.pEvents->Release();
+
+        IMFSample* resultSample = outputData.pSample;
+        if (userSample && userSample != resultSample) userSample->Release();
 
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            if (userSample) userSample->Release();
-            break;
+            if (resultSample) resultSample->Release();
+            return true;
         }
 
         if (FAILED(hr)) {
@@ -559,50 +568,45 @@ bool MediaEncoder::processOutput(std::vector<uint8_t>& output) {
             if (++poErrCount <= 3)
                 std::cerr << "[MediaEncoder] ProcessOutput hr=0x" << std::hex << hr
                           << " status=" << status << std::dec << std::endl;
-            if (userSample) userSample->Release();
-            if (hr == MF_E_BUFFERTOOSMALL) {
-                continue;
-            }
-            break;
+            if (resultSample) resultSample->Release();
+            return false;
         }
 
-        IMFSample* resultSample = outputData.pSample;
-        if (resultSample) {
+        if (resultSample && outputData.dwStatus != MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE &&
+            outputData.dwStatus != MFT_OUTPUT_DATA_BUFFER_STREAM_END) {
             IMFMediaBuffer* buf = nullptr;
-            hr = resultSample->GetBufferByIndex(0, &buf);
+            hr = resultSample->ConvertToContiguousBuffer(&buf);
             if (SUCCEEDED(hr)) {
                 BYTE* dataPtr = nullptr;
                 DWORD curLen = 0;
                 hr = buf->Lock(&dataPtr, nullptr, &curLen);
-                if (SUCCEEDED(hr) && curLen > 0) {
-                    size_t oldSize = output.size();
-                    output.resize(oldSize + curLen);
-                    memcpy(output.data() + oldSize, dataPtr, curLen);
+                if (SUCCEEDED(hr)) {
+                    if (curLen > 0) {
+                        UINT32 cleanPoint = FALSE;
+                        resultSample->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint);
+                        Frame frame;
+                        frame.data.assign(dataPtr, dataPtr + curLen);
+                        frame.keyframe = cleanPoint != FALSE;
+                        output.push_back(std::move(frame));
+                    }
                     buf->Unlock();
                 }
                 buf->Release();
             }
-            resultSample->Release();
         }
 
-        if (outputData.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE) break;
-        if (outputData.dwStatus == MFT_OUTPUT_DATA_BUFFER_INCOMPLETE) continue;
-        break;
+        if (resultSample) resultSample->Release();
+        if (FAILED(hr)) return false;
+        if (outputData.dwStatus != MFT_OUTPUT_DATA_BUFFER_INCOMPLETE) return true;
     }
-
-    return !output.empty();
-}
-
-bool MediaEncoder::flushEncoder(std::vector<uint8_t>& output) {
-    if (!encoder_) return false;
-    encoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    processOutput(output);
-    return true;
 }
 
 void MediaEncoder::cleanup() {
     std::lock_guard<std::mutex> lock(mtx_);
+    cleanupLocked();
+}
 
+void MediaEncoder::cleanupLocked() {
     if (encoder_) {
         encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         encoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);

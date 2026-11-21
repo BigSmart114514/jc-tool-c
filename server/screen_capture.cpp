@@ -2,6 +2,7 @@
 #include "screen_capture.h"
 #include <windows.h>
 #include <iostream>
+#include <cwctype>
 
 ScreenCapture::ScreenCapture() {}
 
@@ -10,7 +11,23 @@ ScreenCapture::~ScreenCapture() {
 }
 
 bool ScreenCapture::init() {
+    if (captureOutputName_ == L"auto-virtual") {
+        captureOutputName_.clear();
+        DISPLAY_DEVICEW display = { sizeof(display) };
+        for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &display, 0); ++i) {
+            std::wstring identity = std::wstring(display.DeviceID) + L" " + display.DeviceString;
+            for (auto& ch : identity) ch = std::towlower(ch);
+            if ((display.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
+                (identity.find(L"usbmmid") != std::wstring::npos ||
+                 identity.find(L"usb mobile monitor") != std::wstring::npos)) {
+                captureOutputName_ = display.DeviceName;
+                break;
+            }
+            display = { sizeof(display) };
+        }
+    }
     if (!initDXGI()) {
+        cleanupDXGIOnly();
         return initGDI();
     }
     return true;
@@ -36,9 +53,8 @@ bool ScreenCapture::initDXGI() {
                 for (int i = 0;; ++i) {
                     IDXGIOutput* output = nullptr;
                     if (FAILED(adapter->EnumOutputs(i, &output))) break;
-                    DXGI_OUTPUT_DESC desc;
-                    output->GetDesc(&desc);
-                    if (captureOutputName_ == desc.DeviceName) {
+                    DXGI_OUTPUT_DESC desc = {};
+                    if (SUCCEEDED(output->GetDesc(&desc)) && captureOutputName_ == desc.DeviceName) {
                         outputIndex = i;
                         output->Release();
                         break;
@@ -52,37 +68,7 @@ bool ScreenCapture::initDXGI() {
         if (outputIndex < 0) {
             std::cerr << "[Capture] Output device not found: ";
             std::wcerr << captureOutputName_ << std::endl;
-            // Find the virtual display: prefer non-primary output
-            outputIndex = -1;
-            int totalOutputs = 0;
-            IDXGIAdapter* adapter2 = nullptr;
-            IDXGIDevice* dxgiDev2 = nullptr;
-            if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev2)) &&
-                SUCCEEDED(dxgiDev2->GetAdapter(&adapter2))) {
-                for (int i = 0;; ++i) {
-                    IDXGIOutput* output = nullptr;
-                    if (FAILED(adapter2->EnumOutputs(i, &output))) break;
-                    ++totalOutputs;
-                    DXGI_OUTPUT_DESC desc;
-                    output->GetDesc(&desc);
-                    MONITORINFOEXW mi = { sizeof(mi) };
-                    if (GetMonitorInfoW(desc.Monitor, &mi)) {
-                        if (!(mi.dwFlags & MONITORINFOF_PRIMARY)) {
-                            outputIndex = i;
-                            output->Release();
-                            break;
-                        }
-                    }
-                    output->Release();
-                }
-                adapter2->Release();
-            }
-            if (dxgiDev2) dxgiDev2->Release();
-            if (outputIndex < 0 && totalOutputs > 0)
-                outputIndex = totalOutputs - 1; // fallback: highest index
-            if (outputIndex < 0)
-                outputIndex = 0;
-            std::cerr << "[Capture] Using output index: " << outputIndex << std::endl;
+            return false;
         }
     }
 
@@ -106,8 +92,12 @@ bool ScreenCapture::initDuplication(int outputIndex) {
     adapter->Release();
     if (FAILED(hr)) return false;
 
-    DXGI_OUTPUT_DESC desc;
-    output->GetDesc(&desc);
+    DXGI_OUTPUT_DESC desc = {};
+    hr = output->GetDesc(&desc);
+    if (FAILED(hr) || (!captureOutputName_.empty() && captureOutputName_ != desc.DeviceName)) {
+        output->Release();
+        return false;
+    }
 
     IDXGIOutput1* output1 = nullptr;
     hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
@@ -118,8 +108,11 @@ bool ScreenCapture::initDuplication(int outputIndex) {
     output1->Release();
     if (FAILED(hr)) return false;
 
-    width_ = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
-    height_ = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+    // Desktop coordinates can be DPI-virtualized. CopyResource needs the actual pixel size.
+    DXGI_OUTDUPL_DESC duplicationDesc = {};
+    duplication_->GetDesc(&duplicationDesc);
+    width_ = static_cast<int>(duplicationDesc.ModeDesc.Width);
+    height_ = static_cast<int>(duplicationDesc.ModeDesc.Height);
     desktopOriginX_ = desc.DesktopCoordinates.left;
     desktopOriginY_ = desc.DesktopCoordinates.top;
     currentOutputIndex_ = outputIndex;   // 记住当前抓的是哪个输出，DXGI reset 时复用
@@ -176,6 +169,7 @@ bool ScreenCapture::initDuplication(int outputIndex) {
     }
 
     useGDI_ = false;
+    activeOutputName_ = desc.DeviceName;
     initialized_ = true;
 
     std::cout << "[Capture] DXGI initialized: "
@@ -186,11 +180,26 @@ bool ScreenCapture::initDuplication(int outputIndex) {
 }
 
 bool ScreenCapture::initGDI() {
-    hdcScreen_ = GetDC(nullptr);
+    activeOutputName_.clear();
+    desktopOriginX_ = desktopOriginY_ = 0;
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!captureOutputName_.empty() &&
+        EnumDisplaySettingsExW(captureOutputName_.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
+        hdcScreen_ = CreateDCW(L"DISPLAY", captureOutputName_.c_str(), nullptr, nullptr);
+        if (hdcScreen_) {
+            ownsScreenDC_ = true;
+            activeOutputName_ = captureOutputName_;
+            desktopOriginX_ = mode.dmPosition.x;
+            desktopOriginY_ = mode.dmPosition.y;
+        }
+    }
+    if (!hdcScreen_) hdcScreen_ = GetDC(nullptr);
+    if (!hdcScreen_) return false;
     hdcMem_ = CreateCompatibleDC(hdcScreen_);
     
-    width_ = GetDeviceCaps(hdcScreen_, DESKTOPHORZRES);
-    height_ = GetDeviceCaps(hdcScreen_, DESKTOPVERTRES);
+    width_ = ownsScreenDC_ ? static_cast<int>(mode.dmPelsWidth) : GetDeviceCaps(hdcScreen_, DESKTOPHORZRES);
+    height_ = ownsScreenDC_ ? static_cast<int>(mode.dmPelsHeight) : GetDeviceCaps(hdcScreen_, DESKTOPVERTRES);
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -200,10 +209,10 @@ bool ScreenCapture::initGDI() {
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    hBitmap_ = CreateDIBSection(hdcMem_, &bmi, DIB_RGB_COLORS, &gdiBits_, nullptr, 0);
+    if (hdcMem_ && width_ > 0 && height_ > 0)
+        hBitmap_ = CreateDIBSection(hdcMem_, &bmi, DIB_RGB_COLORS, &gdiBits_, nullptr, 0);
     if (!hBitmap_) {
-        DeleteDC(hdcMem_);
-        ReleaseDC(nullptr, hdcScreen_);
+        cleanup();
         return false;
     }
 
@@ -213,6 +222,8 @@ bool ScreenCapture::initGDI() {
     initialized_ = true;
 
     std::cout << "[Capture] GDI: " << width_ << "x" << height_ << std::endl;
+    std::wcout << L"[Capture] GDI output: "
+               << (activeOutputName_.empty() ? L"default desktop" : activeOutputName_) << std::endl;
     return true;
 }
 
@@ -224,9 +235,14 @@ void ScreenCapture::cleanup() {
     if (context_) { context_->Release(); context_ = nullptr; }
     if (device_) { device_->Release(); device_ = nullptr; }
 
-    if (hBitmap_) { DeleteObject(hBitmap_); hBitmap_ = nullptr; }
     if (hdcMem_) { DeleteDC(hdcMem_); hdcMem_ = nullptr; }
-    if (hdcScreen_) { ReleaseDC(nullptr, hdcScreen_); hdcScreen_ = nullptr; }
+    if (hBitmap_) { DeleteObject(hBitmap_); hBitmap_ = nullptr; }
+    if (hdcScreen_) {
+        if (ownsScreenDC_) DeleteDC(hdcScreen_);
+        else ReleaseDC(nullptr, hdcScreen_);
+        hdcScreen_ = nullptr;
+    }
+    ownsScreenDC_ = false;
 
     if (!useGDI_ && frameBuffer_) { delete[] frameBuffer_; }
     frameBuffer_ = nullptr;
@@ -239,7 +255,7 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
     if (!initialized_) return nullptr;
 
     if (useGDI_) {
-        BitBlt(hdcMem_, 0, 0, width_, height_, hdcScreen_, 0, 0, SRCCOPY);
+        if (!BitBlt(hdcMem_, 0, 0, width_, height_, hdcScreen_, 0, 0, SRCCOPY)) return nullptr;
         hasNew = true;
         return frameBuffer_;
     }
@@ -279,8 +295,16 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
     ID3D11Texture2D* tex = nullptr;
     hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
     res->Release();
-    if (FAILED(hr)) return frameBuffer_;
+    if (FAILED(hr)) return nullptr;
 
+    D3D11_TEXTURE2D_DESC desc = {};
+    tex->GetDesc(&desc);
+    if (desc.Width != static_cast<UINT>(width_) || desc.Height != static_cast<UINT>(height_) ||
+        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        tex->Release();
+        resetDXGI();
+        return nullptr;
+    }
     context_->CopyResource(stagingTexture_, tex);
     tex->Release();
 
@@ -295,6 +319,8 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
             }
         }
         context_->Unmap(stagingTexture_, 0);
+    } else {
+        return nullptr;
     }
 
     return frameBuffer_;
@@ -334,6 +360,14 @@ bool ScreenCapture::captureTexture(ID3D11Texture2D** outTex) {
     res->Release();
     if (FAILED(hr)) return false;
 
+    D3D11_TEXTURE2D_DESC desc = {};
+    tex->GetDesc(&desc);
+    if (desc.Width != static_cast<UINT>(width_) || desc.Height != static_cast<UINT>(height_) ||
+        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        tex->Release();
+        resetDXGI();
+        return false;
+    }
     context_->CopyResource(gpuCopyTexture_, tex);
     tex->Release();
 

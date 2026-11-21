@@ -86,6 +86,7 @@ void DesktopService::onMessage(const BinaryData& data) {
                 auto msg = MessageBuilder::ScreenInfo(encoder_.encodedWidth(), encoder_.encodedHeight());
                 transport_->send(msg);
             }
+            keyframeRequested_ = true;
             clientReady_ = true;
             clientCV_.notify_one();
             break;
@@ -154,9 +155,17 @@ void DesktopService::onMessage(const BinaryData& data) {
             }
             break;
         }
-        case Desktop::MsgType::ScreenOff:
-            DisablePhysicalMonitors(capture_.getCaptureOutput());
+        case Desktop::MsgType::ScreenOff: {
+            std::lock_guard<std::mutex> lock(displayMtx_);
+            if (!running_) break;
+            if (capture_.usesRequestedOutput()) {
+                screenOffOutput_ = capture_.getCaptureOutput();
+                DisablePhysicalMonitors(screenOffOutput_);
+            } else {
+                std::cerr << "[Desktop] Screen-off ignored: virtual output is not being captured" << std::endl;
+            }
             break;
+        }
 
         case Desktop::MsgType::Shutdown:
             std::cout << "[Desktop] Shutdown requested via TCP" << std::endl;
@@ -205,12 +214,15 @@ void DesktopService::stop() {
     configChangeCV_.notify_all();
     if (captureThread_.joinable()) captureThread_.join();
     if (configChangeLoopThread_.joinable()) configChangeLoopThread_.join();
+    std::lock_guard<std::mutex> lock(displayMtx_);
+    if (!screenOffOutput_.empty()) {
+        RestorePhysicalMonitors(screenOffOutput_);
+        screenOffOutput_.clear();
+    }
 }
 
 void DesktopService::captureLoop() {
-    std::vector<uint8_t> encoded;
-    encoded.reserve(256 * 1024);
-    const DWORD frameMs = 1000 / Config::FPS;
+    std::vector<MediaEncoder::Frame> encoded;
     int64_t pts = 0;
 
     std::cout << "[Desktop] Capture loop started" << std::endl;
@@ -281,6 +293,7 @@ void DesktopService::captureLoop() {
                     transport_->send(msg);
                 }
                 pts = 0;
+                isTimeForKeyframe = true;
             } else {
                 std::cerr << "[Desktop] Encoder reinit after capture change failed" << std::endl;
                 // 不能直接 continue：会跳过下面的 Sleep 造成忙等
@@ -290,24 +303,39 @@ void DesktopService::captureLoop() {
         }
 
         ID3D11Texture2D* tex = nullptr;
-        if (capture_.captureTexture(&tex)) {
-            encodeOk = encoder_.encodeFromTexture(tex, pts, encoded, isTimeForKeyframe);
-            if (!encodeOk && pts % 30 == 0)
-                std::cerr << "[Desktop] GPU encode failed, dropping frame" << std::endl;
+        if (capture_.getDevice() && encoder_.hasGPUPath()) {
+            std::lock_guard<std::mutex> lock(displayMtx_);
+            if (capture_.captureTexture(&tex)) {
+                encodeOk = encoder_.encodeFromTexture(tex, pts, encoded, isTimeForKeyframe);
+            }
+        } else {
+            bool hasNew = false;
+            const uint8_t* bgra = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(displayMtx_);
+                bgra = capture_.capture(hasNew);
+            }
+            if (bgra && (hasNew || isTimeForKeyframe) &&
+                capture_.getWidth() == encoder_.sourceWidth() && capture_.getHeight() == encoder_.sourceHeight()) {
+                encodeOk = encoder_.encode(bgra, pts, encoded, isTimeForKeyframe);
+            }
         }
 
-        if (encodeOk) {
-            if (!encoded.empty() && transport_ && transport_->hasClient()) {
-                auto msg = MessageBuilder::VideoFrame(encoded.data(), encoded.size(), isTimeForKeyframe);
+        if (isTimeForKeyframe && (!encodeOk || encoded.empty())) keyframeRequested_ = true;
+        if (transport_ && transport_->hasClient()) {
+            for (const auto& frame : encoded) {
+                auto msg = MessageBuilder::VideoFrame(frame.data.data(), frame.data.size(), frame.keyframe);
                 if (!transport_->send(msg)) {
                     clientReady_ = false;
+                    break;
                 }
                 if (pts % 30 == 0)
                     std::cout << "[Desktop] Sent frame pts=" << pts
-                              << " size=" << encoded.size()
-                              << " kf=" << (isTimeForKeyframe ? 1 : 0) << std::endl;
+                              << " size=" << frame.data.size()
+                              << " kf=" << frame.keyframe << std::endl;
             }
         }
+        encoded.clear();
 
         pts++;
         DWORD elapsed = GetTickCount() - t0;

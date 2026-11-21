@@ -105,7 +105,7 @@ bool MediaDecoder::init(int width, int height) {
 
     if (!initDecoder()) {
         std::cerr << "[MediaDecoder] Decoder init failed" << std::endl;
-        cleanup();
+        cleanupLocked();
         return false;
     }
 
@@ -271,17 +271,25 @@ bool MediaDecoder::decode(const uint8_t* data, int size, std::vector<uint8_t>& b
 
     BYTE* dataPtr = nullptr;
     hr = buf->Lock(&dataPtr, nullptr, nullptr);
-    if (SUCCEEDED(hr)) {
-        memcpy(dataPtr, data, size);
-        buf->Unlock();
-        buf->SetCurrentLength((DWORD)size);
+    if (FAILED(hr)) {
+        buf->Release();
+        sample->Release();
+        return false;
     }
-
-    sample->AddBuffer(buf);
+    memcpy(dataPtr, data, size);
+    buf->Unlock();
+    hr = buf->SetCurrentLength((DWORD)size);
+    if (SUCCEEDED(hr)) hr = sample->AddBuffer(buf);
     buf->Release();
+    if (FAILED(hr)) { sample->Release(); return false; }
     sample->SetSampleTime(0);
 
     hr = decoder_->ProcessInput(0, sample, 0);
+    bool gotOutput = false;
+    if (hr == MF_E_NOTACCEPTING) {
+        gotOutput = processOutput(bgraOut);
+        hr = decoder_->ProcessInput(0, sample, 0);
+    }
     sample->Release();
 
     // STREAM_CHANGE 表示解码器要从 SPS/PPS 重新协商输出格式，
@@ -304,13 +312,12 @@ bool MediaDecoder::decode(const uint8_t* data, int size, std::vector<uint8_t>& b
         return false;
     }
 
-    if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
+    if (FAILED(hr)) {
         std::cerr << "[MediaDecoder] ProcessInput failed: 0x" << std::hex << hr << std::dec << std::endl;
-        return false;
+        return gotOutput;
     }
 
-    bool ok = processOutput(bgraOut);
-    return ok;
+    return processOutput(bgraOut) || gotOutput;
 }
 
 bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
@@ -339,6 +346,7 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
 
         DWORD status = 0;
         HRESULT hr = decoder_->ProcessOutput(0, 1, &outputData, &status);
+        if (outputData.pEvents) outputData.pEvents->Release();
 
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
             if (userSample) userSample->Release();
@@ -405,7 +413,8 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
             // 一旦用错，越往下偏移越大，整帧斜着滑出去 —— 就是花屏。
             IMF2DBuffer* buf2d = nullptr;
             if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&buf2d))) && buf2d) {
-                if (SUCCEEDED(buf2d->Lock2D(&bufPtr, &pitch)) && pitch > 0) {
+                const HRESULT lockResult = buf2d->Lock2D(&bufPtr, &pitch);
+                if (SUCCEEDED(lockResult) && pitch > 0) {
                     locked = true;
                     got2d = true;
                     DWORD contig = 0;
@@ -415,23 +424,16 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
                         curLen = (DWORD)((size_t)pitch * frameH_ * 3 / 2);
                     }
                 } else {
+                    if (SUCCEEDED(lockResult)) buf2d->Unlock2D();
                     buf2d->Release();
                     buf2d = nullptr;
                 }
             }
 
             if (!locked) {
-                DWORD maxLen = 0;
-                hr = buf->Lock(&bufPtr, &maxLen, &curLen);
-                if (SUCCEEDED(hr)) {
-                    locked = true;
-                    // 一维缓冲没有任何行跨距信息。
-                    // 注意：maxLen 是缓冲区“容量”，不是有效数据长度 ——
-                    // 我们自己 MFCreateMemoryBuffer 时会多要一点余量，
-                    // 拿容量反推 pitch 会得到一个偏大的假值（实测 1995），
-                    // 整帧按错的行宽读取。所以只在 curLen 为 0 时才退用 maxLen。
-                    if (curLen == 0) curLen = maxLen;
-                }
+                // 空样本不包含像素，不能拿分配容量冒充有效长度。
+                hr = buf->Lock(&bufPtr, nullptr, &curLen);
+                locked = SUCCEEDED(hr);
             }
 
             // GetContiguousLength 有时返回的是整个分配容量（我们自己
@@ -569,7 +571,7 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
             userSample->Release();
         resultSample->Release();
 
-        if (outputData.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE) {
+        if (outputData.dwStatus == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE) {
             break;
         }
     }
@@ -579,7 +581,10 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
 
 void MediaDecoder::cleanup() {
     std::lock_guard<std::mutex> lock(mtx_);
+    cleanupLocked();
+}
 
+void MediaDecoder::cleanupLocked() {
     if (decoder_) {
         decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);

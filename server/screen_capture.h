@@ -33,6 +33,7 @@ public:
     // If not set, defaults to output 0 (primary)
     void setCaptureOutput(const std::wstring& deviceName) { captureOutputName_ = deviceName; }
     const std::wstring& getCaptureOutput() const { return captureOutputName_; }
+    bool usesRequestedOutput() const { return !captureOutputName_.empty() && captureOutputName_ == activeOutputName_; }
 
 private:
     bool initDXGI();
@@ -68,6 +69,8 @@ private:
     bool useGDI_ = false;
     bool initialized_ = false;
     std::wstring captureOutputName_;  // blank means output 0
+    std::wstring activeOutputName_;
+    bool ownsScreenDC_ = false;
 };
 
 #endif // SCREEN_CAPTURE_H

@@ -30,6 +30,7 @@ private:
     // 解码器的输出尺寸不一定等于我们请求的尺寸（H.264 有宏块/对齐 padding），
     // 以前用请求尺寸去算 stride，行宽一错整帧就滑坡。
     bool reconfigureOutput();
+    void cleanupLocked();
 
     static void nv12ToBgra(const uint8_t* yPlane, int pitchY,
                            const uint8_t* uvPlane, int pitchUV,

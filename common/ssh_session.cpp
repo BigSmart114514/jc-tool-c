@@ -817,12 +817,13 @@ int SshSession::readDesktopPort() {
     if (!ddChannel_) return -1;
 
     std::vector<char> buf(4096);
-    DWORD deadline = GetTickCount() + 10000;
+    // The service may need to install and enable the virtual display before starting capture.
+    const ULONGLONG deadline = GetTickCount64() + 75000;
     std::vector<uint8_t> recvBuf;
     bool gotResult = false;
     bool success = false;
 
-    while (GetTickCount() < deadline) {
+    while (GetTickCount64() < deadline) {
         int rc = ssh_channel_read_nonblocking(ddChannel_, buf.data(), (int)buf.size(), 0);
         if (rc > 0) {
             recvBuf.insert(recvBuf.end(), buf.data(), buf.data() + rc);

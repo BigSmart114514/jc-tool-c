@@ -52,17 +52,22 @@ static bool RunProcess(const std::wstring& exe, const std::wstring& args) {
     sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     sei.lpFile = exe.c_str();
     sei.lpParameters = args.c_str();
+    const std::wstring workingDir = GetExeDir();
+    sei.lpDirectory = workingDir.c_str();
     sei.nShow = SW_HIDE;
     if (!ShellExecuteExW(&sei)) {
         WriteLog("[VirtualDisplay] ShellExecuteExW failed: " + std::to_string(GetLastError()));
         return false;
     }
-    if (sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 30000);
-        DWORD ec = 0;
-        GetExitCodeProcess(sei.hProcess, &ec);
-        CloseHandle(sei.hProcess);
-        return ec == 0;
+    if (!sei.hProcess) return false;
+    const DWORD wait = WaitForSingleObject(sei.hProcess, 30000);
+    DWORD ec = 0;
+    const bool exited = wait == WAIT_OBJECT_0 && GetExitCodeProcess(sei.hProcess, &ec);
+    CloseHandle(sei.hProcess);
+    if (!exited || ec != 0) {
+        WriteLog("[VirtualDisplay] Installer command failed: " + narrow(args)
+                 + " wait=" + std::to_string(wait) + " exit=" + std::to_string(ec));
+        return false;
     }
     return true;
 }
@@ -110,18 +115,19 @@ bool InstallUsbmmId() {
     }
 
     WriteLog("[VirtualDisplay] Installing usbmmidd...");
-    std::wstring args = L"install " + inf + L" usbmmidd";
+    std::wstring args = L"install \"" + inf + L"\" usbmmidd";
     bool ok = RunProcess(exe, args);
     WriteLog(ok ? "[VirtualDisplay] Install OK" : "[VirtualDisplay] Install FAILED");
     return ok;
 }
 
-std::wstring EnableVirtualDisplay() {
+bool EnableVirtualDisplay(std::wstring& deviceName) {
+    deviceName.clear();
     if (!IsUsbmmIdInstalled()) {
         WriteLog("[VirtualDisplay] Not installed, attempting install...");
         if (!InstallUsbmmId()) {
             WriteLog("[VirtualDisplay] Install failed, cannot enable");
-            return L"";
+            return false;
         }
     }
 
@@ -130,7 +136,7 @@ std::wstring EnableVirtualDisplay() {
     std::wstring exe = GetDeviceInstallerPath();
     std::wstring args = L"enableidd 1";
     WriteLog("[VirtualDisplay] Enabling usbmmidd (enableidd 1)...");
-    RunProcess(exe, args);
+    if (!RunProcess(exe, args)) return false;
 
     Sleep(3000);
 
@@ -143,17 +149,13 @@ std::wstring EnableVirtualDisplay() {
         }
         if (!found) {
             WriteLog("[VirtualDisplay] New display device: " + narrow(name));
-            return name;
+            deviceName = name;
+            return true;
         }
     }
 
-    if (!after.empty()) {
-        WriteLog("[VirtualDisplay] Using fallback device: " + narrow(after.back()));
-        return after.back();
-    }
-
-    WriteLog("[VirtualDisplay] No display device found after enable");
-    return L"";
+    WriteLog("[VirtualDisplay] No new desktop output visible to service");
+    return true;
 }
 
 void DisableVirtualDisplay() {
@@ -164,46 +166,18 @@ void DisableVirtualDisplay() {
     }
     WriteLog("[VirtualDisplay] Deactivating usbmmidd (enableidd 0)...");
     RunProcess(exe, L"enableidd 0");
-    Sleep(1000);
-    WriteLog("[VirtualDisplay] Stopping usbmmidd...");
-    RunProcess(exe, L"stop usbmmidd");
-    Sleep(500);
-    WriteLog("[VirtualDisplay] Removing usbmmidd...");
-    RunProcess(exe, L"remove usbmmidd");
-    Sleep(1000);
-    WriteLog("[VirtualDisplay] Disable done");
 }
 
-std::vector<std::wstring> EnumDisplayDeviceNames() {
+static std::vector<std::wstring> EnumDisplayDeviceNames() {
     std::vector<std::wstring> result;
 
-    // Method 1: EnumDisplayDevicesW (works in user sessions)
     DISPLAY_DEVICEW dd = { sizeof(dd) };
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
-        result.push_back(dd.DeviceName);
+        if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+            result.push_back(dd.DeviceName);
+        dd = {};
         dd.cb = sizeof(dd);
     }
-    if (!result.empty()) {
-        WriteLog("[VirtualDisplay] EnumDisplayDevicesW: " + std::to_string(result.size()) + " device(s)");
-        return result;
-    }
-
-    // Method 2: SetupAPI fallback (session-independent, works in Session 0)
-    WriteLog("[VirtualDisplay] EnumDisplayDevicesW empty, fallback to SetupAPI");
-    HDEVINFO devs = SetupDiGetClassDevsW(
-        &GUID_DEVCLASS_DISPLAY, nullptr, nullptr, DIGCF_PRESENT);
-    if (devs == INVALID_HANDLE_VALUE) return result;
-
-    SP_DEVINFO_DATA did = { sizeof(did) };
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(devs, i, &did); ++i) {
-        wchar_t desc[256] = {};
-        if (SetupDiGetDeviceRegistryPropertyW(devs, &did, SPDRP_DEVICEDESC,
-            nullptr, (PBYTE)desc, sizeof(desc), nullptr)) {
-            result.push_back(desc);
-        }
-    }
-    SetupDiDestroyDeviceInfoList(devs);
-    WriteLog("[VirtualDisplay] SetupAPI: " + std::to_string(result.size()) + " adapter(s)");
     return result;
 }
 

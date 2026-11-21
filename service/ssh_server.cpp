@@ -1575,6 +1575,7 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
     // ── 4. Launch new session (if not reused) ───────────────────────────────
     HANDLE hProcess = nullptr;
     std::wstring virtualOutput;
+    bool virtualDisplayEnabled = false;
 
     if (!isReused) {
         // 4a. Authenticate & get token
@@ -1640,13 +1641,12 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
         ssh_channel_write(channel, result.data(), (int)result.size());
 
         // 4b. Enable virtual display
-        virtualOutput = EnableVirtualDisplay();
-        if (virtualOutput.empty()) {
-            WriteLog("[DirectDesktop] EnableVirtualDisplay failed");
-            auto err = BuildError("Failed to enable virtual display");
-            ssh_channel_write(channel, err.data(), (int)err.size());
-            if (hLaunchToken) CloseHandle(hLaunchToken);
-            return;
+        virtualDisplayEnabled = EnableVirtualDisplay(virtualOutput);
+        if (!virtualDisplayEnabled) {
+            WriteLog("[DirectDesktop] Virtual display unavailable, starting with the existing desktop");
+        } else if (virtualOutput.empty()) {
+            WriteLog("[DirectDesktop] Looking for the virtual output in the user session");
+            virtualOutput = L"auto-virtual";
         }
         WriteLog("[DirectDesktop] Virtual display: " + narrow(virtualOutput));
 
@@ -1658,7 +1658,7 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
         std::wstring pipeName = std::wstring(DIRECT_DESKTOP_READY_PIPE_PREFIX)
                                 + std::to_wstring(pid) + L"_" + std::to_wstring(desktopPort);
         HANDLE hReadyPipe = CreateNamedPipeW(pipeName.c_str(),
-            PIPE_ACCESS_INBOUND, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            PIPE_ACCESS_INBOUND, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT,
             1, 4096, 4096, 30000, &sa);
 
         // 4d. Create per-user running event
@@ -1671,7 +1671,7 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
             if (hRunningEvent) CloseHandle(hRunningEvent);
             if (hReadyPipe != INVALID_HANDLE_VALUE) CloseHandle(hReadyPipe);
             if (hLaunchToken) CloseHandle(hLaunchToken);
-            DisableVirtualDisplay();
+            if (virtualDisplayEnabled) DisableVirtualDisplay();
             return;
         }
 
@@ -1679,15 +1679,17 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
         std::wstring exePath = GetRemoteControlPath();
         std::wstringstream cmdLine;
         cmdLine << L"\"RemoteControl.exe\" --direct-desktop --port " << desktopPort
-                << L" --ready-pipe " << pipeName
-                << L" --capture-output " << virtualOutput
-                << L" --exit-event " << runningEventName;
+                << L" --ready-pipe \"" << pipeName << L"\""
+                << L" --exit-event \"" << runningEventName << L"\"";
+        if (!virtualOutput.empty())
+            cmdLine << L" --capture-output \"" << virtualOutput << L"\"";
+        std::wstring command = cmdLine.str();
 
         STARTUPINFOW si = { sizeof(si) };
         si.lpDesktop = L"winsta0\\default";
         PROCESS_INFORMATION pi = {};
         BOOL created = CreateProcessAsUserW(hLaunchToken,
-            exePath.c_str(), (wchar_t*)cmdLine.str().c_str(),
+            exePath.c_str(), command.data(),
             nullptr, nullptr, FALSE,
             CREATE_NEW_CONSOLE | CREATE_NO_WINDOW,
             nullptr, nullptr, &si, &pi);
@@ -1700,7 +1702,7 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
             ssh_channel_write(channel, err.data(), (int)err.size());
             CloseHandle(hRunningEvent);
             CloseHandle(hReadyPipe);
-            DisableVirtualDisplay();
+            if (virtualDisplayEnabled) DisableVirtualDisplay();
             return;
         }
         CloseHandle(pi.hThread);
@@ -1708,14 +1710,20 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
 
         // 4f. Wait for ready signal
         bool ready = false;
-        if (ConnectNamedPipe(hReadyPipe, nullptr)) {
+        bool pipeConnected = false;
+        const ULONGLONG readyDeadline = GetTickCount64() + 8000;
+        while (GetTickCount64() < readyDeadline) {
+            if (!pipeConnected) {
+                pipeConnected = ConnectNamedPipe(hReadyPipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
+            }
             char pipeBuf[64] = {};
             DWORD read = 0;
-            if (ReadFile(hReadyPipe, pipeBuf, (DWORD)sizeof(pipeBuf) - 1, &read, nullptr) && read > 0) {
-                pipeBuf[read] = '\0';
+            if (pipeConnected && ReadFile(hReadyPipe, pipeBuf, sizeof(pipeBuf) - 1, &read, nullptr) && read > 0) {
                 int actualPort = atoi(pipeBuf);
                 if (actualPort > 0) { desktopPort = actualPort; ready = true; }
+                break;
             }
+            if (WaitForSingleObject(hProcess, 50) != WAIT_TIMEOUT) break;
         }
         CloseHandle(hReadyPipe);
 
@@ -1726,7 +1734,9 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
             CloseHandle(hProcess); hProcess = nullptr;
             CloseHandle(hRunningEvent); hRunningEvent = nullptr;
             RemoveRunningPort(username);
-            DisableVirtualDisplay();
+            auto err = BuildError("RemoteControl failed to report its desktop port");
+            ssh_channel_write(channel, err.data(), (int)err.size());
+            if (virtualDisplayEnabled) DisableVirtualDisplay();
             return;
         }
 
@@ -1770,7 +1780,6 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
 
     // ── 6. Cleanup (process exit or explicit shutdown) ───────────────────────
     WriteLog("[DirectDesktop] Cleaning up...");
-    RestorePhysicalMonitors(virtualOutput);
     if (hRunningEvent) {
         SetEvent(hRunningEvent);
         if (hProcess) {
@@ -1783,7 +1792,7 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
     } else if (hProcess) {
         CloseHandle(hProcess);
     }
-    DisableVirtualDisplay();
+    if (virtualDisplayEnabled) DisableVirtualDisplay();
     WriteLog("[DirectDesktop] Cleanup complete");
     return;
 

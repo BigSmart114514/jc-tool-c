@@ -13,14 +13,18 @@ struct IMFSample;
 
 class MediaEncoder {
 public:
+    struct Frame {
+        std::vector<uint8_t> data;
+        bool keyframe = false;
+    };
     MediaEncoder();
     ~MediaEncoder();
 
     bool init(ID3D11Device* device, int srcW, int srcH, int dstW, int dstH, int fps, int bitrate = 3000000);
     void cleanup();
 
-    bool encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts, std::vector<uint8_t>& output, bool keyframe = false);
-    bool encode(const uint8_t* bgra, int64_t pts, std::vector<uint8_t>& output, bool keyframe = false);
+    bool encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts, std::vector<Frame>& output, bool keyframe = false);
+    bool encode(const uint8_t* bgra, int64_t pts, std::vector<Frame>& output, bool keyframe = false);
 
     bool initialized() const { return initialized_; }
     bool hasGPUPath() const { return hasGPUPath_; }
@@ -32,9 +36,9 @@ public:
 private:
     bool initEncoder();
     bool initVideoProcessor();
-    bool processOutput(std::vector<uint8_t>& output);
-    bool createInputSample(const uint8_t* nv12Data, int64_t pts, bool keyframe);
-    bool flushEncoder(std::vector<uint8_t>& output);
+    bool processOutput(std::vector<Frame>& output);
+    bool submitFrame(const uint8_t* nv12Data, int64_t pts, bool keyframe, std::vector<Frame>& output);
+    void cleanupLocked();
 
     ID3D11Device* d3dDevice_ = nullptr;
     ID3D11DeviceContext* d3dContext_ = nullptr;

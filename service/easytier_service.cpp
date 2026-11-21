@@ -308,11 +308,6 @@ bool EasyTierService::init() {
                  + " network=" + config_.networkName
                  + " autoStart=" + (config_.autoStart ? "yes" : "no"));
     }
-    // Auto-start SSH server if enabled (outside lock)
-    if (config_.sshEnabled && !config_.sshPassword.empty()) {
-        startSshServer(config_.sshPort, config_.sshPassword);
-    }
-
     // Check usbmmidd at startup (for direct desktop feature)
     WriteLog("[Service] Checking usbmmidd...");
     if (!IsUsbmmIdInstalled()) {
@@ -326,6 +321,10 @@ bool EasyTierService::init() {
         WriteLog("[Service] usbmmidd is already installed");
     }
 
+    // Start SSH after the driver check so the first connection cannot race installation.
+    if (config_.sshEnabled && !config_.sshPassword.empty()) {
+        startSshServer(config_.sshPort, config_.sshPassword);
+    }
     return true;
 }
 
@@ -339,8 +338,7 @@ bool EasyTierService::startEasyTier() {
             config_.ipv4, config_.listenPort, config_.peerUrl);
         // 复位上次运行残留的状态（monitor 线程 / FFI 实例）。
         // 这里刻意不调用 stopEasyTier()：那会连带停掉 SSH 服务器，并卸载
-        // usbmmidd 虚拟显示器（enableidd 0 / stop / remove 各等 1s），
-        // 与"启动 EasyTier"无关，还会把刚装好的驱动立刻拆掉。
+        // usbmmidd 虚拟显示输出，与启动 EasyTier 无关。
         running_ = false;
         active_ = false;
         staleMonitor = std::move(monitorThread_);

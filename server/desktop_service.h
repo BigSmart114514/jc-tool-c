@@ -51,6 +51,8 @@ private:
 
     std::queue<Desktop::InputEvent> inputQueue_;
     std::mutex inputMtx_;
+    std::mutex displayMtx_;
+    std::wstring screenOffOutput_;
 
     std::thread captureThread_;
     std::thread audioThread_;

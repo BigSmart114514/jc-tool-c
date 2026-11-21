@@ -2,7 +2,6 @@
 #define VIRTUAL_DISPLAY_H
 
 #include <string>
-#include <vector>
 
 // Check if usbmmid_v2 is installed via SetupAPI
 bool IsUsbmmIdInstalled();
@@ -10,15 +9,11 @@ bool IsUsbmmIdInstalled();
 // Install usbmmid_v2 driver (requires bundled inf/cat in exe dir)
 bool InstallUsbmmId();
 
-// Enable virtual display — returns the DeviceName (e.g. L"\\\\.\\DISPLAY4")
-// Used by EasyTierService to pass to DirectDesktop
-std::wstring EnableVirtualDisplay();
+// Enable the driver. deviceName may be empty if the display is not visible in Session 0.
+bool EnableVirtualDisplay(std::wstring& deviceName);
 
-// Disable/remove virtual display
+// Disable the output, leaving the driver installed.
 void DisableVirtualDisplay();
-
-// Query all display device names (for matching against DXGI outputs)
-std::vector<std::wstring> EnumDisplayDeviceNames();
 
 // Power management (call from user session only)
 // Pass the virtual display DeviceName to skip it (e.g. L"\\\\.\\DISPLAY3")
