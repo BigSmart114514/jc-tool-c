@@ -397,6 +397,7 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
             LONG pitch = 0;
             DWORD curLen = 0;
             bool locked = false;
+            bool got2d = false;
 
             // 关键：优先用 IMF2DBuffer 拿真实行 pitch。
             // 硬件/网络解码器输出的行宽通常是 128/256 对齐，
@@ -406,6 +407,7 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
             if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&buf2d))) && buf2d) {
                 if (SUCCEEDED(buf2d->Lock2D(&bufPtr, &pitch)) && pitch > 0) {
                     locked = true;
+                    got2d = true;
                     DWORD contig = 0;
                     if (SUCCEEDED(buf2d->GetContiguousLength(&contig)) && contig > 0) {
                         curLen = contig;
@@ -423,15 +425,61 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
                 hr = buf->Lock(&bufPtr, &maxLen, &curLen);
                 if (SUCCEEDED(hr)) {
                     locked = true;
-                    // 一维缓冲：从总容量反推 pitch。NV12 总长 ≈ pitch*h*3/2。
-                    // 用 maxLen 而不是 curLen —— curLen 只是本次有效数据长度，
-                    // 拿它反推 pitch 会偏小，行宽一错整帧就滑坡。
-                    size_t cap = maxLen > 0 ? maxLen : curLen;
-                    int pitchGuess = frameH_ > 0
-                        ? (int)(cap * 2 / ((size_t)frameH_ * 3)) : frameW_;
-                    pitch = std::max(frameW_, pitchGuess);
-                    if (curLen == 0) curLen = (DWORD)cap;
+                    // 一维缓冲没有任何行跨距信息。
+                    // 注意：maxLen 是缓冲区“容量”，不是有效数据长度 ——
+                    // 我们自己 MFCreateMemoryBuffer 时会多要一点余量，
+                    // 拿容量反推 pitch 会得到一个偏大的假值（实测 1995），
+                    // 整帧按错的行宽读取。所以只在 curLen 为 0 时才退用 maxLen。
+                    if (curLen == 0) curLen = maxLen;
                 }
+            }
+
+            // GetContiguousLength 有时返回的是整个分配容量（我们自己
+            // MFCreateMemoryBuffer 时多要了余量），夹到 NV12 最大可能长度。
+            if (got2d && pitch > 0 && frameH_ > 0) {
+                size_t maxA = (size_t)pitch * (size_t)frameH_ * 3 / 2;
+                if ((size_t)curLen > maxA) curLen = (DWORD)maxA;
+            }
+
+            // 用“有效数据长度”校正行跨距。
+            // NV12 只有两种常见排布：
+            //   A) Y、UV 共用同一 pitch  → 总长 = pitch * H * 3/2
+            //   B) UV 紧凑（pitch=帧宽）  → 总长 = pitch * H + ceil(H/2) * W
+            // 两种候选都算出来，取与实际长度吻合的那个。2D 给的 pitch 也要
+            // 通过这道校验，否则布局判断会全盘跑偏（连 UV 都会被判成不存在）。
+            if (locked && curLen > 0 && frameH_ > 0 && frameW_ > 0) {
+                size_t L = (size_t)curLen;
+                size_t h = (size_t)frameH_;
+                size_t w = (size_t)frameW_;
+                auto fits = [&](int p) -> bool {
+                    if (p <= 0 || (size_t)p < w) return false;
+                    size_t a = (size_t)p * h * 3 / 2;
+                    size_t b = (size_t)p * h + ((h + 1) / 2) * w;
+                    auto near = [&](size_t v) {
+                        size_t d = v > L ? v - L : L - v;
+                        return d <= 16;
+                    };
+                    return near(a) || near(b);
+                };
+                int candA = (int)(L * 2 / (h * 3));
+                int candB = (int)((L > ((h + 1) / 2) * w
+                                   ? L - ((h + 1) / 2) * w : 0) / h);
+                int chosen = (int)pitch;
+                if (!fits(chosen)) {
+                    if (fits(candA))      chosen = candA;
+                    else if (fits(candB)) chosen = candB;
+                    else if (candA >= (int)w) chosen = candA;
+                    else if (candB >= (int)w) chosen = candB;
+                }
+                if (chosen < (int)w) chosen = (int)w;
+                if (chosen != (int)pitch) {
+                    std::cout << "[MediaDecoder] pitch corrected " << pitch
+                              << " -> " << chosen << " (len=" << curLen
+                              << " frame=" << frameW_ << "x" << frameH_
+                              << ", 2d=" << (got2d ? 1 : 0) << ")"
+                              << std::endl;
+                }
+                pitch = chosen;
             }
 
             if (locked && curLen > 0) {
