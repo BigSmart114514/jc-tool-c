@@ -26,6 +26,8 @@ public:
     bool hasGPUPath() const { return hasGPUPath_; }
     int encodedWidth() const { return width_; }
     int encodedHeight() const { return height_; }
+    int sourceWidth() const { return srcWidth_; }
+    int sourceHeight() const { return srcHeight_; }
 
 private:
     bool initEncoder();

@@ -260,6 +260,35 @@ void DesktopService::captureLoop() {
 
         bool encodeOk = false;
 
+        // 抓取源分辨率可能因为虚拟显示器切换而变化。
+        // VideoProcessor 的输入尺寸是构造时固定的，尺寸一变
+        // VideoProcessorBlt 就会读错纹理 —— 表现为花屏/撕裂。
+        // 这里检测到变化后重建编码器。
+        if (capture_.getWidth() > 0 && capture_.getHeight() > 0 &&
+            (capture_.getWidth() != encoder_.sourceWidth() ||
+             capture_.getHeight() != encoder_.sourceHeight())) {
+            std::cout << "[Desktop] Capture size changed "
+                      << encoder_.sourceWidth() << "x" << encoder_.sourceHeight()
+                      << " -> " << capture_.getWidth() << "x" << capture_.getHeight()
+                      << ", reinitializing encoder" << std::endl;
+            encoder_.cleanup();
+            int newBitrate = std::max(10000000, targetWidth_ * targetHeight_ * 4);
+            if (encoder_.init(capture_.getDevice(), capture_.getWidth(), capture_.getHeight(),
+                              targetWidth_, targetHeight_, targetFps_, newBitrate)) {
+                if (transport_ && transport_->hasClient()) {
+                    auto msg = MessageBuilder::ScreenInfo(
+                        encoder_.encodedWidth(), encoder_.encodedHeight());
+                    transport_->send(msg);
+                }
+                pts = 0;
+            } else {
+                std::cerr << "[Desktop] Encoder reinit after capture change failed" << std::endl;
+                // 不能直接 continue：会跳过下面的 Sleep 造成忙等
+                Sleep(200);
+                continue;
+            }
+        }
+
         ID3D11Texture2D* tex = nullptr;
         if (capture_.captureTexture(&tex)) {
             encodeOk = encoder_.encodeFromTexture(tex, pts, encoded, isTimeForKeyframe);

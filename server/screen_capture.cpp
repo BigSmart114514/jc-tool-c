@@ -122,45 +122,57 @@ bool ScreenCapture::initDuplication(int outputIndex) {
     height_ = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
     desktopOriginX_ = desc.DesktopCoordinates.left;
     desktopOriginY_ = desc.DesktopCoordinates.top;
+    currentOutputIndex_ = outputIndex;   // 记住当前抓的是哪个输出，DXGI reset 时复用
 
-    if (!stagingTexture_) {
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = width_;
-        td.Height = height_;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_STAGING;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        hr = device_->CreateTexture2D(&td, nullptr, &stagingTexture_);
-        if (FAILED(hr)) {
-            duplication_->Release(); duplication_ = nullptr;
-            return false;
+    // 抓取分辨率可能变化（虚拟显示器切换 / 显示模式改变）。
+    // 以前这里只在第一次创建纹理，之后一直沿用旧尺寸，
+    // CopyResource 尺寸不匹配 → 花屏。现在尺寸不一致就重建。
+    auto recreateIfSizeChanged = [&](ID3D11Texture2D*& tex, const D3D11_TEXTURE2D_DESC& wanted) {
+        if (tex) {
+            D3D11_TEXTURE2D_DESC cur = {};
+            tex->GetDesc(&cur);
+            if (cur.Width == wanted.Width && cur.Height == wanted.Height
+                && cur.Format == wanted.Format) {
+                return true;
+            }
+            tex->Release();
+            tex = nullptr;
         }
+        return SUCCEEDED(device_->CreateTexture2D(&wanted, nullptr, &tex));
+    };
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = width_;
+    td.Height = height_;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (!recreateIfSizeChanged(stagingTexture_, td)) {
+        duplication_->Release(); duplication_ = nullptr;
+        return false;
     }
 
-    if (!gpuCopyTexture_) {
-        D3D11_TEXTURE2D_DESC gpuDesc = {};
-        gpuDesc.Width = width_;
-        gpuDesc.Height = height_;
-        gpuDesc.MipLevels = 1;
-        gpuDesc.ArraySize = 1;
-        gpuDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        gpuDesc.SampleDesc.Count = 1;
-        gpuDesc.Usage = D3D11_USAGE_DEFAULT;
-        gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        hr = device_->CreateTexture2D(&gpuDesc, nullptr, &gpuCopyTexture_);
-        if (FAILED(hr)) {
-            stagingTexture_->Release(); stagingTexture_ = nullptr;
-            duplication_->Release(); duplication_ = nullptr;
-            return false;
-        }
+    D3D11_TEXTURE2D_DESC gpuDesc = td;
+    gpuDesc.Usage = D3D11_USAGE_DEFAULT;
+    gpuDesc.CPUAccessFlags = 0;
+    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    if (!recreateIfSizeChanged(gpuCopyTexture_, gpuDesc)) {
+        stagingTexture_->Release(); stagingTexture_ = nullptr;
+        duplication_->Release(); duplication_ = nullptr;
+        return false;
     }
 
-    if (!frameBuffer_) {
+    // 记录 frameBuffer_ 当前对应的宽高，避免分辨率变化后仍按旧 buffer 写入
+    if (!frameBuffer_ || frameBufferW_ != width_ || frameBufferH_ != height_) {
+        // GDI 模式下的 frameBuffer_ 是 DIB 内部指针，不能 delete
+        if (!useGDI_) delete[] frameBuffer_;
         frameBuffer_ = new uint8_t[size_t(width_) * height_ * 4];
         memset(frameBuffer_, 0, size_t(width_) * height_ * 4);
+        frameBufferW_ = width_;
+        frameBufferH_ = height_;
     }
 
     useGDI_ = false;
@@ -218,6 +230,7 @@ void ScreenCapture::cleanup() {
 
     if (!useGDI_ && frameBuffer_) { delete[] frameBuffer_; }
     frameBuffer_ = nullptr;
+    frameBufferW_ = frameBufferH_ = 0;
     initialized_ = false;
 }
 
@@ -366,6 +379,7 @@ void ScreenCapture::cleanupDXGIOnly() {
         delete[] frameBuffer_;
         frameBuffer_ = nullptr;
     }
+    frameBufferW_ = frameBufferH_ = 0;
 
     initialized_ = false;
 }
@@ -375,7 +389,9 @@ bool ScreenCapture::resetDXGI() {
 
     cleanupDuplicationOnly();
 
-    if (initDuplication()) {
+    // 抓的是同一个输出，不能回落到默认的 0 号（通常是主屏），
+    // 否则虚拟显示器会莫名其妙变成主屏画面。
+    if (initDuplication(currentOutputIndex_)) {
         std::cout << "[Capture] DXGI reset OK" << std::endl;
         return true;
     }

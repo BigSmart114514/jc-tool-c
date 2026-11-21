@@ -9,6 +9,7 @@
 #include <mferror.h>
 #include <codecapi.h>
 #include <strmif.h>
+#include <mfobjects.h>
 
 #pragma comment(lib, "mfplat")
 #pragma comment(lib, "mfuuid")
@@ -17,31 +18,42 @@
 static const GUID CLSID_H264DecoderMFT =
     {0x62CE7E72, 0x4C71, 0x4D20, {0xB1, 0x5D, 0x45, 0x28, 0x3A, 0x99, 0xB0, 0x3B}};
 
-void MediaDecoder::nv12ToBgra(const uint8_t* nv12, uint8_t* bgra, int w, int h, int strideY, int strideUV, int alignedH) {
-    const uint8_t* yPlane = nv12;
-    const uint8_t* uvPlane = nv12 + strideY * alignedH;
+void MediaDecoder::nv12ToBgra(const uint8_t* yPlane, int pitchY,
+                              const uint8_t* uvPlane, int pitchUV,
+                              int w, int h, uint8_t* bgra, int outW) {
     int halfW = (w + 1) / 2;
     int halfH = (h + 1) / 2;
 
     for (int y = 0; y < h; y++) {
+        const uint8_t* yRow = yPlane + (size_t)y * pitchY;
+        const uint8_t* uvRow0 = uvPlane ? uvPlane + (size_t)(y / 2) * pitchUV : nullptr;
+        const uint8_t* uvRow1 = uvPlane
+            ? uvPlane + (size_t)std::min(y / 2 + 1, halfH - 1) * pitchUV : nullptr;
+        bool oddRow = (y & 1) != 0;
+
         for (int x = 0; x < w; x++) {
-            uint8_t Y = yPlane[y * strideY + x];
+            uint8_t Y = yRow[x];
 
-            float fx = (x & 1) * 0.5f;
-            float fy = (y & 1) * 0.5f;
-            int ux = x / 2, uy = y / 2;
-            int ux1 = std::min(ux + 1, halfW - 1);
-            int uy1 = std::min(uy + 1, halfH - 1);
+            // UV 平面不可用（buffer 不完整）时按中性色处理，只显示亮度，
+            // 绝不越界读。
+            float U = 128.0f, V = 128.0f;
+            if (uvPlane) {
+                int ux = x / 2;
+                int ux1 = std::min(ux + 1, halfW - 1);
+                float fx = (x & 1) * 0.5f;
+                int o00 = ux * 2, o10 = ux1 * 2;
 
-            int off00 = uy * strideUV + ux * 2;
-            int off10 = uy * strideUV + ux1 * 2;
-            int off01 = uy1 * strideUV + ux * 2;
-            int off11 = uy1 * strideUV + ux1 * 2;
-
-            float U = (1-fy)*((1-fx)*uvPlane[off00] + fx*uvPlane[off10])
-                    + fy*((1-fx)*uvPlane[off01] + fx*uvPlane[off11]);
-            float V = (1-fy)*((1-fx)*uvPlane[off00+1] + fx*uvPlane[off10+1])
-                    + fy*((1-fx)*uvPlane[off01+1] + fx*uvPlane[off11+1]);
+                // 偶数行用当前 UV 行，奇数行与下一 UV 行做垂直插值
+                const uint8_t* ra = oddRow ? uvRow1 : uvRow0;
+                U = (1.0f - fx) * ra[o00] + fx * ra[o10];
+                V = (1.0f - fx) * ra[o00 + 1] + fx * ra[o10 + 1];
+                if (oddRow && y + 1 < h) {
+                    float U0 = (1.0f - fx) * uvRow0[o00] + fx * uvRow0[o10];
+                    float V0 = (1.0f - fx) * uvRow0[o00 + 1] + fx * uvRow0[o10 + 1];
+                    U = (U0 + U) * 0.5f;
+                    V = (V0 + V) * 0.5f;
+                }
+            }
 
             int C = Y - 16;
             int D = (int)(U + 0.5f) - 128;
@@ -55,10 +67,11 @@ void MediaDecoder::nv12ToBgra(const uint8_t* nv12, uint8_t* bgra, int w, int h, 
             G = std::max(0, std::min(255, G));
             B = std::max(0, std::min(255, B));
 
-            bgra[(y * w + x) * 4] = (uint8_t)B;
-            bgra[(y * w + x) * 4 + 1] = (uint8_t)G;
-            bgra[(y * w + x) * 4 + 2] = (uint8_t)R;
-            bgra[(y * w + x) * 4 + 3] = 255;
+            uint8_t* px = bgra + ((size_t)y * outW + x) * 4;
+            px[0] = (uint8_t)B;
+            px[1] = (uint8_t)G;
+            px[2] = (uint8_t)R;
+            px[3] = 255;
         }
     }
 }
@@ -76,7 +89,11 @@ bool MediaDecoder::init(int width, int height) {
     height_ = height;
     alignedW_ = (width + 15) & ~15;
     alignedH_ = (height + 15) & ~15;
-    stride_ = alignedW_ * 4;
+    frameW_ = alignedW_;
+    frameH_ = alignedH_;
+    // 输出 BGRA 是紧凑排列（每行恰好 width*4），不是 aligned 宽度。
+    // 以前返回 alignedW_*4，任何用 getStride() 的地方都会读错行。
+    stride_ = width_ * 4;
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -162,10 +179,30 @@ bool MediaDecoder::initDecoder() {
 
     hr = decoder_->SetOutputType(0, outputType_, 0);
     if (FAILED(hr)) {
-        std::cerr << "[MediaDecoder] SetOutputType failed: 0x"
-                  << std::hex << hr << std::dec << std::endl;
-        return false;
+        // 部分硬件解码器不接受我们指定的尺寸，退而用解码器给出的类型
+        std::cerr << "[MediaDecoder] SetOutputType(aligned) failed: 0x"
+                  << std::hex << hr << std::dec << ", falling back" << std::endl;
+        IMFMediaType* avail = nullptr;
+        for (DWORD i = 0; SUCCEEDED(decoder_->GetOutputAvailableType(0, i, &avail)); ++i) {
+            GUID sub = GUID_NULL;
+            avail->GetGUID(MF_MT_SUBTYPE, &sub);
+            if (sub == MFVideoFormat_NV12) {
+                hr = decoder_->SetOutputType(0, avail, 0);
+                avail->Release();
+                if (SUCCEEDED(hr)) break;
+            } else {
+                avail->Release();
+            }
+            avail = nullptr;
+        }
+        if (FAILED(hr)) {
+            std::cerr << "[MediaDecoder] No usable NV12 output type" << std::endl;
+            return false;
+        }
     }
+
+    // 读取解码器实际接受的帧尺寸，不要相信我们自己请求的那个值
+    reconfigureOutput();
 
     ICodecAPI* codecApi = nullptr;
     if (SUCCEEDED(decoder_->QueryInterface(IID_PPV_ARGS(&codecApi)))) {
@@ -190,6 +227,31 @@ bool MediaDecoder::initDecoder() {
     hr = decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     if (FAILED(hr)) return false;
 
+    return true;
+}
+
+// 从解码器当前输出类型读取真实帧尺寸。
+bool MediaDecoder::reconfigureOutput() {
+    if (!decoder_) return false;
+
+    IMFMediaType* cur = nullptr;
+    if (FAILED(decoder_->GetOutputCurrentType(0, &cur)) || !cur) {
+        // 还没协商出输出类型，保持请求值
+        return false;
+    }
+
+    UINT32 fw = 0, fh = 0;
+    if (SUCCEEDED(MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &fw, &fh)) && fw > 0 && fh > 0) {
+        if ((int)fw != frameW_ || (int)fh != frameH_) {
+            std::cout << "[MediaDecoder] actual output frame size: "
+                      << fw << "x" << fh
+                      << " (requested " << alignedW_ << "x" << alignedH_ << ")"
+                      << std::endl;
+        }
+        frameW_ = (int)fw;
+        frameH_ = (int)fh;
+    }
+    cur->Release();
     return true;
 }
 
@@ -222,6 +284,26 @@ bool MediaDecoder::decode(const uint8_t* data, int size, std::vector<uint8_t>& b
     hr = decoder_->ProcessInput(0, sample, 0);
     sample->Release();
 
+    // STREAM_CHANGE 表示解码器要从 SPS/PPS 重新协商输出格式，
+    // 以前直接当错误返回，于是客户端只会疯狂发关键帧请求、永远黑屏。
+    if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+        std::cout << "[MediaDecoder] stream change requested, renegotiating output type" << std::endl;
+        IMFMediaType* avail = nullptr;
+        for (DWORD i = 0; SUCCEEDED(decoder_->GetOutputAvailableType(0, i, &avail)); ++i) {
+            GUID sub = GUID_NULL;
+            avail->GetGUID(MF_MT_SUBTYPE, &sub);
+            if (sub == MFVideoFormat_NV12 && SUCCEEDED(decoder_->SetOutputType(0, avail, 0))) {
+                avail->Release();
+                break;
+            }
+            avail->Release();
+            avail = nullptr;
+        }
+        reconfigureOutput();
+        decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        return false;
+    }
+
     if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
         std::cerr << "[MediaDecoder] ProcessInput failed: 0x" << std::hex << hr << std::dec << std::endl;
         return false;
@@ -234,6 +316,7 @@ bool MediaDecoder::decode(const uint8_t* data, int size, std::vector<uint8_t>& b
 bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
     bool gotOutput = false;
     int loopCount = 0;
+    int tooSmallCount = 0;
 
     while (loopCount < 16) {
         loopCount++;
@@ -241,7 +324,8 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
         IMFSample* userSample = nullptr;
         MFCreateSample(&userSample);
         IMFMediaBuffer* userBuf = nullptr;
-        size_t bufSize = (size_t)alignedW_ * alignedH_ * 3 / 2;
+        // 按解码器真实帧尺寸申请，别用请求尺寸（可能偏小导致 BUFFERTOOSMALL 死循环）
+        size_t bufSize = (size_t)frameW_ * frameH_ * 3 / 2 + frameW_ * 64;
         MFCreateMemoryBuffer((DWORD)bufSize, &userBuf);
         if (userSample && userBuf) {
             userSample->AddBuffer(userBuf);
@@ -256,6 +340,27 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
         DWORD status = 0;
         HRESULT hr = decoder_->ProcessOutput(0, 1, &outputData, &status);
 
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            if (userSample) userSample->Release();
+            std::cout << "[MediaDecoder] STREAM_CHANGE during ProcessOutput" << std::endl;
+            IMFMediaType* avail = nullptr;
+            bool set = false;
+            for (DWORD i = 0; SUCCEEDED(decoder_->GetOutputAvailableType(0, i, &avail)); ++i) {
+                GUID sub = GUID_NULL;
+                avail->GetGUID(MF_MT_SUBTYPE, &sub);
+                if (sub == MFVideoFormat_NV12 && SUCCEEDED(decoder_->SetOutputType(0, avail, 0))) {
+                    avail->Release();
+                    set = true;
+                    break;
+                }
+                avail->Release();
+                avail = nullptr;
+            }
+            reconfigureOutput();
+            if (!set) break;
+            continue;
+        }
+
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
             if (userSample) userSample->Release();
             break;
@@ -263,6 +368,13 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
 
         if (hr == MF_E_BUFFERTOOSMALL) {
             if (userSample) userSample->Release();
+            reconfigureOutput();
+            if (++tooSmallCount > 3) {
+                // 连续三次都装不下：解码器要的尺寸和 MF_MT_FRAME_SIZE 报的不一致，
+                // 继续重试只会空转。
+                std::cerr << "[MediaDecoder] MF_E_BUFFERTOOSMALL persists, giving up this frame" << std::endl;
+                break;
+            }
             continue;
         }
 
@@ -282,31 +394,118 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
         hr = resultSample->GetBufferByIndex(0, &buf);
         if (SUCCEEDED(hr)) {
             BYTE* bufPtr = nullptr;
-            DWORD maxLen = 0, curLen = 0;
-            hr = buf->Lock(&bufPtr, &maxLen, &curLen);
-            if (SUCCEEDED(hr) && curLen > 0) {
-                int strideY, strideUV, actualH;
-                int expectedAligned = alignedW_ * alignedH_ * 3 / 2;
-                int expectedUnaligned = width_ * height_ * 3 / 2;
+            LONG pitch = 0;
+            DWORD curLen = 0;
+            bool locked = false;
 
-                if ((int)curLen >= expectedAligned) {
-                    strideY = strideUV = alignedW_;
-                    actualH = alignedH_;
-                } else if ((int)curLen >= expectedUnaligned) {
-                    strideY = strideUV = width_;
-                    actualH = height_;
+            // 关键：优先用 IMF2DBuffer 拿真实行 pitch。
+            // 硬件/网络解码器输出的行宽通常是 128/256 对齐，
+            // 跟 width 16 对齐推算出来的值根本不一样，
+            // 一旦用错，越往下偏移越大，整帧斜着滑出去 —— 就是花屏。
+            IMF2DBuffer* buf2d = nullptr;
+            if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&buf2d))) && buf2d) {
+                if (SUCCEEDED(buf2d->Lock2D(&bufPtr, &pitch)) && pitch > 0) {
+                    locked = true;
+                    DWORD contig = 0;
+                    if (SUCCEEDED(buf2d->GetContiguousLength(&contig)) && contig > 0) {
+                        curLen = contig;
+                    } else {
+                        curLen = (DWORD)((size_t)pitch * frameH_ * 3 / 2);
+                    }
                 } else {
-                    buf->Unlock();
-                    buf->Release();
-                    resultSample->Release();
-                    if (userSample && userSample != resultSample) userSample->Release();
-                    break;
+                    buf2d->Release();
+                    buf2d = nullptr;
+                }
+            }
+
+            if (!locked) {
+                DWORD maxLen = 0;
+                hr = buf->Lock(&bufPtr, &maxLen, &curLen);
+                if (SUCCEEDED(hr)) {
+                    locked = true;
+                    // 一维缓冲：从总容量反推 pitch。NV12 总长 ≈ pitch*h*3/2。
+                    // 用 maxLen 而不是 curLen —— curLen 只是本次有效数据长度，
+                    // 拿它反推 pitch 会偏小，行宽一错整帧就滑坡。
+                    size_t cap = maxLen > 0 ? maxLen : curLen;
+                    int pitchGuess = frameH_ > 0
+                        ? (int)(cap * 2 / ((size_t)frameH_ * 3)) : frameW_;
+                    pitch = std::max(frameW_, pitchGuess);
+                    if (curLen == 0) curLen = (DWORD)cap;
+                }
+            }
+
+            if (locked && curLen > 0) {
+                int pitchY = (int)pitch;
+                if (pitchY < frameW_) pitchY = frameW_;   // 防御：pitch 不得小于帧宽
+
+                // 已知：Y 的行跨距 = pitchY，帧高 = frameH_。
+                //
+                // 决策顺序（重要）：
+                //   1) 优先按完整帧高处理。Y 平面够长就保留全部行 ——
+                //      "Y 完整但缺 UV"只损失颜色，不该连下半屏一起丢。
+                //   2) Y 平面都不够长时，才按总长反推真实行数。
+                //   3) UV 布局按 A（共用 pitch）→ B（紧凑）依次尝试，
+                //      剩余空间不足则传 nullptr，只显示亮度。
+                int yHeight = frameH_;
+                int pitchUV = pitchY;
+                size_t yEnd = (size_t)pitchY * (size_t)yHeight;
+
+                if (yEnd > curLen) {
+                    // Y 不完整：NV12 总长 ≈ pitch * H * 3/2，据此反推行数
+                    int h = (int)((curLen * 2) / ((size_t)pitchY * 3));
+                    h &= ~1;
+                    if (h >= 2 && h < yHeight) yHeight = h;
+                    yEnd = (size_t)pitchY * (size_t)yHeight;
                 }
 
-                bgraOut.resize(width_ * height_ * 4);
-                nv12ToBgra(bufPtr, bgraOut.data(), width_, height_, strideY, strideUV, actualH);
+                int uvOffset = -1;
+                if (yEnd <= curLen) {
+                    size_t remain = curLen - yEnd;
+                    size_t uvRows = (size_t)((yHeight + 1) / 2);
+                    if (remain >= uvRows * (size_t)pitchY) {
+                        uvOffset = (int)yEnd;          // 布局 A：Y/UV 同 pitch
+                        pitchUV = pitchY;
+                    } else if (remain >= uvRows * (size_t)frameW_) {
+                        uvOffset = (int)yEnd;          // 布局 B：UV 紧凑
+                        pitchUV = frameW_;
+                    }
+                }
 
+                static bool loggedOnce = false;
+                if (!loggedOnce) {
+                    loggedOnce = true;
+                    std::cout << "[MediaDecoder] output pitch=" << pitchY
+                              << " uvPitch=" << pitchUV
+                              << " frame=" << frameW_ << "x" << frameH_
+                              << " yHeight=" << yHeight
+                              << " len=" << curLen
+                              << " uvOffset=" << uvOffset
+                              << " (display " << width_ << "x" << height_ << ")"
+                              << std::endl;
+                }
+
+                // 真实帧可能小于请求尺寸：超出部分填黑，绝不越界读。
+                // uvOffset < 0 表示 UV 不可用，只输出亮度（灰度），同样不越界。
+                int drawW = std::min(width_, frameW_);
+                int drawH = std::min(height_, yHeight);
+                bgraOut.assign((size_t)width_ * height_ * 4, 0);
+                for (size_t i = 3; i < bgraOut.size(); i += 4) bgraOut[i] = 255;
+
+                if (drawW > 0 && drawH > 0) {
+                    const uint8_t* uvPtr =
+                        (uvOffset >= 0 && (size_t)uvOffset < curLen)
+                            ? (bufPtr + uvOffset) : nullptr;
+                    nv12ToBgra(bufPtr, pitchY, uvPtr, pitchUV,
+                               drawW, drawH, bgraOut.data(), width_);
+                }
                 gotOutput = true;
+            }
+
+            if (buf2d) {
+                // 2D 锁定的 buffer 只能用 Unlock2D 解锁，1D 用 Unlock
+                if (locked) buf2d->Unlock2D();
+                buf2d->Release();
+            } else if (locked) {
                 buf->Unlock();
             }
             buf->Release();
@@ -340,5 +539,6 @@ void MediaDecoder::cleanup() {
     MFShutdown();
 
     width_ = height_ = stride_ = 0;
+    frameW_ = frameH_ = 0;
     initialized_ = false;
 }

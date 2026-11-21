@@ -60,8 +60,11 @@ private:
     uint8_t* frameBuffer_ = nullptr;
     int width_ = 0;
     int height_ = 0;
+    int frameBufferW_ = 0;   // frameBuffer_ 对应的宽高，分辨率变化时需要重建
+    int frameBufferH_ = 0;
     int desktopOriginX_ = 0;
     int desktopOriginY_ = 0;
+    int currentOutputIndex_ = 0;   // 当前抓取的 DXGI 输出序号，reset 时复用
     bool useGDI_ = false;
     bool initialized_ = false;
     std::wstring captureOutputName_;  // blank means output 0
