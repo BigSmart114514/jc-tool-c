@@ -21,7 +21,7 @@ link_directories(${EASYTIER_DIR}/lib)
 # usbmmidd_v2
 set(USBMMIDD_DIR "${CMAKE_SOURCE_DIR}/../usbmmidd_v2")
 if(NOT EXISTS ${USBMMIDD_DIR})
-    message(FATAL_ERROR "Easytier library not found at ${EASYTIER_DIR}")
+    message(FATAL_ERROR "usbmmidd_v2 not found at ${USBMMIDD_DIR}")
 endif()
 set(USBMMIDD_FILES
 "${USBMMIDD_DIR}/deviceinstaller64.exe"
@@ -158,9 +158,26 @@ set_target_properties(EasyTierService PROPERTIES
 
 # 复制 DLL
 if(WIN32)
-    # 可靠地获取 Qt bin 目录
-    find_program(QT_QMAKE_EXECUTABLE qmake HINTS ${Qt6_DIR} ENV Qt6_DIR REQUIRED)
+    # 可靠地获取 Qt bin 目录（优先使用 Qt6 提供的 qmake 位置，避免依赖环境变量）
+    if(TARGET Qt6::qmake)
+        get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
+        if(NOT QT_QMAKE_EXECUTABLE)
+            get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION_RELEASE)
+        endif()
+    endif()
+    if(NOT QT_QMAKE_EXECUTABLE AND DEFINED Qt6_DIR)
+        find_program(QT_QMAKE_EXECUTABLE qmake HINTS "${Qt6_DIR}/../../../bin")
+    endif()
+    if(NOT QT_QMAKE_EXECUTABLE AND DEFINED ENV{QT_ROOT_DIR})
+        find_program(QT_QMAKE_EXECUTABLE qmake HINTS "$ENV{QT_ROOT_DIR}/bin")
+    endif()
+    if(NOT QT_QMAKE_EXECUTABLE)
+        find_program(QT_QMAKE_EXECUTABLE qmake REQUIRED)
+    endif()
     get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)
+    if(NOT EXISTS "${QT_BIN_DIR}/Qt6Core.dll")
+        message(FATAL_ERROR "Found qmake at ${QT_QMAKE_EXECUTABLE} but ${QT_BIN_DIR}/Qt6Core.dll is missing")
+    endif()
     message(STATUS "Qt bin directory: ${QT_BIN_DIR}")
 
     file(GLOB EASYTIER_DLLS "${EASYTIER_DIR}/bin/*.dll")
