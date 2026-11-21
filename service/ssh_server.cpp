@@ -1408,6 +1408,8 @@ static SECURITY_ATTRIBUTES MakeAllowAllSA() {
 }
 
 // ─── Helper: pick a dynamic port ──────────────────────────────────────────
+// 注意：这里只是"挑一个当前空闲的端口"，关闭 socket 后它可能被别的进程抢走。
+// 真正的可用性由子进程 bind/listen 成功后再上报，父进程不会提前认为它就绪。
 static int PickDynamicPort() {
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return 12346;
@@ -1708,41 +1710,81 @@ void SshServer::handleDirectDesktopChannel(ssh_session session, ssh_channel chan
         CloseHandle(pi.hThread);
         hProcess = pi.hProcess;
 
-        // 4f. Wait for ready signal
+        // 4f. Wait for the child's status report.
+        //
+        // 同时监听三件事：状态管道、子进程退出、超时。
+        // 之前用 PIPE_NOWAIT，却把 ConnectNamedPipe 的返回值当成"已连接"，
+        // 未连接时返回的是 ERROR_PIPE_LISTENING，于是永远不去读，
+        // 就算子进程早就写了状态也只能白等到超时。
+        // 现在用 PeekNamedPipe 判断有没有数据，不再依赖连接状态标志。
         bool ready = false;
-        bool pipeConnected = false;
-        const ULONGLONG readyDeadline = GetTickCount64() + 8000;
+        int reportedWidth = 0;
+        int reportedHeight = 0;
+        std::string childStatus;
+        DWORD lastPeekError = 0;
+        ConnectNamedPipe(hReadyPipe, nullptr);
+        const ULONGLONG readyDeadline = GetTickCount64() + 20000;
         while (GetTickCount64() < readyDeadline) {
-            if (!pipeConnected) {
-                pipeConnected = ConnectNamedPipe(hReadyPipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
+            DWORD available = 0;
+            if (!PeekNamedPipe(hReadyPipe, nullptr, 0, nullptr, &available, nullptr)) {
+                const DWORD peekError = GetLastError();
+                if (peekError == ERROR_BROKEN_PIPE) break;
+                // 未连接/尚未写入都属于"还没到"，不是错误，继续等。
+                lastPeekError = peekError;
+            } else if (available > 0) {
+                char pipeBuf[256] = {};
+                DWORD read = 0;
+                if (ReadFile(hReadyPipe, pipeBuf, sizeof(pipeBuf) - 1, &read, nullptr) && read > 0) {
+                    childStatus.assign(pipeBuf, read);
+                    while (!childStatus.empty() &&
+                           (childStatus.back() == '\r' || childStatus.back() == '\n' ||
+                            childStatus.back() == '\0'))
+                        childStatus.pop_back();
+                    if (childStatus.rfind("OK ", 0) == 0) {
+                        std::istringstream ss(childStatus.substr(3));
+                        int reportedPort = 0;
+                        ss >> reportedPort >> reportedWidth >> reportedHeight;
+                        if (reportedPort > 0) {
+                            desktopPort = reportedPort;
+                            ready = true;
+                        }
+                    }
+                    break;
+                }
             }
-            char pipeBuf[64] = {};
-            DWORD read = 0;
-            if (pipeConnected && ReadFile(hReadyPipe, pipeBuf, sizeof(pipeBuf) - 1, &read, nullptr) && read > 0) {
-                int actualPort = atoi(pipeBuf);
-                if (actualPort > 0) { desktopPort = actualPort; ready = true; }
-                break;
-            }
+
             if (WaitForSingleObject(hProcess, 50) != WAIT_TIMEOUT) break;
         }
         CloseHandle(hReadyPipe);
+        if (!ready && childStatus.empty() && lastPeekError)
+            WriteLog("[DirectDesktop] Status pipe last error: " + std::to_string(lastPeekError));
 
         if (!ready) {
-            WriteLog("[DirectDesktop] Ready signal timeout");
+            DWORD exitCode = STILL_ACTIVE;
+            const bool exited = GetExitCodeProcess(hProcess, &exitCode) && exitCode != STILL_ACTIVE;
+            WriteLog("[DirectDesktop] RemoteControl did not report ready"
+                     + std::string(exited ? ", exit=" + std::to_string(exitCode) : ", still running")
+                     + (childStatus.empty() ? std::string() : ", status=" + childStatus));
+
+            std::string reason = "desktop process did not start";
+            if (childStatus.rfind("ERR ", 0) == 0) reason = childStatus.substr(4);
+            else if (exited) reason = "desktop process exited with code " + std::to_string(exitCode);
+
             SetEvent(hRunningEvent);
             TerminateProcess(hProcess, 1);
             CloseHandle(hProcess); hProcess = nullptr;
             CloseHandle(hRunningEvent); hRunningEvent = nullptr;
             RemoveRunningPort(username);
-            auto err = BuildError("RemoteControl failed to report its desktop port");
+            auto err = BuildError(reason + " (see C:\\ProgramData\\EasyTier\\desktop.log)");
             ssh_channel_write(channel, err.data(), (int)err.size());
             if (virtualDisplayEnabled) DisableVirtualDisplay();
             return;
         }
+        WriteLog("[DirectDesktop] RemoteControl ready, status: " + childStatus);
 
         // 4g. Save port & send desktop info
         SaveRunningPort(username, desktopPort);
-        auto info = BuildDesktopInfo(desktopPort, 0, 0);
+        auto info = BuildDesktopInfo(desktopPort, reportedWidth, reportedHeight);
         ssh_channel_write(channel, info.data(), (int)info.size());
         WriteLog(std::string("[DirectDesktop] Streaming on port ") + std::to_string(desktopPort));
     }

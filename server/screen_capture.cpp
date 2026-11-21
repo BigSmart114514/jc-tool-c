@@ -34,37 +34,37 @@ bool ScreenCapture::init() {
 }
 
 bool ScreenCapture::initDXGI() {
-    if (!device_) {
-        D3D_FEATURE_LEVEL fl;
-        UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                                        nullptr, 0, D3D11_SDK_VERSION, &device_, &fl, &context_);
-        if (FAILED(hr)) return false;
-    }
-
-    // If a specific output name is set, find its index
+    // 虚拟显示器往往挂在别的显卡/基础显示适配器上，不一定是默认适配器。
+    // 以前只在 device_ 所属的适配器里找输出，找不到就直接退回 GDI，
+    // 于是虚拟屏实际上从来没被采集过。
+    int adapterIndex = 0;
     int outputIndex = 0;
+
     if (!captureOutputName_.empty()) {
-        outputIndex = -1;
-        IDXGIDevice* dxgiDev = nullptr;
-        if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev))) {
-            IDXGIAdapter* adapter = nullptr;
-            if (SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
-                for (int i = 0;; ++i) {
+        IDXGIFactory1* factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
+            outputIndex = -1;
+            for (UINT a = 0; outputIndex < 0; ++a) {
+                IDXGIAdapter1* adapter = nullptr;
+                if (factory->EnumAdapters1(a, &adapter) != S_OK) break;
+                for (UINT o = 0;; ++o) {
                     IDXGIOutput* output = nullptr;
-                    if (FAILED(adapter->EnumOutputs(i, &output))) break;
+                    if (adapter->EnumOutputs(o, &output) != S_OK) break;
                     DXGI_OUTPUT_DESC desc = {};
-                    if (SUCCEEDED(output->GetDesc(&desc)) && captureOutputName_ == desc.DeviceName) {
-                        outputIndex = i;
-                        output->Release();
+                    const bool match = SUCCEEDED(output->GetDesc(&desc)) &&
+                                       captureOutputName_ == desc.DeviceName;
+                    output->Release();
+                    if (match) {
+                        adapterIndex = (int)a;
+                        outputIndex = (int)o;
                         break;
                     }
-                    output->Release();
                 }
                 adapter->Release();
             }
-            dxgiDev->Release();
+            factory->Release();
         }
+
         if (outputIndex < 0) {
             std::cerr << "[Capture] Output device not found: ";
             std::wcerr << captureOutputName_ << std::endl;
@@ -72,6 +72,27 @@ bool ScreenCapture::initDXGI() {
         }
     }
 
+    if (!device_) {
+        D3D_FEATURE_LEVEL fl;
+        UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        IDXGIAdapter* adapter = nullptr;
+        if (adapterIndex > 0) {
+            IDXGIFactory1* factory = nullptr;
+            if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
+                factory->EnumAdapters(adapterIndex, &adapter);
+                factory->Release();
+            }
+        }
+        HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN
+                                                        : D3D_DRIVER_TYPE_HARDWARE,
+                                        nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
+                                        &device_, &fl, &context_);
+        if (adapter) adapter->Release();
+        if (FAILED(hr)) return false;
+    }
+
+    currentAdapterIndex_ = adapterIndex;
+    currentOutputIndex_ = outputIndex;
     return initDuplication(outputIndex);
 }
 

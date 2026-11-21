@@ -66,6 +66,7 @@ private:
     int desktopOriginX_ = 0;
     int desktopOriginY_ = 0;
     int currentOutputIndex_ = 0;   // 当前抓取的 DXGI 输出序号，reset 时复用
+    int currentAdapterIndex_ = 0;  // 该输出所属的适配器序号，reset 时复用
     bool useGDI_ = false;
     bool initialized_ = false;
     std::wstring captureOutputName_;  // blank means output 0
