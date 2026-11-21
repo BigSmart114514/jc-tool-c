@@ -455,11 +455,12 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
                     if (p <= 0 || (size_t)p < w) return false;
                     size_t a = (size_t)p * h * 3 / 2;
                     size_t b = (size_t)p * h + ((h + 1) / 2) * w;
-                    auto near = [&](size_t v) {
+                    // 不能叫 near：windows.h 里有历史遗留的 near/far 宏
+                    auto lenIsClose = [&](size_t v) {
                         size_t d = v > L ? v - L : L - v;
                         return d <= 16;
                     };
-                    return near(a) || near(b);
+                    return lenIsClose(a) || lenIsClose(b);
                 };
                 int candA = (int)(L * 2 / (h * 3));
                 int candB = (int)((L > ((h + 1) / 2) * w
