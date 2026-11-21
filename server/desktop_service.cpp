@@ -305,7 +305,7 @@ void DesktopService::captureLoop() {
         ID3D11Texture2D* tex = nullptr;
         if (capture_.getDevice() && encoder_.hasGPUPath()) {
             std::lock_guard<std::mutex> lock(displayMtx_);
-            if (capture_.captureTexture(&tex)) {
+            if (capture_.captureTexture(&tex, isTimeForKeyframe)) {
                 encodeOk = encoder_.encodeFromTexture(tex, pts, encoded, isTimeForKeyframe);
             }
         } else {
@@ -321,7 +321,9 @@ void DesktopService::captureLoop() {
             }
         }
 
-        if (isTimeForKeyframe && (!encodeOk || encoded.empty())) keyframeRequested_ = true;
+        if (isTimeForKeyframe && (!encodeOk ||
+            std::none_of(encoded.begin(), encoded.end(), [](const auto& frame) { return frame.keyframe; })))
+            keyframeRequested_ = true;
         if (transport_ && transport_->hasClient()) {
             for (const auto& frame : encoded) {
                 auto msg = MessageBuilder::VideoFrame(frame.data.data(), frame.data.size(), frame.keyframe);

@@ -1,6 +1,7 @@
 
 #define NOMINMAX
 #include "media_encoder.h"
+#include "h264_nal.h"
 #include <iostream>
 #include <algorithm>
 #include <mfapi.h>
@@ -295,30 +296,28 @@ bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
 
     d3dContext_->Unmap(nv12Staging_, 0);
 
-    // 临时诊断：确认编码器拿到的 NV12 各段是否真的有内容
-    {
-        static int dbgEnc = 0;
-        if (dbgEnc < 5) {
-            dbgEnc++;
-            const uint8_t* y = nv12Buf.data();
-            auto meanBand = [&](int y0, int y1) {
-                double s = 0; long n = 0;
-                for (int yy = y0; yy < y1; yy += 3)
-                    for (int xx = 0; xx < alignedW_; xx += 3) {
-                        s += y[(size_t)yy * alignedW_ + xx];
-                        n++;
-                    }
-                return n ? s / n : 0.0;
-            };
-            std::cout << "[MediaEncoder] dbg src " << alignedW_ << "x" << alignedH_
-                      << " mean top=" << meanBand(0, alignedH_ / 2)
-                      << " mid=" << meanBand(alignedH_ / 2, alignedH_ * 3 / 4)
-                      << " bottom=" << meanBand(alignedH_ * 3 / 4, alignedH_)
-                      << std::endl;
-        }
-    }
-
+    logInputBands(nv12Buf.data(), "GPU");
     return submitFrame(nv12Buf.data(), pts, keyframe, output);
+}
+
+void MediaEncoder::logInputBands(const uint8_t* nv12, const char* path) {
+    if (inputBandLogs_ >= 5) return;
+    ++inputBandLogs_;
+    auto meanBand = [&](int firstRow, int endRow) {
+        double sum = 0;
+        size_t count = 0;
+        for (int y = firstRow; y < endRow; y += 3) {
+            for (int x = 0; x < alignedW_; x += 3) {
+                sum += nv12[size_t(y) * alignedW_ + x];
+                ++count;
+            }
+        }
+        return count ? sum / count : 0.0;
+    };
+    std::cout << "[MediaEncoder] dbg src " << alignedW_ << 'x' << alignedH_ << " path=" << path
+              << " mean top=" << meanBand(0, alignedH_ / 2)
+              << " mid=" << meanBand(alignedH_ / 2, alignedH_ * 3 / 4)
+              << " bottom=" << meanBand(alignedH_ * 3 / 4, alignedH_) << std::endl;
 }
 
 bool MediaEncoder::initEncoder() {
@@ -427,6 +426,7 @@ bool MediaEncoder::initEncoder() {
         return false;
     }
     std::cout << "[MediaEncoder] Input type set" << std::endl;
+    loadSequenceHeader();
 
     ICodecAPI* codecApi = nullptr;
     if (SUCCEEDED(encoder_->QueryInterface(IID_PPV_ARGS(&codecApi)))) {
@@ -458,6 +458,20 @@ bool MediaEncoder::initEncoder() {
     return true;
 }
 
+void MediaEncoder::loadSequenceHeader() {
+    IMFMediaType* type = nullptr;
+    if (FAILED(encoder_->GetOutputCurrentType(0, &type))) return;
+    UINT32 size = 0;
+    if (SUCCEEDED(type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size)) && size > 0 && size <= 65536) {
+        std::vector<uint8_t> bytes(size);
+        if (SUCCEEDED(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, bytes.data(), size, nullptr))) {
+            const auto nals = annexBNalTypes(bytes.data(), bytes.size());
+            if (nals.sps && nals.pps) sequenceHeader_ = std::move(bytes);
+        }
+    }
+    type->Release();
+}
+
 bool MediaEncoder::submitFrame(const uint8_t* nv12Data, int64_t pts, bool keyframe, std::vector<Frame>& output) {
     size_t bufSize = size_t(alignedW_) * alignedH_ * 3 / 2;
 
@@ -486,20 +500,28 @@ bool MediaEncoder::submitFrame(const uint8_t* nv12Data, int64_t pts, bool keyfra
     sample->SetSampleTime((LONGLONG)(pts * 10000000LL / fps_));
     sample->SetSampleDuration((LONGLONG)(10000000LL / fps_));
 
-    if (keyframe) {
+    auto forceKeyframe = [&] {
+        if (!keyframe) return;
         ICodecAPI* codec = nullptr;
-        if (SUCCEEDED(encoder_->QueryInterface(IID_PPV_ARGS(&codec)))) {
+        HRESULT result = encoder_->QueryInterface(IID_PPV_ARGS(&codec));
+        if (SUCCEEDED(result)) {
             VARIANT value = {};
             value.vt = VT_UI4;
             value.ulVal = 1;
-            codec->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value);
+            result = codec->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value);
             codec->Release();
         }
-    }
+        if (FAILED(result) && !loggedKeyframeError_) {
+            loggedKeyframeError_ = true;
+            std::cerr << "[MediaEncoder] ForceKeyFrame failed: 0x" << std::hex << result << std::dec << std::endl;
+        }
+    };
 
+    forceKeyframe();
     hr = encoder_->ProcessInput(0, sample, 0);
 
     if (hr == MF_E_NOTACCEPTING && processOutput(output)) {
+        forceKeyframe();
         hr = encoder_->ProcessInput(0, sample, 0);
     }
 
@@ -526,6 +548,7 @@ bool MediaEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<Frame>& 
 
     bgraToNv12(bgra, srcWidth_, srcHeight_, yPlane, uvPlane, alignedW_, alignedH_);
 
+    logInputBands(nv12Buf.data(), "CPU");
     return submitFrame(nv12Buf.data(), pts, keyframe, output);
 }
 
@@ -572,8 +595,9 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
             return false;
         }
 
-        if (resultSample && outputData.dwStatus != MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE &&
-            outputData.dwStatus != MFT_OUTPUT_DATA_BUFFER_STREAM_END) {
+        const DWORD sampleStatus = outputData.dwStatus & ~static_cast<DWORD>(MFT_OUTPUT_DATA_BUFFER_INCOMPLETE);
+        if (resultSample && sampleStatus != MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE &&
+            sampleStatus != MFT_OUTPUT_DATA_BUFFER_STREAM_END) {
             IMFMediaBuffer* buf = nullptr;
             hr = resultSample->ConvertToContiguousBuffer(&buf);
             if (SUCCEEDED(hr)) {
@@ -582,11 +606,14 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
                 hr = buf->Lock(&dataPtr, nullptr, &curLen);
                 if (SUCCEEDED(hr)) {
                     if (curLen > 0) {
-                        UINT32 cleanPoint = FALSE;
-                        resultSample->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint);
+                        const auto nals = annexBNalTypes(dataPtr, curLen);
                         Frame frame;
-                        frame.data.assign(dataPtr, dataPtr + curLen);
-                        frame.keyframe = cleanPoint != FALSE;
+                        if (nals.idr && !(nals.sps && nals.pps)) {
+                            if (sequenceHeader_.empty()) loadSequenceHeader();
+                            frame.data = sequenceHeader_;
+                        }
+                        frame.keyframe = nals.idr && ((nals.sps && nals.pps) || !frame.data.empty());
+                        frame.data.insert(frame.data.end(), dataPtr, dataPtr + curLen);
                         output.push_back(std::move(frame));
                     }
                     buf->Unlock();
@@ -597,7 +624,7 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
 
         if (resultSample) resultSample->Release();
         if (FAILED(hr)) return false;
-        if (outputData.dwStatus != MFT_OUTPUT_DATA_BUFFER_INCOMPLETE) return true;
+        if (!(outputData.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE)) return true;
     }
 }
 
@@ -631,6 +658,9 @@ void MediaEncoder::cleanupLocked() {
     MFShutdown();
 
     srcWidth_ = srcHeight_ = width_ = height_ = 0;
+    sequenceHeader_.clear();
+    loggedKeyframeError_ = false;
+    inputBandLogs_ = 0;
     hasGPUPath_ = false;
     initialized_ = false;
 }

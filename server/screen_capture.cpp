@@ -347,7 +347,7 @@ const uint8_t* ScreenCapture::capture(bool& hasNew) {
     return frameBuffer_;
 }
 
-bool ScreenCapture::captureTexture(ID3D11Texture2D** outTex) {
+bool ScreenCapture::captureTexture(ID3D11Texture2D** outTex, bool allowCached) {
     if (!outTex) return false;
     *outTex = nullptr;
     if (!initialized_ || useGDI_) return false;
@@ -362,7 +362,9 @@ bool ScreenCapture::captureTexture(ID3D11Texture2D** outTex) {
     HRESULT hr = duplication_->AcquireNextFrame(16, &fi, &res);
 
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        return false;
+        if (!allowCached || !gpuCopyValid_) return false;
+        *outTex = gpuCopyTexture_;
+        return true;
     }
 
     if (hr == DXGI_ERROR_ACCESS_LOST) {
@@ -391,12 +393,14 @@ bool ScreenCapture::captureTexture(ID3D11Texture2D** outTex) {
     }
     context_->CopyResource(gpuCopyTexture_, tex);
     tex->Release();
+    gpuCopyValid_ = true;
 
     *outTex = gpuCopyTexture_;
     return true;
 }
 
 void ScreenCapture::cleanupDuplicationOnly() {
+    gpuCopyValid_ = false;
     if (frameAcquired_ && duplication_) {
         duplication_->ReleaseFrame();
         frameAcquired_ = false;

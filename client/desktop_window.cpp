@@ -130,27 +130,27 @@ void DesktopWindow::handleMessage(const BinaryData& data) {
             handleScreenInfo(data);
             break;
 
-        case Desktop::MsgType::VideoFrame:
-            if (data.size() > 2) {
+        case Desktop::MsgType::VideoFrame: {
+            if (data.size() <= 2) break;
+            bool request = false;
+            {
                 std::lock_guard<std::mutex> lock(queueMtx_);
-
-                if (videoQueue_.size() > 3) {
-                    int dropCount = videoQueue_.size();
-                    intervalFramesDropped_ += dropCount;
-
-                    std::queue<BinaryData> empty;
-                    std::swap(videoQueue_, empty);
-
-                    if (transport_ && transport_->isConnected()) {
-                        auto msg = MessageBuilder::KeyframeRequest();
-                        transport_->send(msg);
-                    }
+                if (videoQueue_.size() >= 4) {
+                    intervalFramesDropped_ += videoQueue_.size();
+                    discardVideoQueue(true);
                 }
-                
-                videoQueue_.push(data);
-                queueCV_.notify_one();
+                if (waitingForKeyframe_ && data[1] == 0) {
+                    ++intervalFramesDropped_;
+                    request = shouldRequestKeyframe();
+                } else {
+                    waitingForKeyframe_ = false;
+                    videoQueue_.push(data);
+                    queueCV_.notify_one();
+                }
             }
+            if (request) requestKeyframe();
             break;
+        }
 
         case Desktop::MsgType::AudioConfig:
             handleAudioConfig(data);
@@ -184,6 +184,25 @@ void DesktopWindow::handleMessage(const BinaryData& data) {
     }
 }
 
+void DesktopWindow::discardVideoQueue(bool resetDecoder) {
+    std::queue<BinaryData> empty;
+    videoQueue_.swap(empty);
+    ++videoGeneration_;
+    waitingForKeyframe_ = true;
+    resetDecoderOnNextFrame_ = resetDecoder;
+}
+
+bool DesktopWindow::shouldRequestKeyframe() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextKeyframeRequest_) return false;
+    nextKeyframeRequest_ = now + std::chrono::milliseconds(500);
+    return true;
+}
+
+void DesktopWindow::requestKeyframe() {
+    if (transport_ && transport_->isConnected()) transport_->send(MessageBuilder::KeyframeRequest());
+}
+
 void DesktopWindow::handleScreenInfo(const BinaryData& data) {
     if (data.size() < 1 + sizeof(Desktop::ScreenInfo)) return;
 
@@ -193,16 +212,14 @@ void DesktopWindow::handleScreenInfo(const BinaryData& data) {
     screenWidth_ = info->width;
     screenHeight_ = info->height;
 
-    // 清空旧分辨率帧
-    {
-        std::lock_guard<std::mutex> lock(queueMtx_);
-        std::queue<BinaryData> empty;
-        std::swap(videoQueue_, empty);
-    }
-
     // 【修改】加锁保护解码器的重新初始化，避免与 decodeLoop 产生数据竞争
     {
         std::lock_guard<std::mutex> decLock(decoderMtx_);
+        {
+            std::lock_guard<std::mutex> lock(queueMtx_);
+            discardVideoQueue(false);
+            nextKeyframeRequest_ = {};
+        }
         decoder_.cleanup();
         if (decoder_.init(info->width, info->height)) {
             decoderReady_ = true;
@@ -277,6 +294,8 @@ void DesktopWindow::decodeLoop() {
     
     while (decoding_) {
         BinaryData data;
+        uint64_t generation;
+        bool resetDecoder;
         {
             std::unique_lock<std::mutex> lock(queueMtx_);
             queueCV_.wait(lock, [this] { return !videoQueue_.empty() || !decoding_; });
@@ -284,25 +303,31 @@ void DesktopWindow::decodeLoop() {
             
             data = std::move(videoQueue_.front());
             videoQueue_.pop();
+            generation = videoGeneration_;
+            resetDecoder = resetDecoderOnNextFrame_;
+            resetDecoderOnNextFrame_ = false;
         }
 
-        const uint8_t* rawH265 = data.data() + 2;
+        const uint8_t* rawH264 = data.data() + 2;
         size_t rawSize = data.size() - 2;
 
         auto decodeStart = std::chrono::steady_clock::now();
 
-        bool success = false;
+        auto result = MediaDecoder::DecodeResult::Error;
         int w = 0, h = 0, stride = 0;
-
-
 
         // 【修改】加锁保护解码操作，防止网络线程在此期间销毁上下文
         {
             std::lock_guard<std::mutex> decLock(decoderMtx_);
             if (!decoderReady_) continue;
+            {
+                std::lock_guard<std::mutex> lock(queueMtx_);
+                if (generation != videoGeneration_) continue;
+            }
             
-            success = decoder_.decode(rawH265, static_cast<int>(rawSize), rgbData);
-            if (success) {
+            if (!resetDecoder || decoder_.resetStream())
+                result = decoder_.decode(rawH264, static_cast<int>(rawSize), rgbData);
+            if (result == MediaDecoder::DecodeResult::FrameReady) {
                 w = decoder_.getWidth();
                 h = decoder_.getHeight();
                 stride = decoder_.getStride();
@@ -311,12 +336,10 @@ void DesktopWindow::decodeLoop() {
 
         auto decodeEnd = std::chrono::steady_clock::now();
         
-        if (success) {
+        if (result == MediaDecoder::DecodeResult::FrameReady) {
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(decodeEnd - decodeStart).count();
             intervalDecodeTimeMs_ += static_cast<uint64_t>(duration);
             intervalFramesDecoded_++;
-
-            checkAndAdjustStreamQuality();
 
             // 临时诊断：确认解码出来的画面各段是否真的有内容
             {
@@ -344,11 +367,13 @@ void DesktopWindow::decodeLoop() {
             }
 
             // 使用获取到的参数构造 QImage
-            QImage img(rgbData.data(), w, h, w * 4, QImage::Format_RGB32);
+            QImage img(rgbData.data(), w, h, stride, QImage::Format_RGB32);
             if (img.isNull()) {
                 continue;
             }
             {
+                std::lock_guard<std::mutex> queueLock(queueMtx_);
+                if (generation != videoGeneration_) continue;
                 std::lock_guard<std::mutex> lock(frameMutex_);
                 latestFrame_ = img.copy();   
                 hasNewFrame_ = true;
@@ -356,6 +381,8 @@ void DesktopWindow::decodeLoop() {
                 screenHeight_ = h;
                 frameReadyTime_ = std::chrono::steady_clock::now();
             }
+
+            checkAndAdjustStreamQuality();
 
             if (!initialStreamConfigured_) {
                 initialStreamConfigured_ = true;
@@ -375,11 +402,16 @@ void DesktopWindow::decodeLoop() {
             }
 
             emit frameReady(); 
-        } else {
-            if (transport_ && transport_->isConnected()) {
-                auto msg = MessageBuilder::KeyframeRequest();
-                transport_->send(msg);
+        } else if (result == MediaDecoder::DecodeResult::Error) {
+            bool request = false;
+            {
+                std::lock_guard<std::mutex> lock(queueMtx_);
+                if (generation == videoGeneration_) {
+                    discardVideoQueue(true);
+                    request = shouldRequestKeyframe();
+                }
             }
+            if (request) requestKeyframe();
         }
     }
 }
@@ -574,12 +606,13 @@ void DesktopWindow::checkAndAdjustStreamQuality() {
     auto actualIntervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatsTime_).count();
 
     if (actualIntervalMs >= STATS_INTERVAL_MS) {
+        const auto dropped = intervalFramesDropped_.exchange(0);
         auto sinceLastChangeMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFpsChangeTime_).count();
         bool needUpdate = false;
 
         if (sinceLastChangeMs > BLIND_PERIOD_MS) {
             // 修正 1：降帧逻辑
-            if (intervalFramesDropped_ > 0) {
+            if (dropped > 0) {
                 // 不要用“区间实际帧数”去算，而是基于“当前设定值”打折
                 // 否则一次抖动就会让 FPS 归零
                 int newFps = static_cast<int>(currentFps_ * FPS_DOWN_RATIO);
@@ -616,7 +649,6 @@ void DesktopWindow::checkAndAdjustStreamQuality() {
 
         // 重置区间统计（保持不变）
         intervalFramesDecoded_ = 0;
-        intervalFramesDropped_ = 0;
         intervalDecodeTimeMs_ = 0;
         lastStatsTime_ = now;
     }

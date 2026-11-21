@@ -36,7 +36,9 @@ public:
 private:
     bool initEncoder();
     bool initVideoProcessor();
+    void loadSequenceHeader();
     bool processOutput(std::vector<Frame>& output);
+    void logInputBands(const uint8_t* nv12, const char* path);
     bool submitFrame(const uint8_t* nv12Data, int64_t pts, bool keyframe, std::vector<Frame>& output);
     void cleanupLocked();
 
@@ -54,6 +56,9 @@ private:
     IMFTransform* encoder_ = nullptr;
     IMFMediaType* inputType_ = nullptr;
     IMFMediaType* outputType_ = nullptr;
+    std::vector<uint8_t> sequenceHeader_;
+    bool loggedKeyframeError_ = false;
+    unsigned inputBandLogs_ = 0;
 
     int srcWidth_ = 0;
     int srcHeight_ = 0;

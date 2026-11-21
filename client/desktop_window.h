@@ -46,6 +46,10 @@ private:
     std::mutex queueMtx_;
     std::condition_variable queueCV_;
     std::queue<BinaryData> videoQueue_;
+    uint64_t videoGeneration_ = 0;  // protected by queueMtx_
+    bool waitingForKeyframe_ = true;
+    bool resetDecoderOnNextFrame_ = false;
+    std::chrono::steady_clock::time_point nextKeyframeRequest_{};
 
     MediaDecoder decoder_;
     bool decoderReady_ = false;
@@ -80,7 +84,7 @@ private:
     QTimer resizeTimer_;
 
     uint64_t intervalFramesDecoded_ = 0;
-    uint64_t intervalFramesDropped_ = 0;
+    std::atomic<uint64_t> intervalFramesDropped_{0};
     uint64_t intervalDecodeTimeMs_ = 0;
     std::chrono::steady_clock::time_point lastStatsTime_;
     std::chrono::steady_clock::time_point lastFpsChangeTime_;
@@ -95,6 +99,9 @@ private:
     void checkAndAdjustStreamQuality();
     void logStatistics();
     void decodeLoop();
+    void discardVideoQueue(bool resetDecoder);  // caller holds queueMtx_
+    bool shouldRequestKeyframe();               // caller holds queueMtx_
+    void requestKeyframe();
     void audioDecodeLoop();
     void handleScreenInfo(const BinaryData& data);
     void handleAudioConfig(const BinaryData& data);
