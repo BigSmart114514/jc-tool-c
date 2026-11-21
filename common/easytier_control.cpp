@@ -183,6 +183,41 @@ bool LoadConfigFromFile(EasyTierConfig& config) {
     return JsonToConfig(json, config);
 }
 
+bool SaveConfigToFileEncrypted(const EasyTierConfig& config) {
+    EasyTierConfig toSave = config;
+    // EncryptSecret 在 DPAPI 失败时返回空串。若不校验，就会把一个
+    // 空的 secret 写到磁盘上，看起来"保存成功"但实际把密码清空了。
+    if (!config.networkSecret.empty()) {
+        toSave.networkSecret = EncryptSecret(config.networkSecret);
+        if (toSave.networkSecret.empty()) return false;
+    }
+    if (!config.sshPassword.empty()) {
+        toSave.sshPassword = EncryptSecret(config.sshPassword);
+        if (toSave.sshPassword.empty()) return false;
+    }
+    return SaveConfigToFile(toSave);
+}
+
+// 服务端的响应形如 {"code":0,...} / {"code":1,"message":"..."}。
+// 之前所有调用方都只判断 sendRequest 的返回值（那只是"管道通信成功"），
+// 服务端返回 code=1 也会被当成成功，所以这里统一检查。
+static bool ResponseOk(const std::string& resp, std::string& err) {
+    if (resp.empty()) {
+        err = "empty response";
+        return false;
+    }
+    // 必须显式存在 "code" 字段：ExtractJsonInt 找不到 key 时会返回 0，
+    // 若不先判断，任何非法响应都会被误判成成功。
+    if (resp.find("\"code\":") == std::string::npos) {
+        err = "malformed response";
+        return false;
+    }
+    if (ExtractJsonInt(resp, "code") == 0) return true;
+    err = ExtractJsonString(resp, "message");
+    if (err.empty()) err = "request failed";
+    return false;
+}
+
 EasyTierControlClient::EasyTierControlClient()
     : hPipe_(INVALID_HANDLE_VALUE), seq_(0),
       state_(ConnectionState::Disconnected) {}
@@ -271,16 +306,29 @@ bool EasyTierControlClient::sendRequest(EasyTierCmd cmd,
         return true;
     };
 
-    if (tryOnce()) return true;
+    if (!tryOnce()) {
+        // 服务端已在处理完上一个请求后断开了管道，重连一次再试
+        disconnect();
+        if (!connect(EASYTIER_PIPE_TIMEOUT)) {
+            state_ = ConnectionState::Error;
+            lastError_ = "sendRequest: reconnect failed";
+            return false;
+        }
+        if (!tryOnce()) {
+            lastError_ = "sendRequest: transport failed";
+            return false;
+        }
+    }
 
-    // 服务端已在处理完上一个请求后断开了管道，重连一次再试
-    disconnect();
-    if (!connect(EASYTIER_PIPE_TIMEOUT)) {
-        state_ = ConnectionState::Error;
-        lastError_ = "sendRequest: reconnect failed";
+    // 传输成功 ≠ 命令成功。服务端用 {"code":1,"message":...} 表达业务失败，
+    // 之前这里直接 return true，导致 configure 之类的失败被当成成功。
+    std::string err;
+    if (!ResponseOk(responseJson, err)) {
+        lastError_ = err;
         return false;
     }
-    return tryOnce();
+    lastError_.clear();
+    return true;
 }
 
 bool EasyTierControlClient::start() {
@@ -324,12 +372,15 @@ bool EasyTierControlClient::getConfig(EasyTierConfig& config) {
     return JsonToConfig(inner, config);
 }
 
-bool EasyTierControlClient::configure(const EasyTierConfig& config, bool restartNow) {
+bool EasyTierControlClient::configure(const EasyTierConfig& config, bool restartNow,
+                                      std::string* message) {
     std::string configJson = ConfigToJson(config);
     std::string request = "{\"config\":" + configJson + ",\"restart\":"
         + (restartNow ? "true" : "false") + "}";
     std::string resp;
-    return sendRequest(CMD_CONFIGURE, request, resp);
+    if (!sendRequest(CMD_CONFIGURE, request, resp)) return false;
+    if (message) *message = ExtractJsonString(resp, "message");
+    return true;
 }
 
 bool EasyTierControlClient::shutdown() {

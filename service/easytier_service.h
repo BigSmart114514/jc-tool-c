@@ -11,6 +11,16 @@
 
 class EasytierManager;
 
+// configureAndRestart 的结果：保存成功和"重启成功"是两件事。
+// 以前用一个 bool 表达，导致实例没在跑时（restart 必然失败）连
+// "配置已保存"都被判成失败。
+struct ConfigureResult {
+    bool saved = false;          // 配置是否已写盘
+    bool restarted = false;      // 是否真的重启了 EasyTier 实例
+    bool wasRunning = false;     // 调用时实例是否在运行
+    std::string message;         // 失败原因 / 提示
+};
+
 class EasyTierService {
 public:
     EasyTierService();
@@ -23,7 +33,8 @@ public:
     bool restartEasyTier();
     std::string getVirtualIp() const { return virtualIp_; }
     bool isActive() const { return active_.load(); }
-    bool configureAndRestart(const EasyTierConfig& newConfig, bool restartNow);
+    ConfigureResult configureAndRestart(const EasyTierConfig& newConfig, bool restartNow);
+
     // SSH server management
     bool startSshServer(int port, const std::string& password);
     void stopSshServer();

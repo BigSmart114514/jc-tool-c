@@ -158,21 +158,34 @@ void ServiceManagerDialog::createUI() {
 }
 
 void ServiceManagerDialog::loadConfigFromService() {
+    EasyTierConfig cfg;
+    bool loaded = false;
+
     if (client_.isConnected()) {
-        EasyTierConfig cfg;
-        if (client_.getConfig(cfg)) {
-            leInstName_->setText(QString::fromStdString(cfg.instanceName));
-            leNetName_->setText(QString::fromStdString(cfg.networkName));
-            leNetSecret_->setText(QString::fromStdString(cfg.networkSecret));
-            leIpv4_->setText(QString::fromStdString(cfg.ipv4));
-            leListenPort_->setText(QString::number(cfg.listenPort));
-            lePeerUrl_->setText(QString::fromStdString(cfg.peerUrl));
-            chkAutoStart_->setChecked(cfg.autoStart);
-            leSshPort_->setText(QString::number(cfg.sshPort));
-            leSshPassword_->setText(QString::fromStdString(cfg.sshPassword));
-            return;
+        loaded = client_.getConfig(cfg);
+    }
+    if (!loaded) {
+        // 服务没在跑的时候也把已保存的配置显示出来，
+        // 否则界面一直停留在 createUI() 里的硬编码默认值，
+        // 点 Apply 会用这些默认值覆盖掉真实配置。
+        loaded = LoadConfigFromFile(cfg);
+        if (loaded) {
+            cfg.networkSecret = DecryptSecret(cfg.networkSecret);
+            cfg.sshPassword = DecryptSecret(cfg.sshPassword);
         }
     }
+    if (!loaded) return;
+
+    leInstName_->setText(QString::fromStdString(cfg.instanceName));
+    leNetName_->setText(QString::fromStdString(cfg.networkName));
+    leNetSecret_->setText(QString::fromStdString(cfg.networkSecret));
+    leIpv4_->setText(QString::fromStdString(cfg.ipv4));
+    leListenPort_->setText(QString::number(cfg.listenPort));
+    lePeerUrl_->setText(QString::fromStdString(cfg.peerUrl));
+    chkAutoStart_->setChecked(cfg.autoStart);
+    leSshPort_->setText(QString::number(cfg.sshPort));
+    leSshPassword_->setText(QString::fromStdString(cfg.sshPassword));
+    configLoaded_ = true;
 }
 
 static bool IsServiceInstalledScm() {
@@ -225,6 +238,8 @@ void ServiceManagerDialog::refreshStatus() {
         btnStart_->setEnabled(true);
         btnStop_->setEnabled(false);
         btnRestart_->setEnabled(false);
+        // 服务没连上时也从磁盘读取已保存配置，避免界面停留在默认值。
+        if (!configLoaded_) loadConfigFromService();
         return;
     }
 
@@ -245,6 +260,9 @@ void ServiceManagerDialog::refreshStatus() {
             btnRestart_->setEnabled(false);
         }
         lblIp_->setText("IP: " + QString::fromStdString(ip.empty() ? "--" : ip));
+        // 已连上服务时优先用服务端返回的配置回填；只回填一次，
+        // 否则 3 秒一次的定时刷新会覆盖用户正在编辑的内容。
+        if (!configLoaded_) loadConfigFromService();
         refreshSshStatus();
         return;
     }
@@ -488,21 +506,57 @@ void ServiceManagerDialog::onApplyConfig() {
         if (!guard) return;
         EasyTierControlClient cli;
         bool ok = false;
+        bool viaFile = false;
+        std::string detail;
+        std::string serverMsg;
+
         if (guard->waitForPipe(cli, 10, 300)) {
-            ok = cli.configure(cfg, true);
+            // 服务在跑：交给服务端处理（会写盘并按需重启实例）。
+            ok = cli.configure(cfg, true, &serverMsg);
+            detail = cli.lastError();
+        } else {
+            // 服务没在运行：直接写配置文件，等下次服务启动时生效。
+            // 以前这里直接报"失败"，但配置其实完全可以先存下来。
+            ok = SaveConfigToFileEncrypted(cfg);
+            viaFile = ok;
+            if (!ok) detail = "failed to write config file";
         }
-        QMetaObject::invokeMethod(guard.data(), [guard, ok, cfg]() {
+
+        QMetaObject::invokeMethod(guard.data(), [guard, ok, viaFile, detail, serverMsg]() {
             if (!guard) return;
             guard->setButtonsEnabled(true);
             guard->btnApply_->setText("Apply & Restart");
-            if (ok) {
+            if (!ok) {
+                QString msg = "Failed to apply configuration.";
+                if (!detail.empty())
+                    msg += "\n\n" + QString::fromStdString(detail);
+                QMessageBox::critical((QWidget*)guard, "Error", msg);
+                return;
+            }
+            if (viaFile) {
+                QMessageBox::information((QWidget*)guard, "Saved",
+                    "EasyTier service is not running.\n"
+                    "Configuration has been saved and will be applied "
+                    "the next time the service starts.");
+                return;
+            }
+            // 服务端会区分"已保存"和"已重启"：实例本来就没在跑时
+            // 只保存配置，不应该谎报"已重启"。
+            const QString detailText = QString::fromStdString(serverMsg);
+            if (detailText.contains("not running")) {
+                QMessageBox::information((QWidget*)guard, "Saved",
+                    "Configuration saved.\n"
+                    "EasyTier is not running, so it was not restarted.\n"
+                    "Start EasyTier to apply the new settings.");
+            } else if (detailText.contains("restart failed")) {
+                QMessageBox::warning((QWidget*)guard, "Partially Applied",
+                    "Configuration was saved, but restarting EasyTier failed.\n"
+                    "Check the service log for details.");
+            } else {
                 QMessageBox::information((QWidget*)guard, "Success",
                     "Configuration applied and EasyTier restarted.");
-                guard->refreshStatus();
-            } else {
-                QMessageBox::critical((QWidget*)guard, "Error",
-                    "Failed to apply configuration.");
             }
+            guard->refreshStatus();
         });
     }).detach();
 }

@@ -484,7 +484,23 @@ void EasyTierService::stopEasyTier() {
 }
 
 bool EasyTierService::restartEasyTier() {
-    stopEasyTier();
+    // 重启只应重建 EasyTier 实例，不能走 stopEasyTier()：
+    // 后者会停掉 SSH 服务器并卸载 usbmmidd 虚拟显示器，
+    // 正在进行的远程桌面会话会被直接拆掉。所以这里只停实例本身。
+    std::thread staleMonitor;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (running_) {
+            running_ = false;
+            active_ = false;
+            virtualIp_ = "";
+            staleMonitor = std::move(monitorThread_);
+        }
+    }
+    // join 必须在锁外：monitorLoop 每秒都可能抢 mutex_。
+    if (staleMonitor.joinable())
+        staleMonitor.join();
+    retain_network_instance(nullptr, 0);
     return startEasyTier();
 }
 
@@ -494,28 +510,50 @@ EasyTierConfig EasyTierService::getConfig() const {
 }
 
 bool EasyTierService::saveConfigToDisk(const EasyTierConfig& cfg) {
-    EasyTierConfig toSave = cfg;
-    toSave.networkSecret = EncryptSecret(cfg.networkSecret);
-    toSave.sshPassword = EncryptSecret(cfg.sshPassword);
-    bool ok = SaveConfigToFile(toSave);
+    // 加密写盘复用 common 里的实现，避免客户端/服务端各写一份。
+    bool ok = SaveConfigToFileEncrypted(cfg);
     WriteLog(ok ? "Config saved" : "Config SAVE FAILED");
     return ok;
 }
 
-bool EasyTierService::configureAndRestart(const EasyTierConfig& newConfig, bool restartNow) {
+ConfigureResult EasyTierService::configureAndRestart(const EasyTierConfig& newConfig, bool restartNow) {
+    ConfigureResult res;
+    res.wasRunning = isActive();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         config_ = newConfig;
     }
-    if (!saveConfigToDisk(newConfig)) return false;
-    // Apply SSH config changes
+    // 1. 先把配置写盘。这一步失败才是真正的"配置保存失败"。
+    if (!saveConfigToDisk(newConfig)) {
+        res.message = "failed to save config to disk";
+        return res;
+    }
+    res.saved = true;
+
+    // 2. 按新配置调整 SSH 服务器（与实例是否运行无关）。
     if (newConfig.sshEnabled && !newConfig.sshPassword.empty()) {
         startSshServer(newConfig.sshPort, newConfig.sshPassword);
     } else {
         stopSshServer();
     }
-    if (restartNow) return restartEasyTier();
-    return true;
+
+    // 3. EasyTier 实例本来就没跑，就不要去启动它。
+    //    以前这里无条件 restartEasyTier()，服务处于 stopped 状态时
+    //    必然失败，于是整个"应用配置"被误报为失败。
+    if (!restartNow) {
+        res.message = "config saved (restart not requested)";
+        return res;
+    }
+    if (!res.wasRunning) {
+        res.message = "config saved (EasyTier not running, not restarted)";
+        WriteLog("[Service] Config saved; EasyTier is not running, skip restart");
+        return res;
+    }
+
+    res.restarted = restartEasyTier();
+    res.message = res.restarted ? "config saved and EasyTier restarted"
+                                : "config saved but EasyTier restart failed";
+    return res;
 }
 
 void EasyTierService::monitorLoop() {

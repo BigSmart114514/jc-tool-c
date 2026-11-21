@@ -64,6 +64,9 @@ private:
 
     QTimer* timer_;
     EasyTierControlClient client_;
+    // 配置区是否已经从服务/磁盘回填过。定时刷新只回填一次，
+    // 否则会把用户正在编辑的内容覆盖掉。
+    bool configLoaded_ = false;
 };
 
 #endif

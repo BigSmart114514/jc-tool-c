@@ -61,6 +61,10 @@ const wchar_t* GetEasyTierConfigPath();
 bool SaveConfigToFile(const EasyTierConfig& config);
 bool LoadConfigFromFile(EasyTierConfig& config);
 
+// 直接把明文配置加密后写盘（DPAPI，LocalMachine 作用域）。
+// 客户端在服务未运行时走这条路径，避免把明文 secret 落到磁盘上。
+bool SaveConfigToFileEncrypted(const EasyTierConfig& config);
+
 std::string ConfigToJson(const EasyTierConfig& config);
 bool JsonToConfig(const std::string& json, EasyTierConfig& config);
 std::string JsonEscape(const std::string& s);
@@ -91,7 +95,8 @@ public:
     bool restart();
     bool getStatus(std::string& state, std::string& ip, uint32_t& uptime);
     bool getConfig(EasyTierConfig& config);
-    bool configure(const EasyTierConfig& config, bool restartNow);
+    bool configure(const EasyTierConfig& config, bool restartNow,
+                   std::string* message = nullptr);
     bool shutdown();
     bool sshStart(int port, const std::string& password);
     bool sshStop();

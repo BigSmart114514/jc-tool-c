@@ -257,9 +257,17 @@ static std::string HandleCommand(EasyTierCmd cmd, const std::string& json) {
         if (!JsonToConfig(inner, cfg))
             return errResp("invalid config json");
         bool restart = json.find("\"restart\":true") != std::string::npos;
-        bool ok = g_service.configureAndRestart(cfg, restart);
-        if (!ok) return errResp("configure failed");
-        return okResp("\"ip\":\"" + JsonEscape(g_service.getVirtualIp()) + "\"");
+        ConfigureResult res = g_service.configureAndRestart(cfg, restart);
+        if (!res.saved)
+            return errResp(res.message.empty() ? "configure failed" : res.message);
+        // 保存成功就算成功；是否重启成功单独用字段告知客户端，
+        // 避免"配置已保存但实例没在跑"被当成整体失败。
+        return okResp(
+            std::string("\"saved\":true")
+            + ",\"restarted\":" + (res.restarted ? "true" : "false")
+            + ",\"running\":" + (res.wasRunning ? "true" : "false")
+            + ",\"message\":\"" + JsonEscape(res.message) + "\""
+            + ",\"ip\":\"" + JsonEscape(g_service.getVirtualIp()) + "\"");
     }
     case CMD_SSH_START: {
         int port = ExtractJsonInt(json, "port");
