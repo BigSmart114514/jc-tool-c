@@ -18,6 +18,8 @@
 #include <cstring>
 #include <sstream>
 #include <map>
+#include <thread>
+#include <utility>
 #include <windows.h>
 extern "C" {
 #include <easytier.h>
@@ -279,7 +281,10 @@ std::string EasyTierService::MakeConfig(const std::string& instanceName,
     ss << "enable_exit_node = false\n";
     ss << "no_tun = false\n";
     ss << "use_smoltcp = false\n";
-    ss << "foreign_network_whitelist = \"*\"\n";
+    // 注意：键名是 relay_network_whitelist（对应 FlagsInConfig）。
+    // 写成 foreign_network_whitelist 会被 TOML 解析器判为 unknown field，
+    // 导致 parse_config 直接失败、实例起不来（上游 install.sh 也踩过同样的坑）。
+    ss << "relay_network_whitelist = \"*\"\n";
 
     return ss.str();
 }
@@ -325,14 +330,24 @@ bool EasyTierService::init() {
 }
 
 bool EasyTierService::startEasyTier() {
+    std::thread staleMonitor;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (isActive()) return true;
         tomlConfig_ = EasyTierService::MakeConfig(
             config_.instanceName, config_.networkName, config_.networkSecret,
             config_.ipv4, config_.listenPort, config_.peerUrl);
+        // 复位上次运行残留的状态（monitor 线程 / FFI 实例）。
+        // 这里刻意不调用 stopEasyTier()：那会连带停掉 SSH 服务器，并卸载
+        // usbmmidd 虚拟显示器（enableidd 0 / stop / remove 各等 1s），
+        // 与"启动 EasyTier"无关，还会把刚装好的驱动立刻拆掉。
+        running_ = false;
+        active_ = false;
+        staleMonitor = std::move(monitorThread_);
     }
-    stopEasyTier();            // ← 此时没有锁，不会 crash
+    // join 放在锁外：monitor 的轮询间隔是 5 秒，不能让它卡住 mutex_。
+    if (staleMonitor.joinable())
+        staleMonitor.join();
     std::string tomlConfig;
     {
         std::lock_guard<std::mutex> lock(mutex_);
