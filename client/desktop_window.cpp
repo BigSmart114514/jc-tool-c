@@ -318,6 +318,31 @@ void DesktopWindow::decodeLoop() {
 
             checkAndAdjustStreamQuality();
 
+            // 临时诊断：确认解码出来的画面各段是否真的有内容
+            {
+                static int dbgDec = 0;
+                if (dbgDec < 5) {
+                    dbgDec++;
+                    const uint8_t* px = rgbData.data();
+                    auto meanBand = [&](int y0, int y1) {
+                        double s = 0; long n = 0;
+                        for (int yy = y0; yy < y1; yy += 3)
+                            for (int xx = 0; xx < w; xx += 3) {
+                                s += px[((size_t)yy * w + xx) * 4 + 1];
+                                n++;
+                            }
+                        return n ? s / n : 0.0;
+                    };
+                    std::cout << "[Desktop] dbg dec " << w << "x" << h
+                              << " kf=" << (int)data[1]
+                              << " rawLen=" << data.size() - 2
+                              << " mean top=" << meanBand(0, h / 2)
+                              << " mid=" << meanBand(h / 2, h * 3 / 4)
+                              << " bottom=" << meanBand(h * 3 / 4, h)
+                              << std::endl;
+                }
+            }
+
             // 使用获取到的参数构造 QImage
             QImage img(rgbData.data(), w, h, w * 4, QImage::Format_RGB32);
             if (img.isNull()) {

@@ -474,11 +474,16 @@ bool MediaDecoder::processOutput(std::vector<uint8_t>& bgraOut) {
                 }
                 if (chosen < (int)w) chosen = (int)w;
                 if (chosen != (int)pitch) {
-                    std::cout << "[MediaDecoder] pitch corrected " << pitch
-                              << " -> " << chosen << " (len=" << curLen
-                              << " frame=" << frameW_ << "x" << frameH_
-                              << ", 2d=" << (got2d ? 1 : 0) << ")"
-                              << std::endl;
+                    // 只打印前几次，避免逐帧刷屏（1D 缓冲每帧都没有 pitch 信息）
+                    static int correctedLogs = 0;
+                    if (correctedLogs < 3) {
+                        correctedLogs++;
+                        std::cout << "[MediaDecoder] pitch derived " << chosen
+                                  << " (len=" << curLen
+                                  << " frame=" << frameW_ << "x" << frameH_
+                                  << ", 2d=" << (got2d ? 1 : 0) << ")"
+                                  << std::endl;
+                    }
                 }
                 pitch = chosen;
             }

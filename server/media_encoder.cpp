@@ -285,6 +285,29 @@ bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
 
     d3dContext_->Unmap(nv12Staging_, 0);
 
+    // 临时诊断：确认编码器拿到的 NV12 各段是否真的有内容
+    {
+        static int dbgEnc = 0;
+        if (dbgEnc < 5) {
+            dbgEnc++;
+            const uint8_t* y = nv12Buf.data();
+            auto meanBand = [&](int y0, int y1) {
+                double s = 0; long n = 0;
+                for (int yy = y0; yy < y1; yy += 3)
+                    for (int xx = 0; xx < alignedW_; xx += 3) {
+                        s += y[(size_t)yy * alignedW_ + xx];
+                        n++;
+                    }
+                return n ? s / n : 0.0;
+            };
+            std::cout << "[MediaEncoder] dbg src " << alignedW_ << "x" << alignedH_
+                      << " mean top=" << meanBand(0, alignedH_ / 2)
+                      << " mid=" << meanBand(alignedH_ / 2, alignedH_ * 3 / 4)
+                      << " bottom=" << meanBand(alignedH_ * 3 / 4, alignedH_)
+                      << std::endl;
+        }
+    }
+
     if (!createInputSample(nv12Buf.data(), pts, keyframe)) {
         std::cerr << "[MediaEncoder] createInputSample failed" << std::endl;
         return false;
