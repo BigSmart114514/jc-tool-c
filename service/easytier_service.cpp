@@ -39,20 +39,44 @@ bool EasyTierService::loadIpFromInstances() {
     bool found = false;
     for (int i = 0; i < count; ++i) {
         std::string value(pairs[i].value);
-        if (value.find("\"virtual_ipv4\":") != std::string::npos) {
-            auto pos = value.find("\"virtual_ipv4\":{");
-            if (pos != std::string::npos) {
-                auto addrPos = value.find("\"addr\":", pos);
-                if (addrPos != std::string::npos) {
-                    addrPos += strlen("\"addr\":");
-                    auto endPos = value.find_first_of(",}", addrPos);
-                    std::string addrStr = value.substr(addrPos, endPos - addrPos);
-                    uint32_t addr = std::stoul(addrStr);
-                    virtualIp_ = addrToIp(addr);
-                    found = true;
+
+        // virtual_ipv4 在不同 FFI 版本下的序列化格式不同：
+        //   旧版（对象）："virtual_ipv4":{"addr":169090561,...}
+        //   新版（字符串）："virtual_ipv4":"10.126.126.1/24"
+        // 两种都要兼容，否则升级 FFI 后会永远拿不到 IP。
+        std::string ip;
+
+        auto objPos = value.find("\"virtual_ipv4\":{");
+        if (objPos != std::string::npos) {
+            auto addrPos = value.find("\"addr\":", objPos);
+            if (addrPos != std::string::npos) {
+                addrPos += strlen("\"addr\":");
+                auto endPos = value.find_first_of(",}", addrPos);
+                try {
+                    uint32_t addr = std::stoul(value.substr(addrPos, endPos - addrPos));
+                    ip = addrToIp(addr);
+                } catch (...) {
+                    ip.clear();
                 }
             }
         }
+
+        if (ip.empty()) {
+            auto strPos = value.find("\"virtual_ipv4\":\"");
+            if (strPos != std::string::npos) {
+                strPos += strlen("\"virtual_ipv4\":\"");
+                auto endPos = value.find('"', strPos);
+                std::string cidr = value.substr(strPos, endPos - strPos);
+                auto slash = cidr.find('/');
+                ip = (slash == std::string::npos) ? cidr : cidr.substr(0, slash);
+            }
+        }
+
+        if (!ip.empty() && ip != "0.0.0.0") {
+            virtualIp_ = ip;
+            found = true;
+        }
+
         free_string(pairs[i].key);
         free_string(pairs[i].value);
     }
@@ -333,12 +357,17 @@ bool EasyTierService::startEasyTier() {
         tomlConfig = tomlConfig_; 
     }
 
-    // 2. 启动网络实例
+    // 2. 先清空可能残留的实例。上次启动失败时 running_ 仍为 false，
+    //    stopEasyTier() 不会清理，导致这里报 "instance already exists"，
+    //    之后必须重启进程才能恢复。启动前统一清一次即可自愈。
+    retain_network_instance(nullptr, 0);
+
     if (run_network_instance(tomlConfig.c_str()) != 0) {
         const char* err = nullptr;
         get_error_msg(&err);
         WriteLog("run_network_instance failed: " + (err ? std::string(err) : "unknown"));
         if (err) free_string(err);
+        retain_network_instance(nullptr, 0);   // 清理失败的实例，保证下次可重试
         return false;
     }
     WriteLog("Network instance started");
@@ -359,24 +388,33 @@ bool EasyTierService::startEasyTier() {
             break;
         }
 
-        // 如果超过 10 秒仍无 IP，额外打印一次 vpn_portal 状态
+        // 如果超过 10 秒仍无 IP，打印所有实例的真实状态（含 error_msg）
         if (i == 10) {
-            WriteLog("Still no IP after 10s, checking vpn_portal_cfg...");
+            WriteLog("Still no IP after 10s, dumping instance state...");
             constexpr int MAX = 64;
-            KeyValuePair pairs[MAX];
+            KeyValuePair pairs[MAX] = {};
             int count = collect_network_infos(pairs, MAX);
+            if (count <= 0) {
+                WriteLog("collect_network_infos returned " + std::to_string(count));
+            }
             for (int j = 0; j < count; ++j) {
-                if (std::strcmp(pairs[j].key, "default") == 0) {
-                    std::string vpnStatus = ExtractVpnPortalCfg(pairs[j].value);
-                    WriteLog("VPN Portal Status: " + (vpnStatus.empty() ? "empty" : vpnStatus));
-                    break;
-                }
+                std::string value = pairs[j].value ? pairs[j].value : "";
+                std::string err = ExtractJsonString(value, "error_msg");
+                std::string vpn = ExtractVpnPortalCfg(value);
+                WriteLog(std::string("Instance [")
+                         + (pairs[j].key ? pairs[j].key : "?") + "]"
+                         + " running=" + (value.find("\"running\":true") != std::string::npos ? "true" : "false")
+                         + " error=" + (err.empty() ? "none" : err)
+                         + " vpn_portal=" + (vpn.empty() ? "none" : vpn));
+                free_string(pairs[j].key);
+                free_string(pairs[j].value);
             }
         }
     }
 
     if (!gotIp) {
         WriteLog("Failed to obtain virtual IP after 60s");
+        retain_network_instance(nullptr, 0);   // 清理实例，保证下次启动不会 "instance already exists"
         WriteLog("startEasyTier FAILED");
         return false;
     }
@@ -510,13 +548,14 @@ void EasyTierService::stopSshServer() {
 
 bool EasyTierService::attemptReconnect() {
     active_ = false;
-    if (!instanceName_.empty()) {
-        const char* names[] = { instanceName_.c_str() };
-        retain_network_instance(names, 1);
-    }
+    // 保留同名实例并不会重启它（run_network_instance 仍会报 already exists），
+    // 必须先清空所有实例再重新启动。
+    retain_network_instance(nullptr, 0);
+
     if (parse_config(tomlConfig_.c_str()) != 0 ||
         run_network_instance(tomlConfig_.c_str()) != 0) {
         WriteLog("Reconnect failed");
+        retain_network_instance(nullptr, 0);
         return false;
     }
     for (int i = 0; i < 15; ++i) {
@@ -528,5 +567,6 @@ bool EasyTierService::attemptReconnect() {
         }
     }
     WriteLog("Reconnect: could not get IP after restart");
+    retain_network_instance(nullptr, 0);
     return false;
 }
