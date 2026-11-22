@@ -5,6 +5,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mftransform.h>
@@ -147,7 +148,9 @@ bool MediaDecoder::initDecoder() {
     inputType_->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     inputType_->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     MFSetAttributeSize(inputType_, MF_MT_FRAME_SIZE, alignedW_, alignedH_);
-    inputType_->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeRatio(inputType_, MF_MT_FRAME_RATE, 30, 1);
+    MFSetAttributeRatio(inputType_, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    inputType_->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_MixedInterlaceOrProgressive);
 
     hr = decoder_->SetInputType(0, inputType_, 0);
     if (FAILED(hr)) {
@@ -180,18 +183,20 @@ bool MediaDecoder::initDecoder() {
 
     ICodecAPI* codecApi = nullptr;
     if (SUCCEEDED(decoder_->QueryInterface(IID_PPV_ARGS(&codecApi)))) {
-        VARIANT var;
-        var.vt = VT_BOOL;
-        var.boolVal = VARIANT_TRUE;
-        codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &var);
-        codecApi->SetValue(&CODECAPI_AVDecVideoAcceleration_H264, &var);
-        var.vt = VT_UI4;
-        var.ulVal = (ULONG)alignedW_;
-        codecApi->SetValue(&CODECAPI_AVDecVideoMaxCodedWidth, &var);
-        var.ulVal = (ULONG)alignedH_;
-        codecApi->SetValue(&CODECAPI_AVDecVideoMaxCodedHeight, &var);
+        VARIANT value = {};
+        value.vt = VT_BOOL;
+        value.boolVal = VARIANT_TRUE;
+        const HRESULT lowLatencyResult = codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &value);
+
+        value.vt = VT_I4;
+        value.lVal = 4096;
+        const HRESULT maxWidthResult = codecApi->SetValue(&CODECAPI_AVDecVideoMaxCodedWidth, &value);
+        value.lVal = 2304;
+        const HRESULT maxHeightResult = codecApi->SetValue(&CODECAPI_AVDecVideoMaxCodedHeight, &value);
         codecApi->Release();
-        std::cout << "[MediaDecoder] Low-latency + HW acceleration enabled" << std::endl;
+        std::cout << "[MediaDecoder] ICodecAPI lowLatency=0x" << std::hex << lowLatencyResult
+                  << " maxWidth=0x" << maxWidthResult
+                  << " maxHeight=0x" << maxHeightResult << std::dec << std::endl;
     } else {
         std::cout << "[MediaDecoder] ICodecAPI not supported" << std::endl;
     }
@@ -234,6 +239,7 @@ bool MediaDecoder::selectNv12Output() {
 bool MediaDecoder::resetStream() {
     std::lock_guard<std::mutex> lock(mtx_);
     discontinuity_ = true;
+    nextSampleTime_ = 0;
     return initialized_ && SUCCEEDED(decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)) &&
            SUCCEEDED(decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0));
 }
@@ -265,7 +271,9 @@ MediaDecoder::DecodeResult MediaDecoder::decode(const uint8_t* data, int size, s
     if (SUCCEEDED(hr)) hr = sample->AddBuffer(buf);
     buf->Release();
     if (FAILED(hr)) { sample->Release(); return DecodeResult::Error; }
-    sample->SetSampleTime(0);
+    constexpr LONGLONG frameDuration = 10000000LL / 30;
+    sample->SetSampleTime(nextSampleTime_);
+    sample->SetSampleDuration(frameDuration);
     if (discontinuity_) sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
 
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -281,6 +289,7 @@ MediaDecoder::DecodeResult MediaDecoder::decode(const uint8_t* data, int size, s
         return DecodeResult::Error;
     }
 
+    nextSampleTime_ += frameDuration;
     discontinuity_ = false;
     if (!processOutput(bgraOut)) return DecodeResult::Error;
     return bgraOut.empty() ? DecodeResult::NeedInput : DecodeResult::FrameReady;
@@ -354,6 +363,24 @@ bool MediaDecoder::readFrame(IMFSample* sample, std::vector<uint8_t>& bgraOut) {
 
     const bool complete = data && layout.size && frameW_ >= width_ && frameH_ >= height_;
     if (complete) {
+        if (lumaDiagnosticLogs_ < 5) {
+            ++lumaDiagnosticLogs_;
+            auto meanY = [&](int firstRow, int endRow) {
+                uint64_t sum = 0;
+                uint64_t count = 0;
+                for (int y = firstRow; y < endRow; y += 3) {
+                    for (int x = 0; x < width_; x += 3) {
+                        sum += data[size_t(y) * layout.pitch + x];
+                        ++count;
+                    }
+                }
+                return count ? double(sum) / count : 0.0;
+            };
+            std::cout << "[MediaDecoder] dbg nv12-y " << width_ << 'x' << height_
+                      << " top=" << meanY(0, height_ / 2)
+                      << " mid=" << meanY(height_ / 2, height_ * 3 / 4)
+                      << " bottom=" << meanY(height_ * 3 / 4, height_) << std::endl;
+        }
         if (!loggedLayout_) {
             loggedLayout_ = true;
             std::cout << "[MediaDecoder] output pitch=" << layout.pitch << " frame=" << frameW_ << 'x'
@@ -393,7 +420,9 @@ void MediaDecoder::cleanupLocked() {
     width_ = height_ = stride_ = 0;
     frameW_ = frameH_ = 0;
     linearStride_ = 0;
+    nextSampleTime_ = 0;
     layoutErrors_ = 0;
+    lumaDiagnosticLogs_ = 0;
     loggedLayout_ = false;
     discontinuity_ = true;
     initialized_ = false;

@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QScreen>
 #include <iostream>
+#include <utility>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -341,27 +342,37 @@ void DesktopWindow::decodeLoop() {
             intervalDecodeTimeMs_ += static_cast<uint64_t>(duration);
             intervalFramesDecoded_++;
 
-            // 临时诊断：确认解码出来的画面各段是否真的有内容
+            // 用 RGB 加权亮度统计，不能把单独的 G 通道当作亮度。
             {
                 static int dbgDec = 0;
                 if (dbgDec < 5) {
                     dbgDec++;
                     const uint8_t* px = rgbData.data();
-                    auto meanBand = [&](int y0, int y1) {
-                        double s = 0; long n = 0;
+                    auto bandStats = [&](int y0, int y1) {
+                        double sum = 0;
+                        uint64_t count = 0;
+                        uint64_t nearBlack = 0;
                         for (int yy = y0; yy < y1; yy += 3)
                             for (int xx = 0; xx < w; xx += 3) {
-                                s += px[((size_t)yy * w + xx) * 4 + 1];
-                                n++;
+                                const uint8_t* p = px + (size_t(yy) * w + xx) * 4;
+                                const int luma = (29 * p[0] + 150 * p[1] + 77 * p[2] + 128) >> 8;
+                                sum += luma;
+                                nearBlack += luma <= 20;
+                                ++count;
                             }
-                        return n ? s / n : 0.0;
+                        return std::pair<double, double>{
+                            count ? sum / count : 0.0,
+                            count ? double(nearBlack) * 100.0 / count : 0.0};
                     };
+                    const auto top = bandStats(0, h / 2);
+                    const auto mid = bandStats(h / 2, h * 3 / 4);
+                    const auto bottom = bandStats(h * 3 / 4, h);
                     std::cout << "[Desktop] dbg dec " << w << "x" << h
                               << " kf=" << (int)data[1]
                               << " rawLen=" << data.size() - 2
-                              << " mean top=" << meanBand(0, h / 2)
-                              << " mid=" << meanBand(h / 2, h * 3 / 4)
-                              << " bottom=" << meanBand(h * 3 / 4, h)
+                              << " luma top=" << top.first << " (black=" << top.second << "%)"
+                              << " mid=" << mid.first << " (black=" << mid.second << "%)"
+                              << " bottom=" << bottom.first << " (black=" << bottom.second << "%)"
                               << std::endl;
                 }
             }

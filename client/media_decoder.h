@@ -53,7 +53,9 @@ private:
     int frameW_ = 0;         // 解码器真实输出帧尺寸
     int frameH_ = 0;
     int linearStride_ = 0;
+    int64_t nextSampleTime_ = 0;
     unsigned layoutErrors_ = 0;
+    unsigned lumaDiagnosticLogs_ = 0;
     bool loggedLayout_ = false;
     bool discontinuity_ = true;
     std::vector<uint8_t> packedNv12_;
