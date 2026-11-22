@@ -143,8 +143,14 @@ bool MediaEncoder::initVideoProcessor() {
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc = {};
     vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    // 帧率字段必须给有效值：留 0/0 时部分驱动会把内容描述当成“帧率未知”，
+    // 从而在帧间自行做去隔行/帧率转换决策。
+    vpDesc.InputFrameRate.Numerator = static_cast<UINT>(fps_);
+    vpDesc.InputFrameRate.Denominator = 1;
     vpDesc.InputWidth = srcWidth_;
     vpDesc.InputHeight = srcHeight_;
+    vpDesc.OutputFrameRate.Numerator = static_cast<UINT>(fps_);
+    vpDesc.OutputFrameRate.Denominator = 1;
     vpDesc.OutputWidth = alignedW_;
     vpDesc.OutputHeight = alignedH_;
     vpDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_QUALITY;
@@ -385,10 +391,13 @@ bool MediaEncoder::initEncoder() {
         rcApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
         var.ulVal = 100;
         rcApi->SetValue(&CODECAPI_AVEncCommonQuality, &var);
-        var.ulVal = 100;
-        rcApi->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &var);
+        // 不要设置 CODECAPI_AVEncCommonQualityVsSpeed = 100。
+        // 在“Quality 码控 + CABAC”同时启用时，该档位（67-100 高复杂度）会让
+        // 微软 H.264 MFT 产出熵编码失同步的坏码流：解码端在每行第二个宏块
+        // （MB 1 0）就报 "top block unavailable for requested intra mode"。
+        // 保持默认（中等复杂度）即可，且更符合实时推流需求。
         rcApi->Release();
-        std::cout << "[MediaEncoder] Quality mode (VBR, Q=100, QvS=100) set before SetOutputType" << std::endl;
+        std::cout << "[MediaEncoder] Quality mode (VBR, Q=100) set before SetOutputType" << std::endl;
     }
 
     IMFMediaType* outputType = nullptr;
@@ -575,16 +584,21 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
             if (FAILED(hr)) { userSample->Release(); return false; }
             outputData.pSample = userSample;
         }
-
         DWORD status = 0;
         HRESULT hr = encoder_->ProcessOutput(0, 1, &outputData, &status);
         if (outputData.pEvents) outputData.pEvents->Release();
 
+        // 所有权：userSample 是我们的；如果 MFT 换成了别的 sample（提供 sample
+        // 的 MFT），那个新 sample 也归我们释放。两者相同时只能释放一次。
         IMFSample* resultSample = outputData.pSample;
-        if (userSample && userSample != resultSample) userSample->Release();
+        const bool ownResult = resultSample && resultSample != userSample;
+        auto releaseAll = [&] {
+            if (ownResult) resultSample->Release();
+            if (userSample) userSample->Release();
+        };
 
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            if (resultSample) resultSample->Release();
+            releaseAll();
             return true;
         }
 
@@ -593,7 +607,7 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
             if (++poErrCount <= 3)
                 std::cerr << "[MediaEncoder] ProcessOutput hr=0x" << std::hex << hr
                           << " status=" << status << std::dec << std::endl;
-            if (resultSample) resultSample->Release();
+            releaseAll();
             return false;
         }
 
@@ -601,12 +615,12 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
         if (resultSample && sampleStatus != MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE &&
             sampleStatus != MFT_OUTPUT_DATA_BUFFER_STREAM_END) {
             IMFMediaBuffer* buf = nullptr;
-            hr = resultSample->ConvertToContiguousBuffer(&buf);
-            if (SUCCEEDED(hr)) {
+            HRESULT bufHr = resultSample->ConvertToContiguousBuffer(&buf);
+            if (SUCCEEDED(bufHr)) {
                 BYTE* dataPtr = nullptr;
                 DWORD curLen = 0;
-                hr = buf->Lock(&dataPtr, nullptr, &curLen);
-                if (SUCCEEDED(hr)) {
+                bufHr = buf->Lock(&dataPtr, nullptr, &curLen);
+                if (SUCCEEDED(bufHr)) {
                     if (curLen > 0) {
                         const auto nals = annexBNalTypes(dataPtr, curLen);
                         Frame frame;
@@ -634,9 +648,7 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
             }
         }
 
-        if (resultSample) resultSample->Release();
-        if (FAILED(hr)) return false;
-        if (!(outputData.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE)) return true;
+        releaseAll();
     }
 }
 
