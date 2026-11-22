@@ -137,6 +137,15 @@ struct FindHandleData {
     int driveIndex;        // current drive index being enumerated
 };
 
+// SFTP handles can refer to either an open file or a directory enumeration.
+// Tagging them keeps SSH_FXP_CLOSE from calling CloseHandle() on a
+// FindHandleData* and makes sure directory enumerations are FindClose()d.
+struct SftpHandle {
+    bool isDirectory;
+    HANDLE file;             // valid when isDirectory == false
+    FindHandleData* dir;     // valid when isDirectory == true
+};
+
 static sftp_attributes allocAttrs() {
     return (sftp_attributes)calloc(1, sizeof(struct sftp_attributes_struct));
 }
@@ -619,73 +628,101 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
                 break;
             }
 
-            ssh_string handle = sftp_handle_alloc(sftp, h);
+            auto* hnd = new SftpHandle{};
+            hnd->isDirectory = false;
+            hnd->file = h;
+            ssh_string handle = sftp_handle_alloc(sftp, hnd);
             sftp_reply_handle(msg, handle);
             ssh_string_free(handle);
             break;
         }
         case SSH_FXP_CLOSE: {
-            void* handle_data = sftp_handle(sftp, msg->handle);
-            if (handle_data) {
-                CloseHandle(static_cast<HANDLE>(handle_data));
-                sftp_handle_remove(sftp, handle_data);
+            auto* hnd = static_cast<SftpHandle*>(sftp_handle(sftp, msg->handle));
+            if (hnd) {
+                if (hnd->isDirectory) {
+                    if (hnd->dir) {
+                        if (!hnd->dir->isDrivesList && hnd->dir->hFind != INVALID_HANDLE_VALUE)
+                            FindClose(hnd->dir->hFind);
+                        delete hnd->dir;
+                    }
+                } else if (hnd->file != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hnd->file);
+                }
+                delete hnd;
+                sftp_handle_remove(sftp, hnd);
             }
             sftp_reply_status(msg, SSH_FX_OK, "OK");
             break;
         }
         case SSH_FXP_READ: {
-            void* handle_data = sftp_handle(sftp, msg->handle);
-            if (!handle_data) {
+            auto* hnd = static_cast<SftpHandle*>(sftp_handle(sftp, msg->handle));
+            if (!hnd || hnd->isDirectory) {
                 sftp_reply_status(msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
                 break;
             }
-            HANDLE h = static_cast<HANDLE>(handle_data);
-            OVERLAPPED ov = {};
-            ov.Offset = (DWORD)(msg->offset & 0xFFFFFFFF);
-            ov.OffsetHigh = (DWORD)((msg->offset >> 32) & 0xFFFFFFFF);
+            HANDLE h = hnd->file;
+            LARGE_INTEGER pos;
+            pos.QuadPart = (LONGLONG)msg->offset;
+            if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) {
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Seek failed");
+                break;
+            }
             uint32_t len = msg->len;
             std::vector<char> buf(len > 65536 ? 65536 : len);
-            len = (uint32_t)buf.size();
             DWORD read = 0;
-            if (ReadFile(h, buf.data(), len, &read, &ov)) {
-                sftp_reply_data(msg, buf.data(), read);
-            } else {
-                DWORD err = GetLastError();
-                if (err == ERROR_HANDLE_EOF || read == 0) {
+            if (ReadFile(h, buf.data(), (DWORD)buf.size(), &read, nullptr)) {
+                if (read == 0) {
                     sftp_reply_status(msg, SSH_FX_EOF, "EOF");
                 } else {
-                    sftp_reply_status(msg, SSH_FX_FAILURE, "Read failed");
+                    sftp_reply_data(msg, buf.data(), read);
                 }
+            } else {
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Read failed");
             }
             break;
         }
         case SSH_FXP_WRITE: {
-            void* handle_data = sftp_handle(sftp, msg->handle);
-            if (!handle_data) {
+            auto* hnd = static_cast<SftpHandle*>(sftp_handle(sftp, msg->handle));
+            if (!hnd || hnd->isDirectory) {
                 sftp_reply_status(msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
                 break;
             }
-            HANDLE h = static_cast<HANDLE>(handle_data);
-            OVERLAPPED ov = {};
-            ov.Offset = (DWORD)(msg->offset & 0xFFFFFFFF);
-            ov.OffsetHigh = (DWORD)((msg->offset >> 32) & 0xFFFFFFFF);
-            const char* data = sftp_client_message_get_data(msg);
-            uint32_t len = msg->len;
-            DWORD written = 0;
-            if (WriteFile(h, data, len, &written, &ov)) {
+            HANDLE h = hnd->file;
+            LARGE_INTEGER pos;
+            pos.QuadPart = (LONGLONG)msg->offset;
+            if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) {
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Seek failed");
+                break;
+            }
+            // libssh does not populate msg->len for SSH_FXP_WRITE; the payload
+            // lives in msg->data and its length must be queried from the string.
+            const char* data = static_cast<const char*>(ssh_string_data(msg->data));
+            size_t total = ssh_string_len(msg->data);
+            size_t done = 0;
+            bool ok = (data != nullptr);
+            while (ok && done < total) {
+                DWORD chunk = (DWORD)((total - done) > 0x10000 ? 0x10000 : (total - done));
+                DWORD written = 0;
+                if (!WriteFile(h, data + done, chunk, &written, nullptr) || written == 0) {
+                    ok = false;
+                    break;
+                }
+                done += written;
+            }
+            if (ok) {
                 sftp_reply_status(msg, SSH_FX_OK, "OK");
             } else {
-                sftp_reply_status(msg, SSH_FX_FAILURE, "Write failed");
+                sftp_reply_status(msg, mapWin32ErrorToFx(GetLastError()), "Write failed");
             }
             break;
         }
         case SSH_FXP_FSTAT: {
-            void* handle_data = sftp_handle(sftp, msg->handle);
-            if (!handle_data) {
+            auto* hnd = static_cast<SftpHandle*>(sftp_handle(sftp, msg->handle));
+            if (!hnd || hnd->isDirectory) {
                 sftp_reply_status(msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
                 break;
             }
-            HANDLE h = static_cast<HANDLE>(handle_data);
+            HANDLE h = hnd->file;
             sftp_attributes attr = allocAttrs();
             FILE_STANDARD_INFO stdInfo;
             FILE_BASIC_INFO basicInfo;
@@ -803,10 +840,14 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
             if (listDrives) {
                 auto* dirInfo = new FindHandleData();
                 dirInfo->isDrivesList = true;
+                dirInfo->hFind = INVALID_HANDLE_VALUE;
                 dirInfo->driveMask = GetLogicalDrives();
                 dirInfo->driveIndex = -1;
                 dirInfo->first = true;
-                ssh_string handle = sftp_handle_alloc(sftp, dirInfo);
+                auto* hnd = new SftpHandle{};
+                hnd->isDirectory = true;
+                hnd->dir = dirInfo;
+                ssh_string handle = sftp_handle_alloc(sftp, hnd);
                 sftp_reply_handle(msg, handle);
                 ssh_string_free(handle);
             } else {
@@ -827,19 +868,22 @@ void SshServer::handleSftpChannel(ssh_session session, ssh_channel channel) {
                 dirInfo->hFind = h;
                 dirInfo->first = true;
                 dirInfo->firstData = ffd;
-                ssh_string handle = sftp_handle_alloc(sftp, dirInfo);
+                auto* hnd = new SftpHandle{};
+                hnd->isDirectory = true;
+                hnd->dir = dirInfo;
+                ssh_string handle = sftp_handle_alloc(sftp, hnd);
                 sftp_reply_handle(msg, handle);
                 ssh_string_free(handle);
             }
             break;
         }
         case SSH_FXP_READDIR: {
-            void* handle_data = sftp_handle(sftp, msg->handle);
-            if (!handle_data) {
+            auto* hnd = static_cast<SftpHandle*>(sftp_handle(sftp, msg->handle));
+            if (!hnd || !hnd->isDirectory || !hnd->dir) {
                 sftp_reply_status(msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
                 break;
             }
-            auto* dirInfo = static_cast<FindHandleData*>(handle_data);
+            FindHandleData* dirInfo = hnd->dir;
 
             // Handle virtual drives listing
             if (dirInfo->isDrivesList) {

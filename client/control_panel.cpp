@@ -222,12 +222,19 @@ void ControlPanel::toggleSftp() {
         return;
     }
 
-    if (!config_.sshSession || !config_.sshSession->isConnected()) {
-        QMessageBox::critical(this, "Error", "SSH not connected");
+    auto* sftpSession = new SshSession();
+    if (!sftpSession->connect(config_.sshHost, config_.sshPort,
+                              config_.sshUser, config_.sshPassword)) {
+        QMessageBox::critical(this, "SFTP Error",
+            QString("SSH connection failed: %1")
+                .arg(QString::fromStdString(sftpSession->getError())));
+        delete sftpSession;
         return;
     }
 
-    auto* sw = new SftpWindow(config_.sshSession);
+    // The DirectDesktop session keeps its own channel busy for the lifetime
+    // of the connection, so SFTP gets a dedicated SSH connection.
+    auto* sw = new SftpWindow(std::unique_ptr<SshSession>(sftpSession));
     connect(sw, &SftpWindow::closed, this, &ControlPanel::onSftpWindowClosed);
     sw->show();
     sw->navigateTo("/");

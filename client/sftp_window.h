@@ -18,6 +18,7 @@
 #include <QDropEvent>
 #include <vector>
 #include <string>
+#include <memory>
 #include "../common/ssh_session.h"
 
 struct TransferJob {
@@ -31,7 +32,7 @@ struct TransferJob {
 class SftpWindow : public QMainWindow {
     Q_OBJECT
 public:
-    explicit SftpWindow(SshSession* session, QWidget* parent = nullptr);
+    explicit SftpWindow(std::unique_ptr<SshSession> session, QWidget* parent = nullptr);
     ~SftpWindow();
     void navigateTo(const QString& path);
 
@@ -79,6 +80,7 @@ private:
     static QString formatPermissions(uint32_t perm, bool isDir, bool isSymlink);
 
     SshSession* session_ = nullptr;
+    std::unique_ptr<SshSession> ownedSession_;
 
     QLineEdit* addressBar_;
     QLineEdit* searchBar_;

@@ -24,8 +24,10 @@
 #include <cstdlib>
 #include <iostream>
 
-SftpWindow::SftpWindow(SshSession* session, QWidget* parent)
-    : QMainWindow(parent), session_(session) {
+SftpWindow::SftpWindow(std::unique_ptr<SshSession> session, QWidget* parent)
+    : QMainWindow(parent),
+      session_(session.get()),
+      ownedSession_(std::move(session)) {
     setWindowTitle("SFTP File Manager");
     resize(900, 600);
     createUI();

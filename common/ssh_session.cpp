@@ -314,18 +314,25 @@ bool SshSession::sftpUpload(const std::string& localPath, const std::string& rem
         int n = fread(buffer.data(), 1, buffer.size(), local);
         if (n == 0) break;
 
-        int written = sftp_write(file, buffer.data(), n);
-        if (written != n) {
-            error_ = "sftp_write error: " + std::string(ssh_get_error(session_));
-            ok = false;
-            break;
+        // libssh caps each sftp_write() at the server-advertised maximum
+        // (32 KiB for SFTP v3), so keep feeding the remainder of the buffer.
+        int64_t chunkOffset = 0;
+        while (chunkOffset < n) {
+            int written = sftp_write(file, buffer.data() + chunkOffset,
+                                     (size_t)(n - chunkOffset));
+            if (written <= 0) {
+                error_ = "sftp_write error: " + std::string(ssh_get_error(session_));
+                ok = false;
+                break;
+            }
+            chunkOffset += written;
+            sent += written;
+            if (progress && !progress(sent, totalSize)) {
+                ok = false;
+                break;
+            }
         }
-
-        sent += written;
-        if (progress && !progress(sent, totalSize)) {
-            ok = false;
-            break;
-        }
+        if (!ok) break;
     }
 
     fclose(local);

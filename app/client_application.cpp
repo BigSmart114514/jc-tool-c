@@ -106,8 +106,6 @@ bool ClientApplication::setupDirectDesktop(const ConnectionConfig& cfg) {
         return false;
     }
 
-    sshSession_->sftpInit();
-
     auto dt = std::make_unique<TCPClientTransport>();
     if (dt->connect(targetHost, desktopPort)) {
         desktopTransportPtr_ = dt.get();

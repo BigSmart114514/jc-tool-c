@@ -156,33 +156,6 @@ set_target_properties(EasyTierService PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/Debug
 )
 
-# H.264 编码器配置对照实验（只依赖 Media Foundation，用外部解码器验证码流合法性）
-add_executable(MftProbe tests/mft_probe.cpp)
-target_include_directories(MftProbe PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(MftProbe mfplat mfuuid ole32)
-set_target_properties(MftProbe PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/Debug
-)
-
-# ======================= 视频链路诊断工具 =======================
-# 用产品同一套 ScreenCapture/MediaEncoder/MediaDecoder 录制和回放 H.264，
-# 不经过网络和 Qt，用来单独定位是编码侧还是解码侧的问题。
-add_executable(VideoPipelineTest
-    tests/video_pipeline_test.cpp
-    server/media_encoder.cpp
-    server/screen_capture.cpp
-    client/media_decoder.cpp
-)
-target_include_directories(VideoPipelineTest PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(VideoPipelineTest
-    mfplat mfuuid d3d11 dxgi gdi32 user32
-)
-set_target_properties(VideoPipelineTest PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/Debug
-)
-
 # 复制 DLL
 if(WIN32)
     # 可靠地获取 Qt bin 目录（优先使用 Qt6 提供的 qmake 位置，避免依赖环境变量）
