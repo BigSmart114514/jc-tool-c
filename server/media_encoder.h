@@ -38,7 +38,7 @@ private:
     bool initVideoProcessor();
     void loadSequenceHeader();
     bool processOutput(std::vector<Frame>& output);
-    void logInputBands(const uint8_t* nv12, const char* path);
+    void logInputBands(const uint8_t* nv12, const char* path, int64_t sampleTime);
     bool submitFrame(const uint8_t* nv12Data, int64_t pts, bool keyframe, std::vector<Frame>& output);
     void cleanupLocked();
 
@@ -59,6 +59,7 @@ private:
     std::vector<uint8_t> sequenceHeader_;
     bool loggedKeyframeError_ = false;
     unsigned inputBandLogs_ = 0;
+    unsigned outputFrameLogs_ = 0;
 
     int srcWidth_ = 0;
     int srcHeight_ = 0;

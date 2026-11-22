@@ -4,7 +4,9 @@
 #include <QCloseEvent>
 #include <QPainter>
 #include <QApplication>
+#include <QDir>
 #include <QScreen>
+#include <QTemporaryFile>
 #include <iostream>
 #include <utility>
 #define WIN32_LEAN_AND_MEAN
@@ -292,6 +294,7 @@ void DesktopWindow::audioDecodeLoop() {
 // 独立的视频解码线程：消费者模式
 void DesktopWindow::decodeLoop() {
     std::vector<uint8_t> rgbData;
+    bool dumpKeyframe = qEnvironmentVariableIntValue("JC_DESKTOP_DUMP_IDR") == 1;
     
     while (decoding_) {
         BinaryData data;
@@ -311,6 +314,18 @@ void DesktopWindow::decodeLoop() {
 
         const uint8_t* rawH264 = data.data() + 2;
         size_t rawSize = data.size() - 2;
+
+        if (dumpKeyframe && data[1] != 0) {
+            dumpKeyframe = false;
+            QTemporaryFile dump(QDir::temp().filePath(QStringLiteral("jc-desktop-XXXXXX.h264")));
+            const auto bytes = static_cast<qint64>(rawSize);
+            if (dump.open() && dump.write(reinterpret_cast<const char*>(rawH264), bytes) == bytes && dump.flush()) {
+                dump.setAutoRemove(false);
+                std::cout << "[Desktop] dbg idr-file " << dump.fileName().toStdString() << std::endl;
+            } else {
+                std::cerr << "[Desktop] Could not save diagnostic IDR: " << dump.errorString().toStdString() << std::endl;
+            }
+        }
 
         auto decodeStart = std::chrono::steady_clock::now();
 

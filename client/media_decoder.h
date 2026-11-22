@@ -56,6 +56,7 @@ private:
     int64_t nextSampleTime_ = 0;
     unsigned layoutErrors_ = 0;
     unsigned lumaDiagnosticLogs_ = 0;
+    unsigned inputFrameLogs_ = 0;
     bool loggedLayout_ = false;
     bool discontinuity_ = true;
     std::vector<uint8_t> packedNv12_;

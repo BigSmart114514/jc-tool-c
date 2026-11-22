@@ -1,6 +1,7 @@
 
 #include "media_decoder.h"
 #include "nv12_layout.h"
+#include "../common/video_diagnostics.h"
 #define NOMINMAX
 #include <iostream>
 #include <algorithm>
@@ -10,8 +11,6 @@
 #include <mfidl.h>
 #include <mftransform.h>
 #include <mferror.h>
-#include <codecapi.h>
-#include <strmif.h>
 #include <mfobjects.h>
 #include <wrl/client.h>
 
@@ -138,9 +137,10 @@ bool MediaDecoder::initDecoder() {
 
     IMFAttributes* mftAttr = nullptr;
     if (SUCCEEDED(decoder_->GetAttributes(&mftAttr))) {
-        mftAttr->SetUINT32(MF_LOW_LATENCY, TRUE);
+        const HRESULT lowLatencyResult = mftAttr->SetUINT32(MF_LOW_LATENCY, TRUE);
         mftAttr->Release();
-        std::cout << "[MediaDecoder] MF_LOW_LATENCY set on MFT attributes" << std::endl;
+        std::cout << "[MediaDecoder] MF_LOW_LATENCY attribute hr=0x"
+                  << std::hex << lowLatencyResult << std::dec << std::endl;
     }
 
     hr = MFCreateMediaType(&inputType_);
@@ -179,26 +179,6 @@ bool MediaDecoder::initDecoder() {
         }
     } else if (!reconfigureOutput()) {
         return false;
-    }
-
-    ICodecAPI* codecApi = nullptr;
-    if (SUCCEEDED(decoder_->QueryInterface(IID_PPV_ARGS(&codecApi)))) {
-        VARIANT value = {};
-        value.vt = VT_BOOL;
-        value.boolVal = VARIANT_TRUE;
-        const HRESULT lowLatencyResult = codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &value);
-
-        value.vt = VT_I4;
-        value.lVal = 4096;
-        const HRESULT maxWidthResult = codecApi->SetValue(&CODECAPI_AVDecVideoMaxCodedWidth, &value);
-        value.lVal = 2304;
-        const HRESULT maxHeightResult = codecApi->SetValue(&CODECAPI_AVDecVideoMaxCodedHeight, &value);
-        codecApi->Release();
-        std::cout << "[MediaDecoder] ICodecAPI lowLatency=0x" << std::hex << lowLatencyResult
-                  << " maxWidth=0x" << maxWidthResult
-                  << " maxHeight=0x" << maxHeightResult << std::dec << std::endl;
-    } else {
-        std::cout << "[MediaDecoder] ICodecAPI not supported" << std::endl;
     }
 
     hr = decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -289,6 +269,12 @@ MediaDecoder::DecodeResult MediaDecoder::decode(const uint8_t* data, int size, s
         return DecodeResult::Error;
     }
 
+    if (inputFrameLogs_ < 5) {
+        ++inputFrameLogs_;
+        std::cout << "[MediaDecoder] dbg h264-rx " << width_ << 'x' << height_
+                  << " pts100ns=" << nextSampleTime_ << " bytes=" << size
+                  << " hash=" << std::hex << videoFingerprint(data, size) << std::dec << std::endl;
+    }
     nextSampleTime_ += frameDuration;
     discontinuity_ = false;
     if (!processOutput(bgraOut)) return DecodeResult::Error;
@@ -365,6 +351,8 @@ bool MediaDecoder::readFrame(IMFSample* sample, std::vector<uint8_t>& bgraOut) {
     if (complete) {
         if (lumaDiagnosticLogs_ < 5) {
             ++lumaDiagnosticLogs_;
+            LONGLONG sampleTime = 0;
+            if (FAILED(sample->GetSampleTime(&sampleTime))) sampleTime = -1;
             auto meanY = [&](int firstRow, int endRow) {
                 uint64_t sum = 0;
                 uint64_t count = 0;
@@ -377,7 +365,7 @@ bool MediaDecoder::readFrame(IMFSample* sample, std::vector<uint8_t>& bgraOut) {
                 return count ? double(sum) / count : 0.0;
             };
             std::cout << "[MediaDecoder] dbg nv12-y " << width_ << 'x' << height_
-                      << " top=" << meanY(0, height_ / 2)
+                      << " pts100ns=" << sampleTime << " top=" << meanY(0, height_ / 2)
                       << " mid=" << meanY(height_ / 2, height_ * 3 / 4)
                       << " bottom=" << meanY(height_ * 3 / 4, height_) << std::endl;
         }
@@ -423,6 +411,7 @@ void MediaDecoder::cleanupLocked() {
     nextSampleTime_ = 0;
     layoutErrors_ = 0;
     lumaDiagnosticLogs_ = 0;
+    inputFrameLogs_ = 0;
     loggedLayout_ = false;
     discontinuity_ = true;
     initialized_ = false;

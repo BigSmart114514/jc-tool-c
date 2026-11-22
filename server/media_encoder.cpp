@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include "media_encoder.h"
 #include "h264_nal.h"
+#include "../common/video_diagnostics.h"
 #include <iostream>
 #include <algorithm>
 #include <mfapi.h>
@@ -296,28 +297,29 @@ bool MediaEncoder::encodeFromTexture(ID3D11Texture2D* bgraTex, int64_t pts,
 
     d3dContext_->Unmap(nv12Staging_, 0);
 
-    logInputBands(nv12Buf.data(), "GPU");
+    logInputBands(nv12Buf.data(), "GPU", pts * 10000000LL / fps_);
     return submitFrame(nv12Buf.data(), pts, keyframe, output);
 }
 
-void MediaEncoder::logInputBands(const uint8_t* nv12, const char* path) {
+void MediaEncoder::logInputBands(const uint8_t* nv12, const char* path, int64_t sampleTime) {
     if (inputBandLogs_ >= 5) return;
     ++inputBandLogs_;
     auto meanBand = [&](int firstRow, int endRow) {
         double sum = 0;
         size_t count = 0;
         for (int y = firstRow; y < endRow; y += 3) {
-            for (int x = 0; x < alignedW_; x += 3) {
+            for (int x = 0; x < width_; x += 3) {
                 sum += nv12[size_t(y) * alignedW_ + x];
                 ++count;
             }
         }
         return count ? sum / count : 0.0;
     };
-    std::cout << "[MediaEncoder] dbg src " << alignedW_ << 'x' << alignedH_ << " path=" << path
-              << " mean top=" << meanBand(0, alignedH_ / 2)
-              << " mid=" << meanBand(alignedH_ / 2, alignedH_ * 3 / 4)
-              << " bottom=" << meanBand(alignedH_ * 3 / 4, alignedH_) << std::endl;
+    std::cout << "[MediaEncoder] dbg src " << width_ << 'x' << height_ << " path=" << path
+              << " pts100ns=" << sampleTime
+              << " mean top=" << meanBand(0, height_ / 2)
+              << " mid=" << meanBand(height_ / 2, height_ * 3 / 4)
+              << " bottom=" << meanBand(height_ * 3 / 4, height_) << std::endl;
 }
 
 bool MediaEncoder::initEncoder() {
@@ -548,7 +550,7 @@ bool MediaEncoder::encode(const uint8_t* bgra, int64_t pts, std::vector<Frame>& 
 
     bgraToNv12(bgra, srcWidth_, srcHeight_, yPlane, uvPlane, alignedW_, alignedH_);
 
-    logInputBands(nv12Buf.data(), "CPU");
+    logInputBands(nv12Buf.data(), "CPU", pts * 10000000LL / fps_);
     return submitFrame(nv12Buf.data(), pts, keyframe, output);
 }
 
@@ -614,6 +616,16 @@ bool MediaEncoder::processOutput(std::vector<Frame>& output) {
                         }
                         frame.keyframe = nals.idr && ((nals.sps && nals.pps) || !frame.data.empty());
                         frame.data.insert(frame.data.end(), dataPtr, dataPtr + curLen);
+                        if (outputFrameLogs_ < 5) {
+                            ++outputFrameLogs_;
+                            LONGLONG sampleTime = 0;
+                            if (FAILED(resultSample->GetSampleTime(&sampleTime))) sampleTime = -1;
+                            std::cout << "[MediaEncoder] dbg h264-tx " << width_ << 'x' << height_
+                                      << " pts100ns=" << sampleTime << " bytes=" << frame.data.size()
+                                      << " kf=" << frame.keyframe << " hash=" << std::hex
+                                      << videoFingerprint(frame.data.data(), frame.data.size())
+                                      << std::dec << std::endl;
+                        }
                         output.push_back(std::move(frame));
                     }
                     buf->Unlock();
@@ -661,6 +673,7 @@ void MediaEncoder::cleanupLocked() {
     sequenceHeader_.clear();
     loggedKeyframeError_ = false;
     inputBandLogs_ = 0;
+    outputFrameLogs_ = 0;
     hasGPUPath_ = false;
     initialized_ = false;
 }
