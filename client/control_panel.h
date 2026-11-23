@@ -9,10 +9,10 @@
 #include <QHBoxLayout>
 #include <QGroupBox>
 #include <QStatusBar>
-#include <QPointer>
 #include <QMutex>
 #include <atomic>
 #include <memory>
+#include <vector>
 #include "../common/protocol.h"
 #include "../common/transport.h"
 
@@ -70,6 +70,12 @@ private:
     bool ensureDesktopConnected();
     void sendAudioEnable(bool enabled);
 
+    void destroyAllWindows();
+    void closeDesktopWindow();
+    void closeSftpWindow();
+    void closeSshTerminalWindow();
+    void retireWindow(std::unique_ptr<QWidget> window);
+
     QLabel* lblMode_;
     QLabel* lblInfo_;
     QStatusBar* statusBar_;
@@ -87,12 +93,19 @@ private:
 
     ControlPanelConfig config_;
 
-    QPointer<DesktopWindow> desktopWindow_;
-    QPointer<SftpWindow> sftpWindow_;
-    QPointer<SshTerminalWindow> sshTerminalWindow_;
+    // Declared before the windows so they outlive the objects they reference
+    // during teardown, even if a window destructor runs as a member.
     QMutex windowMtx_;
-
     InputControlState inputState_;
+
+    std::unique_ptr<DesktopWindow> desktopWindow_;
+    std::unique_ptr<SftpWindow> sftpWindow_;
+    std::unique_ptr<SshTerminalWindow> sshTerminalWindow_;
+
+    // Windows that emitted closed() from inside closeEvent(). They cannot be
+    // destroyed until the event handler returns, so they are retired here and
+    // deleted on the next event-loop turn.
+    std::vector<std::unique_ptr<QWidget>> retiredWindows_;
 };
 
 #endif

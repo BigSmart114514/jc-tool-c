@@ -54,6 +54,13 @@ int ClientApplication::exec() {
     controlPanel.show();
 
     int result = qApp->exec();
+
+    // Stop the receive thread before controlPanel is destroyed. Its onMessage
+    // callback captures the panel, so it must not run during panel teardown.
+    if (desktopTransportPtr_) {
+        desktopTransportPtr_->disconnect();
+    }
+
     return result;
 }
 

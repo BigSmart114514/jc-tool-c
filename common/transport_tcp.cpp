@@ -81,10 +81,11 @@ bool TCPClientTransport::reconnect() {
 
 void TCPClientTransport::recvLoop() {
     std::vector<uint8_t> buffer;
+    const SOCKET socket = socket_;
 
     while (connected_) {
         uint32_t msgSize = 0;
-        if (!NetUtil::RecvAll(socket_, &msgSize, sizeof(msgSize))) break;
+        if (!NetUtil::RecvAll(socket, &msgSize, sizeof(msgSize))) break;
 
         if (msgSize == 0 || msgSize > MAXMSG) {
             std::cerr << "[TCP Client] Invalid message size: " << msgSize
@@ -93,7 +94,7 @@ void TCPClientTransport::recvLoop() {
         }
 
         buffer.resize(msgSize);
-        if (!NetUtil::RecvAll(socket_, buffer.data(), msgSize)) break;
+        if (!NetUtil::RecvAll(socket, buffer.data(), msgSize)) break;
 
         if (callbacks_.onMessage) {
             callbacks_.onMessage(buffer);
@@ -119,12 +120,29 @@ bool TCPClientTransport::isConnected() const {
 
 void TCPClientTransport::disconnect() {
     connected_ = false;
-    if (socket_ != INVALID_SOCKET) {
-        shutdown(socket_, SD_BOTH);
-        closesocket(socket_);
-        socket_ = INVALID_SOCKET;
+    const SOCKET socket = socket_;
+    socket_ = INVALID_SOCKET;
+
+    // shutdown() wakes the blocking recv() without invalidating the handle the
+    // receive thread is using. closesocket() happens after the thread is gone.
+    if (socket != INVALID_SOCKET) {
+        shutdown(socket, SD_BOTH);
     }
-    if (recvThread_.joinable()) recvThread_.detach();
+
+    if (recvThread_.joinable()) {
+        if (recvThread_.get_id() == std::this_thread::get_id()) {
+            // Called from a transport callback on the receive thread itself.
+            recvThread_.detach();
+        } else {
+            // Wait for the receive thread to finish so no callback can run
+            // after the owner (and its callbacks) has been destroyed.
+            recvThread_.join();
+        }
+    }
+
+    if (socket != INVALID_SOCKET) {
+        closesocket(socket);
+    }
 }
 
 void TCPClientTransport::setCallbacks(const TransportCallbacks& callbacks) {

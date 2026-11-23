@@ -28,16 +28,65 @@ ControlPanel::ControlPanel(QWidget* parent)
 }
 
 ControlPanel::~ControlPanel() {
-    QMutexLocker lock(&windowMtx_);
-    auto safeDelete = [](auto& ptr) {
-        if (ptr) {
-            auto raw = ptr.data(); ptr.clear();
-            if (raw) { raw->close(); delete raw; }
-        }
-    };
-    safeDelete(desktopWindow_);
-    safeDelete(sftpWindow_);
-    safeDelete(sshTerminalWindow_);
+    // ClientApplication disconnects the transport before this destructor runs,
+    // so the receive callback can no longer reach the panel. Moving the windows
+    // out under the lock still makes teardown safe if that ever changes.
+    destroyAllWindows();
+}
+
+void ControlPanel::destroyAllWindows() {
+    std::unique_ptr<DesktopWindow> desktop;
+    {
+        QMutexLocker lock(&windowMtx_);
+        desktop = std::move(desktopWindow_);
+    }
+    auto sftp = std::move(sftpWindow_);
+    auto terminal = std::move(sshTerminalWindow_);
+    retiredWindows_.clear();
+
+    // The locals are destroyed here, outside the lock. Destructors join worker
+    // threads and release SSH resources.
+}
+
+void ControlPanel::closeDesktopWindow() {
+    std::unique_ptr<DesktopWindow> window;
+    {
+        QMutexLocker lock(&windowMtx_);
+        window = std::move(desktopWindow_);
+    }
+    if (window) {
+        // closeEvent() sends ClientDisconnect and emits closed(). The member is
+        // already null, so the slot only updates the UI; this local owns the
+        // window until the event handler has returned.
+        window->close();
+    }
+}
+
+void ControlPanel::closeSftpWindow() {
+    auto window = std::move(sftpWindow_);
+    if (window) {
+        window->close();
+    }
+}
+
+void ControlPanel::closeSshTerminalWindow() {
+    auto window = std::move(sshTerminalWindow_);
+    if (window) {
+        window->close();
+    }
+}
+
+void ControlPanel::retireWindow(std::unique_ptr<QWidget> window) {
+    if (!window) return;
+
+    retiredWindows_.push_back(std::move(window));
+    if (retiredWindows_.size() == 1) {
+        // closed() is emitted synchronously from closeEvent(), so defer actual
+        // deletion until the event handler has returned.
+        QTimer::singleShot(0, this, [this]() {
+            retiredWindows_.clear();
+        });
+    }
 }
 
 void ControlPanel::createUI() {
@@ -184,27 +233,31 @@ bool ControlPanel::ensureDesktopConnected() {
 
 void ControlPanel::toggleDesktop() {
     if (desktopWindow_) {
-        auto* toDelete = desktopWindow_.data();
-        { QMutexLocker lock(&windowMtx_); desktopWindow_.clear(); }
-        toDelete->close();
-        delete toDelete;
-        btnDesktop_->setText("Remote Desktop");
-        updateStatus("Desktop closed");
+        closeDesktopWindow();
         return;
     }
 
     if (!ensureDesktopConnected()) return;
 
-    auto* dw = new DesktopWindow();
+    auto dw = std::make_unique<DesktopWindow>();
     dw->init(config_.desktopTransport, &inputState_);
-    connect(dw, &DesktopWindow::closed, this, &ControlPanel::onDesktopWindowClosed);
+    connect(dw.get(), &DesktopWindow::closed, this, &ControlPanel::onDesktopWindowClosed);
     dw->setWindowTitle("Remote Desktop [" + QString::fromStdString(config_.modeText) + "]");
-    dw->show();
 
-    { QMutexLocker lock(&windowMtx_); desktopWindow_ = dw; }
+    DesktopWindow* window = dw.get();
+    {
+        QMutexLocker lock(&windowMtx_);
+        desktopWindow_ = std::move(dw);
+    }
+
+    // Publish the window before sending ClientReady: the transport callback
+    // drops incoming messages while desktopWindow_ is null, and the server
+    // sends the initial ScreenInfo only in response to ClientReady.
+    window->show();
+    window->requestStream();
+
     btnDesktop_->setText("Close Desktop");
     updateStatus("Desktop opened");
-    dw->requestStream();
 
     if (chkAudio_->isChecked()) {
         sendAudioEnable(true);
@@ -213,63 +266,54 @@ void ControlPanel::toggleDesktop() {
 
 void ControlPanel::toggleSftp() {
     if (sftpWindow_) {
-        auto* toDelete = sftpWindow_.data();
-        { QMutexLocker lock(&windowMtx_); sftpWindow_.clear(); }
-        toDelete->close();
-        delete toDelete;
-        btnSftp_->setText("SFTP File Manager");
-        updateStatus("SFTP closed");
+        closeSftpWindow();
         return;
     }
 
-    auto* sftpSession = new SshSession();
+    auto sftpSession = std::make_unique<SshSession>();
     if (!sftpSession->connect(config_.sshHost, config_.sshPort,
                               config_.sshUser, config_.sshPassword)) {
         QMessageBox::critical(this, "SFTP Error",
             QString("SSH connection failed: %1")
                 .arg(QString::fromStdString(sftpSession->getError())));
-        delete sftpSession;
         return;
     }
 
     // The DirectDesktop session keeps its own channel busy for the lifetime
     // of the connection, so SFTP gets a dedicated SSH connection.
-    auto* sw = new SftpWindow(std::unique_ptr<SshSession>(sftpSession));
-    connect(sw, &SftpWindow::closed, this, &ControlPanel::onSftpWindowClosed);
-    sw->show();
-    sw->navigateTo("/");
+    auto sw = std::make_unique<SftpWindow>(std::move(sftpSession));
+    connect(sw.get(), &SftpWindow::closed, this, &ControlPanel::onSftpWindowClosed);
 
-    { QMutexLocker lock(&windowMtx_); sftpWindow_ = sw; }
+    SftpWindow* window = sw.get();
+    sftpWindow_ = std::move(sw);
+    window->show();
+    window->navigateTo("/");
     btnSftp_->setText("Close SFTP");
     updateStatus("SFTP opened");
 }
 
 void ControlPanel::toggleSshTerminal() {
     if (sshTerminalWindow_) {
-        auto* toDelete = sshTerminalWindow_.data();
-        { QMutexLocker lock(&windowMtx_); sshTerminalWindow_.clear(); }
-        toDelete->close();
-        delete toDelete;
-        btnSshTerminal_->setText("SSH Terminal");
-        updateStatus("SSH Terminal closed");
+        closeSshTerminalWindow();
         return;
     }
 
-    auto* termSession = new SshSession();
+    auto termSession = std::make_unique<SshSession>();
     if (!termSession->connect(config_.sshHost, config_.sshPort,
                                config_.sshUser, config_.sshPassword)) {
         QMessageBox::critical(this, "Terminal Error",
             QString("SSH connection failed: %1")
                 .arg(QString::fromStdString(termSession->getError())));
-        delete termSession;
         return;
     }
 
-    auto* tw = new SshTerminalWindow(std::unique_ptr<SshSession>(termSession));
-    connect(tw, &SshTerminalWindow::closed, this, &ControlPanel::onSshTerminalClosed);
-    tw->show();
+    auto tw = std::make_unique<SshTerminalWindow>(std::move(termSession));
+    connect(tw.get(), &SshTerminalWindow::closed, this, &ControlPanel::onSshTerminalClosed);
 
-    { QMutexLocker lock(&windowMtx_); sshTerminalWindow_ = tw; }
+    SshTerminalWindow* window = tw.get();
+    sshTerminalWindow_ = std::move(tw);
+    window->show();
+
     btnSshTerminal_->setText("Close Terminal");
     updateStatus("SSH Terminal opened");
 }
@@ -322,21 +366,35 @@ void ControlPanel::onExternalTerminal() {
 }
 
 void ControlPanel::onDesktopWindowClosed() {
+    std::unique_ptr<DesktopWindow> window;
+    {
+        QMutexLocker lock(&windowMtx_);
+        window = std::move(desktopWindow_);
+    }
+
+    sendAudioEnable(false);
     btnDesktop_->setText("Remote Desktop");
     updateStatus("Desktop closed");
-    sendAudioEnable(false);
-    QMutexLocker lock(&windowMtx_);
-    desktopWindow_.clear();
+
+    // If this was a title-bar close, the member still owned the window and it
+    // is still inside closeEvent(). Retire it so it is deleted after returning.
+    // For a panel-initiated close the member is already null and the caller
+    // owns the window.
+    retireWindow(std::move(window));
 }
 
 void ControlPanel::onSftpWindowClosed() {
+    auto window = std::move(sftpWindow_);
     btnSftp_->setText("SFTP File Manager");
     updateStatus("SFTP closed");
+    retireWindow(std::move(window));
 }
 
 void ControlPanel::onSshTerminalClosed() {
+    auto window = std::move(sshTerminalWindow_);
     btnSshTerminal_->setText("SSH Terminal");
     updateStatus("SSH Terminal closed");
+    retireWindow(std::move(window));
 }
 
 void ControlPanel::onDisconnect() {
@@ -347,21 +405,11 @@ void ControlPanel::onDisconnect() {
     btnDisconnect_->setEnabled(false);
     updateStatus("Disconnecting...");
     QTimer::singleShot(0, this, [this]() {
-        auto safeDelete = [](auto& ptr) {
-            if (ptr) {
-                auto raw = ptr.data(); ptr.clear();
-                if (raw) { raw->disconnect(); raw->close(); raw->deleteLater(); }
-            }
-        };
-        {
-            QMutexLocker lock(&windowMtx_);
-            safeDelete(desktopWindow_);
-            safeDelete(sftpWindow_);
-            safeDelete(sshTerminalWindow_);
-        }
-
+        // Stop the receive thread first: its onMessage callback captures this.
         if (config_.desktopTransport) config_.desktopTransport->disconnect();
         if (config_.sshSession) config_.sshSession->disconnect();
+
+        destroyAllWindows();
 
         close();
         qApp->quit();
@@ -404,20 +452,12 @@ void ControlPanel::onShutdownServer() {
     auto msg = MessageBuilder::ShutdownCmd();
     config_.desktopTransport->send(msg);
     QTimer::singleShot(0, this, [this]() {
-        auto safeDelete = [](auto& ptr) {
-            if (ptr) {
-                auto raw = ptr.data(); ptr.clear();
-                if (raw) { raw->disconnect(); raw->close(); raw->deleteLater(); }
-            }
-        };
-        {
-            QMutexLocker lock(&windowMtx_);
-            safeDelete(desktopWindow_);
-            safeDelete(sftpWindow_);
-            safeDelete(sshTerminalWindow_);
-        }
+        // Stop the receive thread first: its onMessage callback captures this.
         if (config_.desktopTransport) config_.desktopTransport->disconnect();
         if (config_.sshSession) config_.sshSession->disconnect();
+
+        destroyAllWindows();
+
         close();
         qApp->quit();
     });
